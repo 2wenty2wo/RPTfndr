@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MeshCore Signal Tester</title>
+    <link rel="icon" type="image/svg+xml" href="logo.svg">
+    <link rel="stylesheet" href="style.css?v=116">
+    <script>try{
+        if(localStorage.getItem("theme")==="light")document.documentElement.classList.add("light-theme");
+        const _s=localStorage.getItem("uiScale");
+        if(_s==="small")document.documentElement.classList.add("ui-small");
+        else if(_s==="large")document.documentElement.classList.add("ui-large");
+        else if(_s==="larger")document.documentElement.classList.add("ui-larger");
+    }catch(e){}</script>
+    <script src="native-bridge.js?v=3"></script>
+    <script type="importmap">
+    { "imports": { "three": "./vendor/three.module.js?v=1" } }
+    </script>
+</head>
+<body>
+    <header>
+        <div class="header-row header-row-connect">
+            <img src="logo.svg" class="app-logo" alt="">
+            <span class="app-title">MeshCore Signal Tester</span>
+            <button class="help-btn" id="helpBtn" aria-label="Help / About">Show help</button>
+            <span id="status" class="status disconnected">Disconnected</span>
+            <button id="pauseBtn" class="btn-pause" disabled>▶ Resume</button>
+            <button id="connectBtn" class="btn-primary">Connect Bluetooth</button>
+            <span id="batteryStatus" class="battery-status hidden"></span>
+            <div id="savedDevices" class="saved-devices hidden"></div>
+            <button id="themeToggleBtn" class="theme-toggle-btn" title="Toggle light/dark theme">☀️</button>
+        </div>
+            <div class="header-row header-row-tools">
+                <button id="exportCsvBtn" class="btn-pause" title="Export visible packets as CSV" disabled>Export CSV</button>
+                <button id="importCsvBtn" class="btn-pause" title="Import CSV file">Import CSV</button>
+                <input type="file" id="importCsvInput" accept=".csv,text/csv,text/plain,application/csv" style="display:none">
+                <label class="sound-toggle">🔊 Sound<select id="soundSelect" class="ttl-header-select"><option value="off" selected>off</option><option value="short">short</option><option value="medium">medium</option><option value="long">long</option></select><span class="help-icon" data-help="sound">?</span></label>
+                <label class="ttl-header-label">Text size<select id="uiScaleSelect" class="ttl-header-select"><option value="small" style="font-size:10px">Small</option><option value="normal" selected style="font-size:13px">Normal</option><option value="large" style="font-size:17px">Large</option><option value="larger" style="font-size:24px">Larger</option></select></label>
+                <label class="size-label">2D graphs dot size<input type="range" id="dotSizeInput" class="size-range" min="0.3" max="2.5" step="0.1" value="1"><span id="dotSizeVal" class="size-val">1</span></label>
+                <label class="ttl-header-label">Auto-remove<select id="ttlSelect" class="ttl-header-select"><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option><option value="300">5 min</option><option value="600">10 min</option><option value="900">15 min</option><option value="1800">30 min</option><option value="3600">1 h</option><option value="Infinity" selected>Never</option></select><span class="help-icon" data-help="ttl">?</span></label>
+                <button id="clearDataBtn" class="btn-clear-data-header" title="Delete all captured data">Clear data</button>
+                <label class="ttl-header-label">Display<select id="hideSelect" class="ttl-header-select"><option value="all">All</option><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option><option value="300">5 min</option><option value="600">10 min</option><option value="900" selected>15 min</option><option value="1800">30 min</option><option value="3600">1 h</option></select><span class="help-icon" data-help="display">?</span></label>
+                <label class="sound-toggle"><input type="checkbox" id="keepScreenChk" checked> Keep screen on<span class="help-icon" data-help="keepscreen">?</span></label>
+            </div>
+            <div class="header-stats-row">
+                <div class="header-stats">
+                    <span class="hstat"><span class="hstat-label">Active</span> <span id="activeHashes">0</span><span class="help-icon" data-help="active">?</span></span>
+                    <span class="hstat"><span class="hstat-label">Total RX</span> <span id="totalRx">0</span><span class="help-icon" data-help="totalrx">?</span></span>
+                    <span class="hstat"><span class="hstat-label">Repeaters</span> <span id="totalRepeaters">0</span><span class="help-icon" data-help="repeaters-count">?</span></span>
+                    <span class="hstat"><span class="hstat-label">Rate</span> <span id="packetRate">—</span><span class="hstat-unit">/min</span><span class="help-icon" data-help="rate">?</span></span>
+                    <span class="hstat" id="contactsHstat" style="display:none"><span class="hstat-label">Contacts</span> <span id="contactsCount">0</span><span class="help-icon" data-help="contacts">?</span></span>
+                    <span id="contactsLoadingMsg" class="contacts-loading" style="display:none">Fetching contacts…</span>
+                </div>
+            </div>
+    </header>
+    <div class="container">
+        <main>
+            <div id="emptyState" class="empty-state">
+                <p>Connect to a MeshCore companion device via Bluetooth to start monitoring RX logs.</p>
+            </div>
+
+            <div class="rep-filter-bar" id="repFilterBar">
+                    <label class="rep-filter-label" for="repFilter">Filter repeaters</label>
+                    <input type="text" id="repFilter" class="rep-filter-input" autocomplete="off" spellcheck="false">
+                    <span class="help-icon" data-help="rep-filter">?</span>
+                    <button id="repFilterClear" class="msg-filter-clear hidden" title="Show all repeaters">✕</button>
+                    <span id="repFilterApplied" class="filter-applied-indicator hidden">Filter applied</span>
+                </div>
+            <div class="ping-bar" id="discoverBar">
+                <button id="discoverBtn" class="btn-pause" title="Send DISCOVER_REQ — nearby nodes reply with their public key and the uplink SNR they measured (firmware ≥ v1.10)">Discover nodes</button>
+                <span class="ping-hint">Sends a discovery request — nearby nodes reply with their public key and the SNR they measured for your signal.<span class="help-icon" data-help="discover">?</span></span>
+            </div>
+            <div class="section-wrap" id="repeaterWrap">
+                <div class="section-header">
+                    <span class="section-title">Seen repeaters</span>
+                    <button class="collapse-btn" data-target="repeaterBody" title="Toggle section">▾</button>
+                </div>
+                <div class="section-body" id="repeaterBody">
+                    <div class="section-body-inner">
+                        <div class="rep-table-scroll" id="repTableScroll">
+                            <table class="rep-table">
+                                <thead><tr>
+                                    <th data-sort-key="id">Repeater<span class="help-icon" data-help="repeater">?</span></th>
+                                    <th data-sort-key="count">RX</th>
+                                    <th data-sort-key="maxSnr">Max SNR</th>
+                                    <th data-sort-key="lastSnr">Last SNR</th>
+                                    <th data-sort-key="maxRssi">Max RSSI</th>
+                                    <th data-sort-key="lastRssi">Last RSSI</th>
+                                    <th data-sort-key="lastSeen" class="sort-desc">Last seen</th>
+                                </tr></thead>
+                                <tbody id="repTableBody"></tbody>
+                            </table>
+                        </div>
+                        <div id="repTableEmpty" class="rep-table-empty hidden">Waiting for data…</div>
+                        <div class="rep-expand-bar" id="repExpandBar">
+                            <label class="rep-expand-label">
+                                <input type="checkbox" id="repExpandTable"> Show all rows
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="section-wrap" id="snrChartWrap">
+                <div class="section-header">
+                    <span class="section-title">SNR history<span class="help-icon" data-help="chart-snr">?</span></span>
+                    <button class="collapse-btn" data-target="snrChartBody" title="Toggle section">▾</button>
+                </div>
+                <div class="section-body" id="snrChartBody">
+                    <div class="section-body-inner">
+                        <div class="snr-toggle-bar">
+                            <label class="snr-toggle-label"><input type="checkbox" id="snrShowIncoming" checked> Incoming</label>
+                            <label class="snr-toggle-label"><input type="checkbox" id="snrShowOutgoing" checked> Outgoing ★</label>
+                        </div>
+                        <div class="chart-box">
+                            <div class="chart-svg-wrap">
+                                <svg id="snrChart" class="rssi-chart"></svg>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section-wrap" id="rssiChartWrap">
+                <div class="section-header">
+                    <span class="section-title">Repeaters RSSI history<span class="help-icon" data-help="chart-interact">?</span></span>
+                    <button class="collapse-btn" data-target="rssiChartBody" title="Toggle section">▾</button>
+                </div>
+                <div class="section-body" id="rssiChartBody">
+                    <div class="chart-box">
+                        <div class="chart-svg-wrap">
+                            <svg id="rssiChart" class="rssi-chart"></svg>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section-wrap" id="mapWrap">
+                <div class="section-header">
+                    <span class="section-title">Signal 3D map<span class="help-icon" data-help="signal3d">?</span></span>
+                    <button class="collapse-btn" data-target="mapBody" title="Toggle section">▾</button>
+                </div>
+                <div class="section-body" id="mapBody">
+                    <div class="map-inner">
+                        <div class="map-controls">
+                            <button id="enableLocationBtn" class="btn-primary">Enable location</button>
+                            <button id="showAllRepeatersBtn" class="btn-show-all-repeaters">Show all repeaters</button>
+                            <span class="map-hint">Drag to pan · scroll/pinch to zoom · two-finger twist to tilt/rotate</span>
+                            <div class="map-settings-wrap">
+                                <button id="mapSettingsBtn" class="map-settings-btn" title="Map settings">⚙</button>
+                                <div id="mapSettingsPanel" class="map-settings-panel hidden">
+                                    <label class="map-source-label">Map:
+                                        <select id="mapSourceSelect" class="map-source-select">
+                                            <optgroup label="Mapy.com">
+                                                <option value="mapycom-basic">Basic</option>
+                                                <option value="mapycom-outdoor">Outdoor (hiking)</option>
+                                                <option value="mapycom-aerial">Aerial (orthophoto)</option>
+                                                <option value="mapycom-winter">Winter</option>
+                                            </optgroup>
+                                            <optgroup label="OpenStreetMap">
+                                                <option value="osm">OSM Standard</option>
+                                                <option value="opentopo">OpenTopoMap</option>
+                                            </optgroup>
+                                        </select>
+                                    </label>
+                                    <label class="size-label">Dot size <input type="range" id="sphereSizeInput" class="size-range" min="0.2" max="3" step="0.1" value="1"><span id="sphereSizeVal" class="size-val">1</span></label>
+                                    <label class="map-setting-toggle"><input type="checkbox" id="perspSizeChk" checked> Perspective dot size</label>
+                                    <label class="map-setting-toggle"><input type="checkbox" id="showLinesChk" checked> Guide lines</label>
+                                    <label class="map-setting-toggle"><input type="checkbox" id="showMarkerChk" checked> My location</label>
+                                    <label class="map-setting-toggle">Cluster radius
+                                        <select id="clusterRadiusSelect" class="ttl-header-select">
+                                            <option value="0" selected>Off</option>
+                                            <option value="5">5 m</option>
+                                            <option value="10">10 m</option>
+                                            <option value="20">20 m</option>
+                                            <option value="50">50 m</option>
+                                            <option value="100">100 m</option>
+                                        </select>
+                                    </label>
+                                    <span id="locationStatus" class="location-status-settings">Location not enabled.</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="map-container">
+                            <canvas id="mapCanvas" class="map-canvas"></canvas>
+                            <div id="mapEmpty" class="map-empty">Allow location and capture some packets to populate the 3D map.</div>
+                            <div id="mapInfo" class="map-info hidden"></div>
+                            <button id="mapFullscreenBtn" class="map-fullscreen-btn" title="Fullscreen">⛶</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section-wrap" id="msgTableWrap">
+                <div class="section-header">
+                    <span class="section-title">Received packets<span class="help-icon" data-help="messages">?</span></span>
+                    <button class="collapse-btn" data-target="msgScrollBody" title="Toggle section">▾</button>
+                </div>
+                <div class="section-body" id="msgScrollBody">
+                    <div class="msg-section-inner">
+                        <div class="msg-filter-bar hidden" id="msgFilterBar">
+                            <input type="text" id="msgFilter" class="msg-filter-input" placeholder="Filter by type, repeater, or text…" autocomplete="off" spellcheck="false">
+                            <button id="msgFilterClear" class="msg-filter-clear hidden" title="Clear filter">✕</button>
+                            <span id="msgFilterApplied" class="filter-applied-indicator hidden">Filter applied</span>
+                            <span id="msgFilterCount" class="msg-filter-count hidden"></span>
+                        </div>
+                        <div class="msg-table-scroll">
+                            <table class="msg-table">
+                                <thead id="msgTableHead"></thead>
+                                <tbody id="msgTableBody"></tbody>
+                            </table>
+                        </div>
+                        <div id="msgTableEmpty" class="msg-table-empty hidden"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section-wrap" id="debugWrap">
+                <div class="section-header">
+                    <span class="section-title">Debug</span>
+                    <button class="collapse-btn collapsed" data-target="debugBody" title="Toggle section">▾</button>
+                </div>
+                <div class="section-body collapsed" id="debugBody">
+                    <div class="debug-inner">
+                        <p class="debug-hint">Inject a fake RX entry to test prefix-collision handling. Hex is interpreted high-byte first, the same way path IDs arrive from the decoder. Examples: <code>5E</code> (1-byte), <code>5E9F</code>, <code>5E9F1234</code>, or <code>direct</code>.</p>
+                        <div class="debug-row">
+                            <label class="debug-input-label" for="debugRepeater">Repeater hex prefix or 'direct'</label>
+                            <input id="debugRepeater" type="text" class="debug-input" autocomplete="off" spellcheck="false">
+                            <button id="debugInject" class="btn-primary">Inject RX</button>
+                            <span id="debugFeedback" class="debug-feedback"></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div><!-- .container -->
+
+    <footer class="app-footer">
+        Author <a href="https://alesjanda.cz" target="_blank" rel="noopener">Aleš Janda</a>
+        <span class="footer-sep">|</span>
+        <a href="#" id="footerHelp">Help</a>
+        <span class="footer-sep">|</span>
+        <a href="https://github.com/kybl/meshcore-signal-tester" target="_blank" rel="noopener">Source code</a>
+    </footer>
+
+    <div id="chartTooltip" class="chart-tooltip"></div>
+    <div id="helpTip" class="chart-tooltip help-tip-float"></div>
+
+    <!-- Corner notice: repeater filter active -->
+    <div id="filterNotice" class="corner-notice hidden">
+        <div class="corner-notice-line1">
+            Filtered to <span class="corner-notice-dot" id="filterNoticeDot"></span><span class="corner-notice-id" id="filterNoticeRep"></span><span id="filterNoticeName" class="corner-notice-name-inline" style="display:none"></span>
+            <span class="help-icon" data-help="rep-filter">?</span>
+        </div>
+        <div id="filterNoticeExtra" class="corner-notice-extra"></div>
+        <button id="filterNoticeClear" class="corner-notice-btn">Clear filter</button>
+    </div>
+
+    <!-- Corner notice: repeater selected -->
+    <div id="selNotice" class="corner-notice hidden">
+        <div class="corner-notice-line1">
+            Selected <span class="corner-notice-dot" id="selNoticeDot"></span><span class="corner-notice-id" id="selNoticeRep"></span><span id="selNoticeName" class="corner-notice-name-inline" style="display:none"></span>
+            <button id="selNoticeClear" class="corner-notice-close" title="Deselect">✕</button>
+        </div>
+        <div id="selNoticeExtra" class="corner-notice-extra"></div>
+        <div class="corner-notice-btns">
+            <button id="selNoticeFilter" class="corner-notice-btn corner-notice-btn-primary">Filter to this only</button>
+        </div>
+    </div>
+
+    <div id="helpModal" class="help-modal-overlay hidden">
+        <div class="help-modal">
+            <button class="help-modal-close" id="helpModalClose" aria-label="Close">✕</button>
+            <div class="help-modal-title">MeshCore Signal Tester</div>
+            <p class="help-modal-intro">Connects via Bluetooth to a MeshCore companion radio and monitors incoming LoRa mesh packets in real time — tracking which packets were received, via which repeaters, and with what signal quality. The <b>Ping</b> button sends a zero-hop self-advertisement so nearby repeaters announce themselves; everything else is passive listening.</p>
+
+            <div class="help-section-title">Getting started</div>
+            <p>Click <b>Connect Bluetooth</b> and select your MeshCore companion device. Packet data appears automatically as the device picks up LoRa traffic. Previously paired devices appear as quick-connect buttons. Click any <b>section title</b> to collapse or expand that section. Use <b>⏹ Stop / ▶ Resume</b> to suspend data collection without disconnecting — collection pauses automatically on disconnect and resumes on reconnect.</p>
+
+            <div class="help-section-title">Key concepts</div>
+            <div class="help-dl">
+                <div class="help-dt">Repeater</div>
+                <div class="help-dd"><b>direct</b> means a flood-routed packet was received at the first hop — no intermediate repeater. Otherwise the ID shown is the last mesh node that forwarded the packet toward your device.</div>
+
+                <div class="help-dt">SNR</div>
+                <div class="help-dd">Signal-to-Noise Ratio in dB. Positive = signal is above the noise floor. LoRa can decode even at negative SNR (down to about −20 dB).</div>
+
+                <div class="help-dt">RSSI</div>
+                <div class="help-dd">Received Signal Strength Indicator — radio power in dBm. Less negative = stronger. −70 dBm: excellent &nbsp;·&nbsp; −120 dBm: very weak.</div>
+
+                <div class="help-dt">Noise floor</div>
+                <div class="help-dd">Background RF noise level, estimated as RSSI − SNR. Shown as the shaded area on the RSSI chart.</div>
+
+            </div>
+
+            <div class="help-section-title">Selecting and filtering repeaters</div>
+            <p>Click any repeater row in <b>Seen Repeaters</b>, a column header in <b>Received Packets</b>, a dot in the <b>3D map</b>, or a dot in the <b>charts</b> to select that repeater. The selection dims all other repeaters across every view simultaneously. A notice appears top-right with options to filter to that repeater only or deselect. Click the same item again to deselect.</p>
+            <p>Use <b>Filter repeaters</b> to restrict all views to one or more repeaters by ID prefix (comma-separated). Filtering is more persistent than selection — it stays active until you clear it. While a filter is active, a notice top-right shows which repeater is filtered and lets you clear it.</p>
+
+            <div class="help-section-title">Repeater ID prefix resolution</div>
+            <p>Path IDs can arrive as 1–3 byte prefixes of the full 4-byte node ID. The app resolves them progressively:</p>
+            <ul class="help-list">
+                <li>When a longer ID arrives for a node already seen as a shorter prefix, the column is <b>promoted</b> to the longer label (e.g. <code>12</code> → <code>1234</code>).</li>
+                <li>If a short prefix turns out to be ambiguous — it matches two or more known distinct nodes — those ambiguous packets are grouped under a <b>combined label</b> (e.g. <code>1234/1289</code>) while each specific node keeps its own column.</li>
+                <li>Each additional sibling is added to the combined label (e.g. <code>1111/1122/1133</code>). The combined column always represents packets whose exact origin is uncertain among those nodes.</li>
+                <li>If a more-precise ID later arrives for one of the siblings, its part of the label is updated too (e.g. <code>1234/1289</code> → <code>123456/1289</code>).</li>
+            </ul>
+
+            <div class="help-section-title">Android app</div>
+            <p>A native Android wrapper is available for field use. It packages this web app into an APK so it works fully offline — no browser needed. The Bluetooth and GPS work runs in a native foreground service, so <b>data collection keeps going with the screen off or the app in the background</b> — you can drop the phone in your pocket and keep mapping signal as you move. A plain browser tab would suspend and stop collecting once the screen turns off, which is exactly what this avoids.</p>
+            <p>The <b>Keep screen on</b> toggle is a separate convenience for when you do want the display to stay lit — e.g. to watch packets arrive live while walking. It only affects the screen, not collection.</p>
+            <p>Source code and APK releases: <a href="https://github.com/kybl/meshcore-signal-tester" target="_blank" rel="noopener">github.com/kybl/meshcore-signal-tester</a></p>
+
+            <div class="help-section-title">Why no iOS app?</div>
+            <p>This is a hobby project and the author doesn't own an iOS device to build or test on — sorry.</p>
+
+            <div class="help-section-title">About</div>
+            <p>MeshCore Signal Tester was created by <a href="https://alesjanda.cz" target="_blank" rel="noopener">Aleš Janda</a>. If you have feedback, found a bug, or just want to say hi — feel free to reach out at <a href="mailto:ales.janda@kyblsoft.cz">ales.janda@kyblsoft.cz</a>.</p>
+            <p>The app was developed with the help of <a href="https://claude.ai/code" target="_blank" rel="noopener">Claude Code</a>.</p>
+        </div>
+    </div>
+
+    <script type="module" src="app.js?v=183"></script>
+</body>
+</html>
