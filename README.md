@@ -1,8 +1,9 @@
 # MeshCore Signal Tester
 
-## Live app: [meshcore.kyblsoft.cz/signal-tester](https://meshcore.kyblsoft.cz/signal-tester)
-
 Web application for real-time monitoring of LoRa mesh traffic from a MeshCore companion radio via Bluetooth.
+
+### Live app: [meshcore.kyblsoft.cz/signal-tester](https://meshcore.kyblsoft.cz/signal-tester)
+#### Android app available in [repo releases](https://github.com/kybl/meshcore-signal-tester/releases).</sub>
 
 ## Features
 
