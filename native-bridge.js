@@ -18,6 +18,30 @@
     if (typeof window.AndroidBle === 'undefined') return;
     window.__MESHCORE_NATIVE__ = true;
 
+    // ---- external links -> system browser --------------------------------
+    // Inside the WebView a normal link navigation would unload the single-page
+    // app (tripping the "leave page?" capture guard) or silently fail for
+    // target="_blank". Intercept clicks on external links / mailto / tel and
+    // hand them to the native host, which opens the system browser/handler.
+    if (window.AndroidScreen && window.AndroidScreen.openUrl) {
+        document.addEventListener('click', function (e) {
+            var a = e.target && e.target.closest && e.target.closest('a[href]');
+            if (!a) return;
+            var href = a.getAttribute('href') || '';
+            if (!href || href.charAt(0) === '#' || /^javascript:/i.test(href)) return;
+            var external = a.target === '_blank' || /^(mailto:|tel:)/i.test(href);
+            if (!external && /^https?:\/\//i.test(href)) {
+                external = true;
+                try { if (new URL(href, location.href).host === location.host) external = false; } catch (_) {}
+            }
+            if (!external) return;
+            e.preventDefault();
+            var abs = href;
+            try { abs = new URL(href, location.href).href; } catch (_) {}
+            try { window.AndroidScreen.openUrl(abs); } catch (_) {}
+        }, true);
+    }
+
     // ---- helpers ---------------------------------------------------------
 
     function norm(u) {
@@ -266,6 +290,218 @@
             });
         }
     };
+
+    // ---- navigator.serial polyfill (USB) --------------------------------
+    // Minimal Web Serial shim backed by native USB host serial. Only the
+    // surface app.js uses is implemented: requestPort/getPorts, port.open/close,
+    // getInfo, a readable.getReader() with read()/releaseLock(), a
+    // writable.getWriter() with write()/releaseLock(), and a 'disconnect' event.
+
+    if (typeof window.AndroidSerial !== 'undefined') {
+        var _serialPorts = {}; // portId -> SerialPort proxy
+
+        function makeSerialPort(info) {
+            var existing = _serialPorts[info.portId];
+            if (existing) { existing._info = info; return existing; }
+
+            var portListeners = {};
+            var readQueue = [];    // Uint8Array chunks waiting to be read
+            var readWaiters = [];  // pending read() resolvers
+            var closed = false;
+
+            function deliverData(bytes) {
+                if (readWaiters.length) readWaiters.shift()({ value: bytes, done: false });
+                else readQueue.push(bytes);
+            }
+            // Resolve any in-flight/future read() with done so app.js's read loop
+            // exits cleanly (on releaseLock, close, or device disconnect).
+            function deliverDone() {
+                closed = true;
+                while (readWaiters.length) readWaiters.shift()({ value: undefined, done: true });
+            }
+
+            var reader = {
+                read: function () {
+                    if (readQueue.length) return Promise.resolve({ value: readQueue.shift(), done: false });
+                    if (closed) return Promise.resolve({ value: undefined, done: true });
+                    return new Promise(function (resolve) { readWaiters.push(resolve); });
+                },
+                cancel: function () { deliverDone(); return Promise.resolve(); },
+                releaseLock: function () { deliverDone(); }
+            };
+
+            var writer = {
+                write: function (data) {
+                    var bytes = toBytes(data);
+                    return call(function (id) {
+                        window.AndroidSerial.write(id, info.portId, bytesToB64(bytes));
+                    });
+                },
+                releaseLock: function () {},
+                close: function () { return Promise.resolve(); }
+            };
+
+            var port = {
+                _info: info,
+                getInfo: function () {
+                    return { usbVendorId: port._info.usbVendorId, usbProductId: port._info.usbProductId };
+                },
+                get readable() { return { getReader: function () { return reader; } }; },
+                get writable() { return { getWriter: function () { return writer; } }; },
+                open: function (options) {
+                    // Reset stream state so a cached proxy works on reconnect.
+                    closed = false;
+                    readQueue.length = 0;
+                    readWaiters.length = 0;
+                    var baud = (options && options.baudRate) || 115200;
+                    return call(function (id) {
+                        window.AndroidSerial.open(id, info.portId, baud);
+                    });
+                },
+                close: function () {
+                    deliverDone();
+                    try { window.AndroidSerial.close(info.portId); } catch (e) {}
+                    return Promise.resolve();
+                },
+                addEventListener: function (type, cb) {
+                    (portListeners[type] = portListeners[type] || []).push(cb);
+                },
+                removeEventListener: function (type, cb) {
+                    var a = portListeners[type] || [], i = a.indexOf(cb);
+                    if (i >= 0) a.splice(i, 1);
+                },
+                _dispatch: function (type, ev) {
+                    (portListeners[type] || []).slice().forEach(function (cb) {
+                        try { cb.call(port, ev); } catch (e) { console.error(e); }
+                    });
+                },
+                _onData: deliverData,
+                _onClosed: deliverDone
+            };
+            _serialPorts[info.portId] = port;
+            return port;
+        }
+
+        window.__mcSerialData = function (portId, b64) {
+            var p = _serialPorts[portId];
+            if (p) p._onData(b64ToBytes(b64));
+        };
+
+        window.__mcSerialDisconnected = function (portId) {
+            var p = _serialPorts[portId];
+            if (!p) return;
+            p._onClosed();
+            p._dispatch('disconnect', { target: p });
+        };
+
+        var serialImpl = {
+            requestPort: function (options) {
+                return call(function (id) {
+                    window.AndroidSerial.requestPort(id, JSON.stringify(options || {}));
+                }).then(function (info) { return makeSerialPort(info); });
+            },
+            getPorts: function () {
+                return call(function (id) {
+                    window.AndroidSerial.getPorts(id);
+                }).then(function (list) { return (list || []).map(makeSerialPort); });
+            },
+            addEventListener: function () {},
+            removeEventListener: function () {}
+        };
+        try {
+            Object.defineProperty(navigator, 'serial', {
+                configurable: true, enumerable: true, value: serialImpl
+            });
+        } catch (e) {
+            navigator.serial = serialImpl;
+        }
+    }
+
+    // ---- WiFi (TCP) companion transport ---------------------------------
+    // The MeshCore WiFi companion firmware exposes the SAME length-prefixed
+    // binary frame protocol as USB serial (0x3c/0x3e + 16-bit LE length), just
+    // over a raw TCP socket. Browsers can't open raw TCP, so the native host
+    // does; here we wrap that socket in a Web-Serial-like port object so app.js
+    // reuses its serial connect/read/write/frame code unchanged.
+
+    if (typeof window.AndroidWifi !== 'undefined') {
+        var _wifiPort = null;
+
+        window.__mcMakeWifiPort = function (host, tcpPort) {
+            var readQueue = [], readWaiters = [], closed = false, opened = false;
+            var listeners = {};
+
+            function deliverData(bytes) {
+                if (readWaiters.length) readWaiters.shift()({ value: bytes, done: false });
+                else readQueue.push(bytes);
+            }
+            function deliverDone() {
+                closed = true;
+                while (readWaiters.length) readWaiters.shift()({ value: undefined, done: true });
+            }
+
+            var reader = {
+                read: function () {
+                    if (readQueue.length) return Promise.resolve({ value: readQueue.shift(), done: false });
+                    if (closed) return Promise.resolve({ value: undefined, done: true });
+                    return new Promise(function (resolve) { readWaiters.push(resolve); });
+                },
+                cancel: function () { deliverDone(); return Promise.resolve(); },
+                releaseLock: function () { deliverDone(); }
+            };
+            var writer = {
+                write: function (data) {
+                    return call(function (id) {
+                        window.AndroidWifi.write(id, bytesToB64(toBytes(data)));
+                    });
+                },
+                releaseLock: function () {},
+                close: function () { return Promise.resolve(); }
+            };
+            var port = {
+                getInfo: function () { return { wifi: true, host: host, port: tcpPort }; },
+                get readable() { return { getReader: function () { return reader; } }; },
+                get writable() { return { getWriter: function () { return writer; } }; },
+                open: function () {
+                    if (opened) return Promise.resolve();
+                    closed = false; readQueue.length = 0; readWaiters.length = 0;
+                    return call(function (id) {
+                        window.AndroidWifi.open(id, host, tcpPort);
+                    }).then(function () { opened = true; });
+                },
+                close: function () {
+                    deliverDone();
+                    try { window.AndroidWifi.close(); } catch (e) {}
+                    return Promise.resolve();
+                },
+                addEventListener: function (type, cb) {
+                    (listeners[type] = listeners[type] || []).push(cb);
+                },
+                removeEventListener: function (type, cb) {
+                    var a = listeners[type] || [], i = a.indexOf(cb);
+                    if (i >= 0) a.splice(i, 1);
+                },
+                _dispatch: function (type, ev) {
+                    (listeners[type] || []).slice().forEach(function (cb) {
+                        try { cb.call(port, ev); } catch (e) { console.error(e); }
+                    });
+                },
+                _onData: deliverData,
+                _onClosed: deliverDone
+            };
+            _wifiPort = port;
+            return port;
+        };
+
+        window.__mcWifiData = function (b64) {
+            if (_wifiPort) _wifiPort._onData(b64ToBytes(b64));
+        };
+        window.__mcWifiClosed = function () {
+            if (!_wifiPort) return;
+            _wifiPort._onClosed();
+            _wifiPort._dispatch('disconnect', { target: _wifiPort });
+        };
+    }
 
     // ---- navigator.geolocation polyfill ---------------------------------
 

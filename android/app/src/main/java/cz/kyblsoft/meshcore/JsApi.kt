@@ -43,4 +43,24 @@ class JsApi(private val webView: WebView) {
     fun geoError(code: Int, message: String) {
         eval("window.__mcGeoError($code, ${q(message)})")
     }
+
+    /** Deliver a chunk of bytes received from a serial port. */
+    fun serialData(portId: String, base64Value: String) {
+        eval("window.__mcSerialData(${q(portId)}, ${q(base64Value)})")
+    }
+
+    /** Report that a serial port closed (unplugged or read error). */
+    fun serialDisconnected(portId: String) {
+        eval("window.__mcSerialDisconnected(${q(portId)})")
+    }
+
+    /** Deliver a chunk of bytes received from the WiFi/TCP socket. */
+    fun wifiData(base64Value: String) {
+        eval("window.__mcWifiData(${q(base64Value)})")
+    }
+
+    /** Report that the WiFi/TCP socket closed unexpectedly. */
+    fun wifiClosed() {
+        eval("window.__mcWifiClosed()")
+    }
 }

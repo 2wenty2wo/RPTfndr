@@ -60,6 +60,77 @@ class BleBridge(private val activity: MainActivity) {
 }
 
 /**
+ * JavaScript interface exposed as `window.AndroidSerial`. Mirrors the subset of
+ * the Web Serial API that app.js uses. Methods run on a WebView binder thread,
+ * so they dispatch onto the activity/serial manager and return promptly.
+ */
+class SerialBridge(private val activity: MainActivity) {
+
+    @JavascriptInterface
+    fun requestPort(reqId: String, filtersJson: String) {
+        activity.main.post { activity.requestSerialPort(reqId) }
+    }
+
+    @JavascriptInterface
+    fun getPorts(reqId: String) {
+        activity.main.post { activity.serial.getGrantedPorts(reqId) }
+    }
+
+    @JavascriptInterface
+    fun open(reqId: String, portId: String, baudRate: Int) {
+        activity.checkBatteryOptimization()
+        activity.main.post {
+            // USB doesn't need Bluetooth permissions; location is still requested
+            // so GPS for the map works and the foreground service can start.
+            activity.ensureConnectPermissions(includeBluetooth = false) {
+                activity.serial.open(reqId, portId, baudRate)
+            }
+        }
+    }
+
+    @JavascriptInterface
+    fun close(portId: String) {
+        activity.serial.close(portId)
+    }
+
+    @JavascriptInterface
+    fun write(reqId: String, portId: String, base64: String) {
+        activity.serial.write(reqId, portId, base64)
+    }
+}
+
+/**
+ * JavaScript interface exposed as `window.AndroidWifi`. Opens a raw TCP socket
+ * to a MeshCore WiFi companion (same binary frame protocol as USB serial).
+ * Methods run on a WebView binder thread, so they dispatch onto the activity /
+ * TcpManager and return promptly.
+ */
+class WifiBridge(private val activity: MainActivity) {
+
+    @JavascriptInterface
+    fun open(reqId: String, host: String, port: Int) {
+        activity.checkBatteryOptimization()
+        activity.main.post {
+            // TCP needs no Bluetooth permission; location is still requested (as
+            // for USB) so the GPS map works and the foreground service can start.
+            activity.ensureConnectPermissions(includeBluetooth = false) {
+                activity.wifi.open(reqId, host, port)
+            }
+        }
+    }
+
+    @JavascriptInterface
+    fun write(reqId: String, base64: String) {
+        activity.wifi.write(reqId, base64)
+    }
+
+    @JavascriptInterface
+    fun close() {
+        activity.wifi.close()
+    }
+}
+
+/**
  * JavaScript interface exposed as `window.AndroidGeo`.
  */
 class GeoBridge(private val activity: MainActivity) {

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MeshCore Signal Tester</title>
     <link rel="icon" type="image/svg+xml" href="logo.svg">
-    <link rel="stylesheet" href="style.css?v=116">
+    <link rel="stylesheet" href="style.css?v=142">
     <script>try{
         if(localStorage.getItem("theme")==="light")document.documentElement.classList.add("light-theme");
         const _s=localStorage.getItem("uiScale");
@@ -13,7 +13,7 @@
         else if(_s==="large")document.documentElement.classList.add("ui-large");
         else if(_s==="larger")document.documentElement.classList.add("ui-larger");
     }catch(e){}</script>
-    <script src="native-bridge.js?v=3"></script>
+    <script src="native-bridge.js?v=6"></script>
     <script type="importmap">
     { "imports": { "three": "./vendor/three.module.js?v=1" } }
     </script>
@@ -23,25 +23,34 @@
         <div class="header-row header-row-connect">
             <img src="logo.svg" class="app-logo" alt="">
             <span class="app-title">MeshCore Signal Tester</span>
+            <a id="appVersion" class="app-version" href="https://github.com/kybl/meshcore-signal-tester/blob/main/CHANGELOG.md" target="_blank" rel="noopener" title="What's new in this version"></a>
             <button class="help-btn" id="helpBtn" aria-label="Help / About">Show help</button>
-            <span id="status" class="status disconnected">Disconnected</span>
-            <button id="pauseBtn" class="btn-pause" disabled>▶ Resume</button>
-            <button id="connectBtn" class="btn-primary">Connect Bluetooth</button>
+            <div id="status" class="status disconnected">
+                <span id="statusText" class="status-text">Disconnected</span>
+                <button id="connectBtn" class="btn-primary btn-connect" data-sub="companion">Connect Bluetooth</button>
+                <button id="connectUsbBtn" class="btn-primary btn-connect" data-sub="companion, repeater">Connect USB</button>
+                <button id="connectWifiBtn" class="btn-primary btn-connect" data-sub="companion">Connect WiFi</button>
+                <button id="pauseBtn" class="btn-pause" disabled>▶ Resume</button>
+                <button id="disconnectBtn" class="btn-pause btn-disconnect">Disconnect</button>
+                <span id="connectedDeviceName" class="connected-device-name"></span>
+                <div id="savedDevices" class="saved-devices hidden"></div>
+            </div>
             <span id="batteryStatus" class="battery-status hidden"></span>
-            <div id="savedDevices" class="saved-devices hidden"></div>
-            <button id="themeToggleBtn" class="theme-toggle-btn" title="Toggle light/dark theme">☀️</button>
         </div>
             <div class="header-row header-row-tools">
-                <button id="exportCsvBtn" class="btn-pause" title="Export visible packets as CSV" disabled>Export CSV</button>
                 <button id="importCsvBtn" class="btn-pause" title="Import CSV file">Import CSV</button>
                 <input type="file" id="importCsvInput" accept=".csv,text/csv,text/plain,application/csv" style="display:none">
+                <button id="exportCsvBtn" class="btn-pause" title="Export visible packets as CSV" disabled>Export CSV</button>
+                <button id="clearDataBtn" class="btn-clear-data-header" title="Delete all captured data">Clear data</button>
+                <label class="ttl-header-label">Auto-remove<select id="ttlSelect" class="ttl-header-select"><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option><option value="300">5 min</option><option value="600">10 min</option><option value="900">15 min</option><option value="1800">30 min</option><option value="3600">1 h</option><option value="Infinity" selected>Never</option></select><span class="help-icon" data-help="ttl">?</span></label>
+            </div>
+            <div class="header-row header-row-tools">
                 <label class="sound-toggle">🔊 Sound<select id="soundSelect" class="ttl-header-select"><option value="off" selected>off</option><option value="short">short</option><option value="medium">medium</option><option value="long">long</option></select><span class="help-icon" data-help="sound">?</span></label>
+                <label class="ttl-header-label">Display<select id="hideSelect" class="ttl-header-select"><option value="all">All</option><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option><option value="300">5 min</option><option value="600">10 min</option><option value="900" selected>15 min</option><option value="1800">30 min</option><option value="3600">1 h</option></select><span class="help-icon" data-help="display">?</span></label>
                 <label class="ttl-header-label">Text size<select id="uiScaleSelect" class="ttl-header-select"><option value="small" style="font-size:10px">Small</option><option value="normal" selected style="font-size:13px">Normal</option><option value="large" style="font-size:17px">Large</option><option value="larger" style="font-size:24px">Larger</option></select></label>
                 <label class="size-label">2D graphs dot size<input type="range" id="dotSizeInput" class="size-range" min="0.3" max="2.5" step="0.1" value="1"><span id="dotSizeVal" class="size-val">1</span></label>
-                <label class="ttl-header-label">Auto-remove<select id="ttlSelect" class="ttl-header-select"><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option><option value="300">5 min</option><option value="600">10 min</option><option value="900">15 min</option><option value="1800">30 min</option><option value="3600">1 h</option><option value="Infinity" selected>Never</option></select><span class="help-icon" data-help="ttl">?</span></label>
-                <button id="clearDataBtn" class="btn-clear-data-header" title="Delete all captured data">Clear data</button>
-                <label class="ttl-header-label">Display<select id="hideSelect" class="ttl-header-select"><option value="all">All</option><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option><option value="300">5 min</option><option value="600">10 min</option><option value="900" selected>15 min</option><option value="1800">30 min</option><option value="3600">1 h</option></select><span class="help-icon" data-help="display">?</span></label>
                 <label class="sound-toggle"><input type="checkbox" id="keepScreenChk" checked> Keep screen on<span class="help-icon" data-help="keepscreen">?</span></label>
+                <button id="themeToggleBtn" class="theme-toggle-btn" title="Toggle light/dark theme">☀️</button>
             </div>
             <div class="header-stats-row">
                 <div class="header-stats">
@@ -56,8 +65,30 @@
     </header>
     <div class="container">
         <main>
+            <div id="repeaterNotice" class="repeater-notice hidden">
+                <button id="repeaterNoticeClose" class="repeater-notice-close" aria-label="Dismiss">✕</button>
+                <strong>Stock repeater firmware — per-node signal can't be measured. Sorry.</strong>
+                <p>The packet log does report SNR/RSSI, but with <strong>no usable identity</strong> for it:</p>
+                <ul>
+                    <li><em>Flood</em> packets are logged with their original <strong>sender</strong>, not the neighbour your
+                        repeater actually heard — so the signal can't be attributed to anyone.</li>
+                    <li><em>Direct</em> packets are almost always your own companion sitting right next to the repeater
+                        (always strong) — useless for range.</li>
+                    <li>There is no packet path and no per-sender RSSI, so incoming traffic can only be grouped
+                        as <code>direct</code> / <code>unknown</code>.</li>
+                </ul>
+                <p><strong>What you can do:</strong></p>
+                <ul>
+                    <li>Use <strong>Discover nodes</strong> — it lists the repeaters yours hears <em>directly</em>, identified,
+                        but SNR only (no RSSI).</li>
+                    <li>Flash the repeater with a <code>MESH_PACKET_LOGGING</code> firmware build. It emits RAW packets this
+                        app decodes to recover the real last hop together with SNR <em>and</em> RSSI — the only way to get
+                        full per-node signal data from a repeater.</li>
+                </ul>
+            </div>
+
             <div id="emptyState" class="empty-state">
-                <p>Connect to a MeshCore companion device via Bluetooth to start monitoring RX logs.</p>
+                <p>Connect to a MeshCore companion device via Bluetooth or USB to start monitoring RX logs.</p>
             </div>
 
             <div class="rep-filter-bar" id="repFilterBar">
@@ -109,7 +140,7 @@
                 <div class="section-body" id="snrChartBody">
                     <div class="section-body-inner">
                         <div class="snr-toggle-bar">
-                            <label class="snr-toggle-label"><input type="checkbox" id="snrShowIncoming" checked> Incoming</label>
+                            <label class="snr-toggle-label"><input type="checkbox" id="snrShowIncoming" checked> Incoming ●</label>
                             <label class="snr-toggle-label"><input type="checkbox" id="snrShowOutgoing" checked> Outgoing ★</label>
                         </div>
                         <div class="chart-box">
@@ -123,7 +154,7 @@
 
             <div class="section-wrap" id="rssiChartWrap">
                 <div class="section-header">
-                    <span class="section-title">Repeaters RSSI history<span class="help-icon" data-help="chart-interact">?</span></span>
+                    <span class="section-title">RSSI history<span class="help-icon" data-help="chart-interact">?</span></span>
                     <button class="collapse-btn" data-target="rssiChartBody" title="Toggle section">▾</button>
                 </div>
                 <div class="section-body" id="rssiChartBody">
@@ -144,6 +175,7 @@
                     <div class="map-inner">
                         <div class="map-controls">
                             <button id="enableLocationBtn" class="btn-primary">Enable location</button>
+                            <button id="centerOnMeBtn" class="btn-show-all-repeaters" title="Move the camera to my current location">📍 Center on me</button>
                             <button id="showAllRepeatersBtn" class="btn-show-all-repeaters">Show all repeaters</button>
                             <span class="map-hint">Drag to pan · scroll/pinch to zoom · two-finger twist to tilt/rotate</span>
                             <div class="map-settings-wrap">
@@ -167,6 +199,7 @@
                                     <label class="map-setting-toggle"><input type="checkbox" id="perspSizeChk" checked> Perspective dot size</label>
                                     <label class="map-setting-toggle"><input type="checkbox" id="showLinesChk" checked> Guide lines</label>
                                     <label class="map-setting-toggle"><input type="checkbox" id="showMarkerChk" checked> My location</label>
+                                    <label class="map-setting-toggle"><input type="checkbox" id="showDeviceChk"> Device location<span class="help-icon" data-help="device-location">?</span></label>
                                     <label class="map-setting-toggle">Cluster radius
                                         <select id="clusterRadiusSelect" class="ttl-header-select">
                                             <option value="0" selected>Off</option>
@@ -199,7 +232,8 @@
                 <div class="section-body" id="msgScrollBody">
                     <div class="msg-section-inner">
                         <div class="msg-filter-bar hidden" id="msgFilterBar">
-                            <input type="text" id="msgFilter" class="msg-filter-input" placeholder="Filter by type, repeater, or text…" autocomplete="off" spellcheck="false">
+                            <input type="text" id="msgFilter" class="msg-filter-input" placeholder="Filter by type, repeater name or ID, or text…" autocomplete="off" spellcheck="false">
+                            <span class="help-icon" data-help="msg-filter">?</span>
                             <button id="msgFilterClear" class="msg-filter-clear hidden" title="Clear filter">✕</button>
                             <span id="msgFilterApplied" class="filter-applied-indicator hidden">Filter applied</span>
                             <span id="msgFilterCount" class="msg-filter-count hidden"></span>
@@ -246,6 +280,26 @@
     <div id="chartTooltip" class="chart-tooltip"></div>
     <div id="helpTip" class="chart-tooltip help-tip-float"></div>
 
+    <!-- WiFi connect form (native Android only) -->
+    <div id="wifiModal" class="wifi-modal-overlay hidden">
+        <div class="wifi-modal" role="dialog" aria-modal="true" aria-labelledby="wifiModalTitle">
+            <button class="wifi-modal-close" id="wifiModalClose" aria-label="Close">✕</button>
+            <h3 id="wifiModalTitle">Connect over WiFi</h3>
+            <p class="wifi-modal-sub">Enter the IP address and TCP port of a MeshCore companion running the WiFi firmware.</p>
+            <label class="wifi-field">IP address
+                <input id="wifiHostInput" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="192.168.x.x">
+            </label>
+            <label class="wifi-field">Port
+                <input id="wifiPortInput" type="number" min="1" max="65535" placeholder="5000">
+            </label>
+            <div id="wifiModalError" class="wifi-modal-error hidden"></div>
+            <div class="wifi-modal-actions">
+                <button id="wifiModalCancel" class="btn-pause">Cancel</button>
+                <button id="wifiModalConnect" class="btn-primary">Connect</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Corner notice: repeater filter active -->
     <div id="filterNotice" class="corner-notice hidden">
         <div class="corner-notice-line1">
@@ -272,10 +326,14 @@
         <div class="help-modal">
             <button class="help-modal-close" id="helpModalClose" aria-label="Close">✕</button>
             <div class="help-modal-title">MeshCore Signal Tester</div>
-            <p class="help-modal-intro">Connects via Bluetooth to a MeshCore companion radio and monitors incoming LoRa mesh packets in real time — tracking which packets were received, via which repeaters, and with what signal quality. The <b>Ping</b> button sends a zero-hop self-advertisement so nearby repeaters announce themselves; everything else is passive listening.</p>
+            <p class="help-modal-intro">Connects to a MeshCore companion radio (Bluetooth, USB, or — in the Android app — WiFi) or a MeshCore repeater (USB) and monitors incoming LoRa mesh packets in real time — tracking which packets were received, via which repeaters, and with what signal quality. The <b>Discover nodes</b> button sends an active discovery request so nearby nodes announce themselves and report the signal quality they measured for you; everything else is passive listening.</p>
 
             <div class="help-section-title">Getting started</div>
-            <p>Click <b>Connect Bluetooth</b> and select your MeshCore companion device. Packet data appears automatically as the device picks up LoRa traffic. Previously paired devices appear as quick-connect buttons. Click any <b>section title</b> to collapse or expand that section. Use <b>⏹ Stop / ▶ Resume</b> to suspend data collection without disconnecting — collection pauses automatically on disconnect and resumes on reconnect.</p>
+            <p>Click <b>Connect Bluetooth</b> (or <b>Connect USB</b> for a wired serial connection, or <b>Connect WiFi</b> in the Android app) and select your MeshCore device. Packet data appears automatically as the device picks up LoRa traffic. Previously used devices (Bluetooth, USB and WiFi) appear as quick-connect buttons. Click any <b>section title</b> to collapse or expand that section. Use <b>⏹ Stop / ▶ Resume</b> to suspend data collection without disconnecting — collection pauses automatically on disconnect and resumes on reconnect.</p>
+            <p>Use <b>Import CSV</b> / <b>Export CSV</b> to save the captured packets to a file and reload them later, and <b>Clear data</b> to wipe the current session. If an established connection drops unexpectedly — cable unplugged, device reset, or out of range — a full-screen <b>alarm</b> warns you that data collection has stopped (a deliberate disconnect won't trigger it).</p>
+
+            <div class="help-section-title">What you can connect to</div>
+            <p>The app auto-detects the device — you don't pick a type. A <b>companion radio</b> (Bluetooth, USB, or WiFi in the Android app) pushes every received packet fully decoded, which is the richest source. A <b>repeater</b> (USB only) instead exposes a text CLI the app drives; how much it can report depends on its firmware (see below).</p>
 
             <div class="help-section-title">Key concepts</div>
             <div class="help-dl">
@@ -306,8 +364,20 @@
                 <li>If a more-precise ID later arrives for one of the siblings, its part of the label is updated too (e.g. <code>1234/1289</code> → <code>123456/1289</code>).</li>
             </ul>
 
+            <div class="help-section-title">Display &amp; appearance</div>
+            <ul class="help-list">
+                <li><b>Theme</b> — the ☀️ / 🌙 button toggles light and dark mode; your choice is remembered.</li>
+                <li><b>Text size</b> — scales the whole interface (Small → Larger) for readability on small or high-DPI screens; remembered across sessions.</li>
+                <li><b>2D graphs dot size</b> — scales the points drawn on the SNR and RSSI charts.</li>
+                <li><b>3D map dot size</b> — set separately in the 3D map's ⚙ menu, alongside the map source, guide lines, and location marker.</li>
+                <li><b>Device location</b> — the 3D map's ⚙ menu can show the connected device's own position (a blue antenna marker), when the companion or repeater reports one. Off by default. A companion shows its current position — its live onboard-GPS fix if it has one, otherwise its configured advert position; a repeater shows its <code>get lat</code>/<code>get lon</code> setting. Nothing appears if the device has no position set. While the marker is shown, a connected <b>companion</b>'s position is re-read about once a second, so one with live GPS tracks your movement; a <b>repeater</b>'s position is static and read once on connect.</li>
+            </ul>
+
+            <div class="help-section-title">Repeater firmware: stock vs. logging build</div>
+            <p>How much a repeater can report depends on its firmware. <b>Stock</b> builds expose only the packet log and neighbour table, so forwarded packets can't be tied to a specific last hop — they show as <b>direct</b> / <b>unknown</b>, and per-node signal comes only from the neighbour table (SNR, no RSSI). A <b>MESH_PACKET_LOGGING</b> build streams raw packets the app decodes for the real last-hop ID with both SNR and RSSI, like a companion — the build to use for a measurement node. Full details are in the project README.</p>
+
             <div class="help-section-title">Android app</div>
-            <p>A native Android wrapper is available for field use. It packages this web app into an APK so it works fully offline — no browser needed. The Bluetooth and GPS work runs in a native foreground service, so <b>data collection keeps going with the screen off or the app in the background</b> — you can drop the phone in your pocket and keep mapping signal as you move. A plain browser tab would suspend and stop collecting once the screen turns off, which is exactly what this avoids.</p>
+            <p>A native Android wrapper is available for field use. It packages this web app into an APK so it works fully offline — no browser needed. It also adds a <b>Connect WiFi</b> option — a raw TCP link to a companion running the WiFi firmware — which a browser can't do. The radio link (Bluetooth, USB or WiFi) and the GPS work run in a native foreground service, so <b>data collection keeps going with the screen off or the app in the background</b> — you can drop the phone in your pocket and keep mapping signal as you move. A plain browser tab would suspend and stop collecting once the screen turns off, which is exactly what this avoids.</p>
             <p>The <b>Keep screen on</b> toggle is a separate convenience for when you do want the display to stay lit — e.g. to watch packets arrive live while walking. It only affects the screen, not collection.</p>
             <p>Source code and APK releases: <a href="https://github.com/kybl/meshcore-signal-tester" target="_blank" rel="noopener">github.com/kybl/meshcore-signal-tester</a></p>
 
@@ -320,6 +390,15 @@
         </div>
     </div>
 
-    <script type="module" src="app.js?v=183"></script>
+    <div id="disconnectAlarm" class="disconnect-alarm hidden">
+        <div class="disconnect-alarm-box">
+            <div class="disconnect-alarm-icon">⚠️</div>
+            <div class="disconnect-alarm-title">Device disconnected</div>
+            <div class="disconnect-alarm-msg">The connection to your MeshCore device was lost unexpectedly. Data collection has stopped.</div>
+            <button id="disconnectAlarmClose" class="btn-primary">Dismiss</button>
+        </div>
+    </div>
+
+    <script type="module" src="app.js?v=237"></script>
 </body>
 </html>

@@ -1,6 +1,29 @@
 // MeshCore Signal Tester Application
 import { MeshCoreDecoder, Utils } from './vendor/meshcore-decoder.js?v=1';
-import { Signal3DMap } from './signal3d.js?v=90';
+import { Signal3DMap } from './signal3d.js?v=103';
+
+// Single source of truth for the released app version, shown in the header (and
+// forwarded to the Android wrapper). Bump this on a release alongside the
+// CHANGELOG and the Android versionName. Distinct from the per-asset ?v= cache
+// busters, which change on every edit.
+const APP_VERSION = '1.1.0';
+
+// Contact-sync resilience. The companion streams its whole contact list as a
+// burst of frames after one CMD_GET_CONTACTS; over BLE that burst can overflow
+// the device's notification queue and drop the tail, so the stream stalls
+// partway and END_OF_CONTACTS never arrives. If no contact frame lands for this
+// long mid-fetch we re-request and merge (contacts upsert by key), up to a cap.
+const CONTACTS_STALL_MS = 4000;
+const CONTACTS_MAX_RETRIES = 8;
+
+// Per-repeater colour: hue, saturation AND lightness are all derived from the id
+// hash, so different repeaters differ in all three — within bounds that keep the
+// colour usable (never grey, never too dark/light). Dark theme lifts the
+// lightness (except the 3D map, whose background is always light). The two
+// pseudo columns 'direct'/'unknown' are drawn as white-filled rings instead.
+const REP_S_MIN = 55, REP_S_MAX = 92;   // saturation range (%) — stays vivid
+const REP_L_MIN = 42, REP_L_MAX = 60;   // lightness range (%) — readable band
+const REP_DARK_BUMP = 18;               // dark theme adds this to lightness
 
 
 
@@ -36,6 +59,35 @@ class MeshCoreApp {
     constructor() {
         this.device = null;
         this.bleRxCharacteristic = null;
+        // Transport abstraction: 'ble' (Nordic UART, one frame per notification)
+        // or 'serial' (Web Serial, length-prefixed frames). null = disconnected.
+        this.transportKind = null;
+        this._serialBtnKind = 'serial';    // which connect button acts as Cancel/Disconnect: 'serial' (USB) or 'wifi'
+        this.serialPort = null;
+        this.serialReader = null;
+        this._serialReadBuffer = new Uint8Array(0);
+        this._serialClosing = false;
+        this._onSerialDisconnect = null;
+        // Connection mode for a serial link: 'companion' (binary frame protocol)
+        // or 'repeater' (plain-text CLI). Decided by probing on connect. null
+        // while detecting, and for BLE (always companion).
+        this.connectionMode = null;
+        this._serialTextBuffer = '';
+        this._textDecoder = new TextDecoder();
+        this._sawCompanionFrame = false;   // set when a companion frame is seen during detection
+        this._sawRepeaterReply = false;    // set when the text CLI answers during detection
+        this._sawRepeaterRaw = false;      // set if the repeater emits RAW packet dumps (logging build)
+        this._repeaterStockNoticed = false;
+        this._neighborSeen = new Map();    // neighbour id → last ingested heard-epoch (dedup)
+        this._neighborPollTimer = null;
+        this._logPollTimer = null;
+        this._pendingRaw = [];             // decoded RAW dumps awaiting their summary line (logging build)
+        this._deviceLocation = null;       // connected device's own position { lat, lon }, or null
+        this._deviceLocPolicy = null;      // companion adv_loc_policy: 0 none, 1 share (live GPS), 2 prefs
+        this._showDeviceMarker = false;    // is the 3D-map device marker enabled
+        this._deviceRefreshTimer = null;   // periodic SELF_INFO re-request while the device marker is shown
+        this._pendingPosFields = [];       // repeater get lat/lon replies awaited, in order
+        this._posQueryTimer = null;
         this.hashData = new Map();
         this.allRepeaters = new Map();
         this.repeaterColumns = []; // sorted by max RSSI descending (strongest first)
@@ -57,6 +109,10 @@ class MeshCoreApp {
         this._contacts = new Map(); // pubKeyFullHex → {name, type, lat, lon, lastAdvert, lastmod}
         this._contactsLastmod = 0;
         this._contactsReceiving = false;
+        this._contactsRetries = 0;
+        this._contactsLastStallSize = -1;
+        this._contactsFetchedKeys = new Set();   // keys received during the current fetch
+        this._contactsFetchActive = false;       // a GET_CONTACTS dump is in progress
         this._selShowMore = false;
         this._filterShowMore = false;
         this._mapPins = new Set(); // pubKeyFullHex of contacts pinned to 3D map
@@ -64,6 +120,7 @@ class MeshCoreApp {
         this._onBatteryChanged = null;
         this._useAbbreviatedTypes = false;
         this._selectedCol = null;
+        this._tooltipPinned = false;
         this._snrShowIncoming = true;
         this._snrShowOutgoing = true;
         this._rxTimestamps = [];
@@ -97,7 +154,17 @@ class MeshCoreApp {
             btn.classList.remove('collecting');
             if (!this._chartFrozenAt) this._chartFrozenAt = Date.now();
         }
+        // While connected, the frame is green when collecting and yellow when
+        // paused (Stopped). When disconnected, leave the frame colour alone —
+        // updateStatus() owns it then.
+        if (connected) {
+            this.statusEl.classList.remove('disconnected', 'connecting');
+            this.statusEl.classList.toggle('connected', this._collecting);
+            this.statusEl.classList.toggle('paused', !this._collecting);
+        }
         this._syncWakeLock();
+        // Keep the Android notification in step with the pause state.
+        this._refreshNativeStatus();
     }
 
     _syncWakeLock() {
@@ -108,6 +175,8 @@ class MeshCoreApp {
     initUI() {
         this.connectBtn = document.getElementById('connectBtn');
         this.statusEl = document.getElementById('status');
+        this.statusTextEl = document.getElementById('statusText');
+        this.connectedNameEl = document.getElementById('connectedDeviceName');
         this.batteryEl = document.getElementById('batteryStatus');
         this.rssiChartWrap = document.getElementById('rssiChartWrap');
         this.rssiChartSvg  = document.getElementById('rssiChart');
@@ -187,6 +256,7 @@ class MeshCoreApp {
         this.repTableBody = document.getElementById('repTableBody');
         this.soundSelect = document.getElementById('soundSelect');
         this.soundSelect.value = Store.get('sound', this.soundSelect.value);
+        this._updateSoundHighlight();
         this.tooltip = document.getElementById('chartTooltip');
 
         document.getElementById('pauseBtn')?.addEventListener('click', () => {
@@ -196,6 +266,22 @@ class MeshCoreApp {
         });
 
         this.connectBtn.onclick = () => this.connectBluetooth();
+
+        this.connectUsbBtn = document.getElementById('connectUsbBtn');
+        // The USB button is always shown and enabled. If Web Serial isn't
+        // available, the click handler explains that — the control never
+        // silently disappears (matching how the Bluetooth button behaves).
+        if (this.connectUsbBtn) this.connectUsbBtn.onclick = () => this.connectUsb();
+
+        this.connectWifiBtn = document.getElementById('connectWifiBtn');
+        // Shown everywhere, but WiFi (raw TCP) only works in the native Android
+        // host; in a plain browser the handler explains why and what to use.
+        if (this.connectWifiBtn) this.connectWifiBtn.onclick = () => this.connectWifi();
+
+        // Dedicated Disconnect control — only visible (via CSS) while connected.
+        document.getElementById('disconnectBtn')?.addEventListener('click', () => this.disconnect());
+
+        document.getElementById('disconnectAlarmClose')?.addEventListener('click', () => this._hideDisconnectAlarm());
 
         // Pair-hover: hovering RSSI or SNR highlights both cells for that repeater
         if (this.msgTableBody) {
@@ -223,23 +309,17 @@ class MeshCoreApp {
 
         const bindChartTooltip = (svg, type) => {
             if (!svg) return;
-            let lastTouch = 0;
+            // Desktop: hover shows a transient preview. A tap/click (here and on
+            // touch) pins the infobox via _onChartClick — it then stays put (no
+            // auto-hide) until tapped again or dismissed by clicking the infobox.
             svg.addEventListener('mousemove', e => this.showChartTooltip(e, type));
-            svg.addEventListener('mouseleave', () => {
-                if (Date.now() - lastTouch > 400) this.hideChartTooltip();
-            });
+            svg.addEventListener('mouseleave', () => this.hideChartTooltip());
             svg.addEventListener('click', e => this._onChartClick(e, type));
-            svg.addEventListener('touchstart', e => {
-                lastTouch = Date.now();
-                if (e.touches.length === 1) this.showChartTooltip(e.touches[0], type);
-            }, { passive: true });
-            svg.addEventListener('touchend', () => {
-                lastTouch = Date.now();
-                setTimeout(() => this.hideChartTooltip(), 2500);
-            });
         };
         bindChartTooltip(this.rssiChartSvg, 'rssi');
         bindChartTooltip(this.snrChartSvg,  'snr');
+        // Click the infobox itself to dismiss it.
+        this.tooltip?.addEventListener('click', () => this.hideChartTooltip(true));
 
         const snrInCb  = document.getElementById('snrShowIncoming');
         const snrOutCb = document.getElementById('snrShowOutgoing');
@@ -334,8 +414,13 @@ class MeshCoreApp {
 
         document.getElementById('discoverBtn')?.addEventListener('click', () => this.startDiscoverSequence(0x0F).catch(e => console.error('Discover failed:', e)));
 
+        document.getElementById('repeaterNoticeClose')?.addEventListener('click', () => document.getElementById('repeaterNotice')?.classList.add('hidden'));
+
         this.soundSelect?.addEventListener('change', () => {
             Store.set('sound', this.soundSelect.value);
+            this._updateSoundHighlight();
+            // Show/hide the speaker icon in the Android notification.
+            this._refreshNativeStatus();
         });
 
         // Keep screen on
@@ -474,6 +559,9 @@ class MeshCoreApp {
             const mapContainer = document.querySelector('.map-container');
             fsBtn.addEventListener('click', () => {
                 if (!document.fullscreenElement) {
+                    // Remember where the page was scrolled so we can return there
+                    // on exit — entering fullscreen resets the document scroll.
+                    this._preFsScrollY = window.scrollY || window.pageYOffset || 0;
                     mapContainer?.requestFullscreen().catch(() => {});
                 } else {
                     document.exitFullscreen();
@@ -483,6 +571,17 @@ class MeshCoreApp {
                 const isFs = !!document.fullscreenElement;
                 fsBtn.textContent = isFs ? '✕' : '⛶';
                 fsBtn.title = isFs ? 'Exit fullscreen' : 'Fullscreen';
+                if (!isFs) {
+                    // Restore the page scroll after leaving fullscreen. The reset
+                    // can land a frame or two later (especially in the Android
+                    // WebView), so re-apply across a few ticks.
+                    const y = this._preFsScrollY || 0;
+                    const restore = () => window.scrollTo(0, y);
+                    restore();
+                    requestAnimationFrame(restore);
+                    setTimeout(restore, 60);
+                    setTimeout(restore, 200);
+                }
             });
         }
 
@@ -556,6 +655,7 @@ class MeshCoreApp {
         });
 
         this._initHelpSystem();
+        this._initWifiModal();
         this._initSignalMap();
         this._initDebug();
     }
@@ -646,11 +746,19 @@ class MeshCoreApp {
                 infoEl:        document.getElementById('mapInfo'),
                 colorFor:      col => this.getRepeaterColor(col),
                 displayId:     col => this.displayId(col),
+                onFollowChange: on => {
+                    const b = document.getElementById('centerOnMeBtn');
+                    if (!b) return;
+                    b.classList.toggle('active', on);
+                    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+                },
                 nameForCol:    col => this._contactNameForCol(col),
+                isLiveCapture: () => this._collecting,   // tiles follow the user only while live
                 initialSource:  sourceSel?.value,
                 initialSphereSize: this._sphereSize,
                 initialClusterRadius: Store.num('clusterRadius', 0),
                 initialPerspSize: Store.bool('perspSize', true),
+                showDevice:    Store.bool('showDevice', false),
                 onSelect:      col => {
                     this._selectRepeater(col);
                 },
@@ -682,6 +790,7 @@ class MeshCoreApp {
                         this._updateCornerNotices();
                     }
                 },
+                onToggleMapPin: col => this._toggleMapPinForCol(col),
             });
         } catch (_) {
             this.signalMap = null;
@@ -715,6 +824,7 @@ class MeshCoreApp {
 
         const showLinesChk      = document.getElementById('showLinesChk');
         const showMarkerChk     = document.getElementById('showMarkerChk');
+        const showDeviceChk     = document.getElementById('showDeviceChk');
         const clusterSel        = document.getElementById('clusterRadiusSelect');
         const perspSizeChk      = document.getElementById('perspSizeChk');
         showLinesChk?.addEventListener('change', () => {
@@ -724,6 +834,12 @@ class MeshCoreApp {
         showMarkerChk?.addEventListener('change', () => {
             this.signalMap?.setShowMarker(showMarkerChk.checked);
             Store.set('showMarker', showMarkerChk.checked);
+        });
+        showDeviceChk?.addEventListener('change', () => {
+            this._showDeviceMarker = showDeviceChk.checked;
+            this.signalMap?.setShowDeviceMarker(showDeviceChk.checked);
+            Store.set('showDevice', showDeviceChk.checked);
+            this._updateDeviceLocationRefresh();   // start/stop position polling
         });
         clusterSel?.addEventListener('change', () => {
             this.signalMap?.setClusterRadius(parseFloat(clusterSel.value));
@@ -739,10 +855,14 @@ class MeshCoreApp {
         if (showLinesChk)  { showLinesChk.checked  = showLines;  this.signalMap?.setShowLines(showLines); }
         const showMarker = Store.bool('showMarker', true);
         if (showMarkerChk) { showMarkerChk.checked = showMarker; this.signalMap?.setShowMarker(showMarker); }
+        const showDevice = Store.bool('showDevice', false);
+        this._showDeviceMarker = showDevice;
+        if (showDeviceChk) { showDeviceChk.checked = showDevice; this.signalMap?.setShowDeviceMarker(showDevice); }
         if (clusterSel)   clusterSel.value   = String(Store.num('clusterRadius', 0));
         if (perspSizeChk)    perspSizeChk.checked    = Store.bool('perspSize', true);
 
         document.getElementById('showAllRepeatersBtn')?.addEventListener('click', () => this._toggleAllRepeatersOnMap());
+        document.getElementById('centerOnMeBtn')?.addEventListener('click', () => this.signalMap?.toggleFollowUser());
     }
 
     _activeCols() {
@@ -790,6 +910,8 @@ class MeshCoreApp {
     }
 
     _initHelpSystem() {
+        const verEl = document.getElementById('appVersion');
+        if (verEl) verEl.textContent = 'v' + APP_VERSION;
         const HELP = {
             'active':
                 'Unique packets in the current display window. Data outside the window is still stored (see Auto-remove) but not shown (see Display).',
@@ -800,11 +922,11 @@ class MeshCoreApp {
             'contacts':
                 'Nodes known from the contact list synced from your device (name, public key, GPS position). Used to label repeaters, show their position on the 3D map, and resolve short IDs. Updated automatically on connect and when new adverts arrive.',
             'contact-unknown':
-                'This repeater is not in the contact list and hasn\'t responded to discovery yet. If you know roughly where it is, try "Discover nodes" in the Active Ping section — it may respond and reveal its name and position. Connecting your device via Bluetooth and syncing contacts can also help significantly.',
+                'This repeater is not in the contact list and hasn\'t responded to discovery yet. If you know roughly where it is, try the "Discover nodes" button — it may respond and reveal its name and position. Connecting your device via Bluetooth and syncing contacts can also help significantly.',
             'contact-no-gps':
                 'The owner of this node hasn\'t configured its position.',
             'sound':
-                'off = silent. short / medium / long play a two-tone beep of increasing duration (long is 4× short) on each new packet. The first tone (1/3 of the beep) is a fixed 700 Hz click; the second tone (2/3) shifts pitch with SNR — higher SNR → higher pitch. Setting is remembered across sessions.',
+                'off = silent. short / medium / long play a two-tone beep of increasing duration (long is 4× short) on each new packet. The first tone (1/3 of the beep) is a fixed 700 Hz click; the second tone (2/3) shifts pitch with SNR — higher SNR → higher pitch. When a repeater filter is active, the alert sounds only for packets from the filtered repeater(s). Setting is remembered across sessions.',
             'ttl':
                 'Data older than this window is permanently deleted — packets, signal history, seen repeaters, and 3D map points all expire together. Collision labels are recalculated when their evidence ages out. "Never" keeps everything for the whole session (set automatically on CSV import).',
             'display':
@@ -818,19 +940,23 @@ class MeshCoreApp {
             'snr':
                 'Signal-to-Noise Ratio in dB. Positive = signal is above the noise. LoRa can decode even at negative SNR (down to ~−20 dB).',
             'chart-snr':
-                'Click a dot to select that repeater — dims others across both charts, Seen Repeaters, Received Packets, and the 3D map; click again or elsewhere to deselect. A notice appears top-right with options to filter or deselect. Circles = incoming SNR; stars (★) = outgoing SNR reported by the remote node via Discover.',
+                'Click a dot to select that repeater — dims others across both charts, Seen Repeaters, Received Packets, and the 3D map; click again or elsewhere to deselect. A notice appears top-right with options to filter or deselect. Hover or tap a point to see its exact ID, SNR/RSSI and time in a small box; click the box to dismiss it. Circles (●) = incoming SNR; stars (★) = outgoing SNR reported by the remote node via Discover.',
             'chart-interact':
-                'Click a dot to select that repeater — dims others across both charts, Seen Repeaters, Received Packets, and the 3D map; click again or elsewhere to deselect. A notice appears top-right with options to filter or deselect. The shaded area shows the estimated noise floor (RSSI − SNR).',
+                'Click a dot to select that repeater — dims others across both charts, Seen Repeaters, Received Packets, and the 3D map; click again or elsewhere to deselect. A notice appears top-right with options to filter or deselect. Hover or tap a point to see its exact ID, RSSI/SNR and time in a small box; click the box to dismiss it. The shaded area shows the estimated noise floor (RSSI − SNR).',
             'rate':
                 'Packets received in the last 60 seconds (rolling). Resets to 0 when the network goes quiet.',
             'rep-filter':
                 'Comma-separated list of repeater IDs to keep visible. Matching is prefix-based and works either way — "3E" matches "3E2F1234" and vice versa. Affects Seen Repeaters, charts, Received Packets, and the 3D map. A notice appears top-right while a filter is active.',
             'messages':
                 'Click any RSSI or SNR cell to expand full packet detail and raw hex, including reception time with millisecond precision. Click the hex string in an expanded row to copy it to the clipboard. Click a repeater column header to select that repeater — syncs with Seen Repeaters, charts, and 3D map. Repeater columns are ordered by: packets received in the last 5 min (desc), then last RSSI, last SNR, total RX count, then alphabetically.',
+            'msg-filter':
+                'Keeps only the packets that match what you type — a case-insensitive substring search across several fields at once: the packet type (full or abbreviated, e.g. "advert", "GT", "traceroute"), a repeater\'s short ID or its synced contact name, the decoded message text and sender (when available — most traffic is encrypted, so this is often empty), and the raw packet hex. The count next to the box shows matching / total. Clear with the ✕.',
             'msg-type':
                 'Type abbreviations — AD: Advert · GT: GroupText · TR: Traceroute · RS: Response · RQ: Request · PN: Ping · TX: TextMessage · PT: Path · CT: Control · PV: Private · RD: Repeater DSC (discover response, includes uplink SNR). Full type is shown in the expanded row.',
             'signal3d':
-                'Interactive 3D map of received signal quality. Each dot is positioned at your GPS location at reception time; height reflects SNR (taller = higher SNR). Click a dot to select that repeater — shows an info panel and syncs the selection across Seen Repeaters, charts, and Received Packets. Use ⚙ (top right) to change map source, dot size, guide lines, and the location marker. Navigation: drag to pan · scroll/pinch to zoom · right-drag to tilt/rotate.',
+                'Interactive 3D map of received signal quality. Each dot is positioned at your GPS location at reception time; height reflects SNR (taller = higher SNR). Click a dot to select that repeater — shows an info panel and syncs the selection across Seen Repeaters, charts, and Received Packets. When the repeater\'s own position is known, the info panel offers an eye button (turn the camera toward it) and a pushpin (keep it on the map — tilted = shown only temporarily, upright = kept permanently). "Center on me" is a toggle — it recentres on your location and then follows you as you move (the camera tracks your GPS); press it again, or pan/rotate the map yourself, to stop following. "Show all repeaters" adds every known position. Use ⚙ (top right) to change map source, dot size, guide lines, your own location marker, and the connected device\'s own location (a blue antenna marker, shown when the radio or repeater reports a position). Navigation: drag to pan · scroll/pinch to zoom · two-finger twist (or right-drag) to tilt/rotate.',
+            'device-location':
+                'Shows the connected device\'s own position on the map (a blue antenna marker). While this is on, the app keeps asking the radio for its location, which means more constant work and can drain the battery faster. If you don\'t need it, turn it off.',
             'discover':
                 'Sends an active DISCOVER_REQ broadcast — this is not passive listening, it injects traffic into the mesh. Nearby nodes with firmware ≥ v1.10 reply with their public key, name, GPS position, and the SNR they measured for your signal (uplink). Please don\'t press it more than once a minute.',
         };
@@ -885,11 +1011,10 @@ class MeshCoreApp {
         const helpModal = document.getElementById('helpModal');
         const openHelp = () => {
             helpModal?.classList.remove('hidden');
-            document.body.style.overflow = 'hidden';
+            helpModal?.querySelector('.help-modal')?.scrollTo(0, 0);
         };
         const closeHelp = () => {
             helpModal?.classList.add('hidden');
-            document.body.style.overflow = '';
         };
         document.getElementById('helpBtn')?.addEventListener('click', e => {
             e.stopPropagation();
@@ -914,6 +1039,22 @@ class MeshCoreApp {
                 closeHelp();
             }
         });
+
+        // Android hardware Back button (called from the native host). Close the
+        // topmost open overlay instead of leaving the app; return true when we
+        // handled it so the native side knows not to background the app.
+        window.__mcHandleBack = () => {
+            const wifiModal = document.getElementById('wifiModal');
+            if (wifiModal && !wifiModal.classList.contains('hidden')) { wifiModal.classList.add('hidden'); return true; }
+            if (tipEl && tipEl.style.display === 'block') { hideTip(); return true; }
+            if (helpModal && !helpModal.classList.contains('hidden')) { closeHelp(); return true; }
+            const settings = document.getElementById('mapSettingsPanel');
+            if (settings && !settings.classList.contains('hidden')) {
+                settings.classList.add('hidden');
+                return true;
+            }
+            return false;
+        };
     }
 
     // --- Bluetooth connection ---
@@ -924,8 +1065,8 @@ class MeshCoreApp {
             return;
         }
         try {
-            this.connectBtn.disabled = true;
-            this.updateStatus('Scanning...', 'disconnected');
+            this._beginConnectAttempt('ble');
+            this.updateStatus('Scanning…', 'connecting');
             const device = await navigator.bluetooth.requestDevice({
                 filters: [
                     { namePrefix: 'Meshtastic' },
@@ -947,6 +1088,14 @@ class MeshCoreApp {
     }
 
     async quickConnect(deviceId) {
+        const saved = this.getSavedDevices().find(d => d.id === deviceId);
+        if (saved?.transport === 'serial') {
+            return this.quickConnectSerial(saved);
+        }
+        if (saved?.transport === 'wifi') {
+            return this.quickConnectWifi(saved);
+        }
+
         // Try getDevices() for zero-friction reconnect (Chrome 85+, may need flag)
         if (navigator.bluetooth?.getDevices) {
             let device;
@@ -971,11 +1120,10 @@ class MeshCoreApp {
         }
 
         // Fall back to requestDevice — use saved name as filter so picker pre-selects it
-        const saved = this.getSavedDevices().find(d => d.id === deviceId);
         const name = saved?.name;
         try {
-            this.connectBtn.disabled = true;
-            this.updateStatus('Scanning...', 'disconnected');
+            this._beginConnectAttempt('ble');
+            this.updateStatus('Scanning…', 'connecting');
             const filters = (name && name !== 'Unknown')
                 ? [{ name }]
                 : [{ namePrefix: 'Meshtastic' }, { namePrefix: 'MeshCore' }];
@@ -996,18 +1144,100 @@ class MeshCoreApp {
         }
     }
 
+    async quickConnectSerial(saved) {
+        if (!navigator.serial) {
+            alert('Web Serial API is not available.\n\nRequirements:\n• Chrome, Edge, or Opera (desktop)\n• Page must be served over HTTPS or localhost');
+            return;
+        }
+        try {
+            this._beginConnectAttempt('serial');
+            this.updateStatus('Scanning…', 'connecting');
+
+            // Look for an already-authorised port matching the saved vid/pid so
+            // we can skip the picker entirely. Only match when we have a real
+            // USB id — otherwise distinct ports would be indistinguishable.
+            let port = null;
+            if (saved.usbVendorId != null || saved.usbProductId != null) {
+                try {
+                    const ports = await navigator.serial.getPorts();
+                    port = ports.find(p => {
+                        let info = {};
+                        try { info = p.getInfo?.() || {}; } catch (e) {}
+                        return info.usbVendorId === saved.usbVendorId
+                            && info.usbProductId === saved.usbProductId;
+                    }) || null;
+                } catch (e) { console.warn('getPorts failed:', e); }
+            }
+
+            // No authorised match (first use on this machine, permission reset,
+            // etc.) — fall back to the picker, exactly like the BLE path does.
+            if (!port) port = await navigator.serial.requestPort({ filters: [] });
+
+            await this.connectToSerialPort(port);
+        } catch (error) {
+            if (error.name !== 'NotFoundError') {
+                alert('Connection error: ' + error.message);
+            }
+            if (this.serialPort || this.device) this.onDisconnected();
+            else this._resetConnectBtn();
+        }
+    }
+
     _resetConnectBtn() {
         this.updateStatus('Disconnected', 'disconnected');
+        this._setConnectIdle();
+    }
+
+    // Idle state: every transport button offers to start a connection.
+    _setConnectIdle() {
         this.connectBtn.textContent = 'Connect Bluetooth';
         this.connectBtn.disabled = false;
         this.connectBtn.onclick = () => this.connectBluetooth();
+        this.connectBtn.classList.remove('hidden', 'btn-action');
+        if (this.connectUsbBtn) {
+            this.connectUsbBtn.textContent = 'Connect USB';
+            this.connectUsbBtn.disabled = false;
+            this.connectUsbBtn.onclick = () => this.connectUsb();
+            this.connectUsbBtn.classList.remove('hidden', 'btn-action');
+        }
+        if (this.connectWifiBtn) {
+            this.connectWifiBtn.textContent = 'Connect WiFi';
+            this.connectWifiBtn.disabled = false;
+            this.connectWifiBtn.onclick = () => this.connectWifi();
+            this.connectWifiBtn.classList.remove('hidden', 'btn-action');
+        }
+    }
+
+    // Start of a connection attempt: visually mark ONLY the chosen transport's
+    // button (it goes disabled/greyed while scanning), leaving the other
+    // transports' buttons untouched — normal colour, sub-labels still showing.
+    // The modal device picker blocks page interaction, so there's no need to
+    // disable the others to prevent a parallel attempt.
+    _beginConnectAttempt(kind) {
+        const btns = { ble: this.connectBtn, serial: this.connectUsbBtn, wifi: this.connectWifiBtn };
+        if (btns[kind]) btns[kind].disabled = true;
+    }
+
+    // Make one transport's button the active Cancel/Disconnect control and hide
+    // the others so a second connection can't be started during one attempt.
+    _setActiveTransportBtn(kind, label, onClick) {
+        const btns = { ble: this.connectBtn, serial: this.connectUsbBtn, wifi: this.connectWifiBtn };
+        const active = btns[kind];
+        // btn-action marks the button as showing Cancel/Disconnect (not a
+        // "Connect …" label), which hides its companion/repeater sub-label.
+        if (active) { active.textContent = label; active.disabled = false; active.onclick = onClick; active.classList.remove('hidden'); active.classList.add('btn-action'); }
+        for (const k of Object.keys(btns)) {
+            if (k === kind) continue;
+            const b = btns[k];
+            if (b) { b.disabled = true; b.classList.add('hidden'); b.classList.remove('btn-action'); }
+        }
     }
 
     async connectToDevice(device) {
-        this.connectBtn.textContent = 'Cancel';
-        this.connectBtn.disabled = false;
-        this.connectBtn.onclick = () => this.disconnect();
-        this.updateStatus('Connecting...', 'disconnected');
+        this._setActiveTransportBtn('ble', 'Cancel', () => this.disconnect());
+        this.updateStatus('Connecting…', 'connecting');
+        this.transportKind = 'ble';
+        this.connectionMode = 'companion';   // BLE is always the companion protocol
         this.device = device;
 
         // Nordic UART Service (NUS) — a de-facto industry standard from Nordic
@@ -1064,13 +1294,16 @@ class MeshCoreApp {
         // Battery is read from MeshCore opcode 0x0c (voltage in mV) — more
         // accurate than the BLE Battery Service which some devices report as 100%.
 
-        this.saveDevice(device);
+        this._setConnectedDeviceName(this.saveDevice(device));
 
-        this.updateStatus('Connected', 'connected');
-        this.connectBtn.textContent = 'Disconnect';
-        this.connectBtn.disabled = false;
-        this.connectBtn.onclick = () => this.disconnect();
+        this.updateStatus('Connected (companion)', 'connected');
+        this._setActiveTransportBtn('ble', 'Disconnect', () => this.disconnect());
+        this._updateSoundHighlight();
         this._collecting = true;
+        // A fully-established connection: from here a drop we didn't initiate is
+        // a surprise disconnect and should raise the alarm.
+        this._wasConnected = true;
+        this._intentionalDisconnect = false;
         this._updatePauseBtn();
         if (this.emptyState) {
             const p = this.emptyState.querySelector('p');
@@ -1082,6 +1315,9 @@ class MeshCoreApp {
     _startConnectionMonitor() {
         clearTimeout(this._monitorDelay);
         clearInterval(this._connectionMonitor);
+        // Serial disconnects are detected by the read loop / port 'disconnect'
+        // event, not by polling gatt.connected — skip the monitor for serial.
+        if (this.transportKind === 'serial') return;
         // Delay first check: gatt.connected can be transiently false during GATT setup
         this._monitorDelay = setTimeout(() => {
             this._monitorDelay = null;
@@ -1093,22 +1329,657 @@ class MeshCoreApp {
         }, 5000);
     }
 
+    // --- USB / Web Serial connection ---
+
+    async connectUsb() {
+        if (!navigator.serial) {
+            alert('Web Serial API is not available.\n\nRequirements:\n• Chrome, Edge, or Opera (desktop)\n• Page must be served over HTTPS or localhost');
+            return;
+        }
+        try {
+            this._beginConnectAttempt('serial');
+            this.updateStatus('Scanning…', 'connecting');
+            // No filters — MeshCore companions appear behind many USB-serial
+            // bridges (CP210x, CH340, native USB CDC), so we let the user pick.
+            const port = await navigator.serial.requestPort({ filters: [] });
+            await this.connectToSerialPort(port);
+        } catch (error) {
+            if (error.name !== 'NotFoundError') {
+                alert('Connection error: ' + error.message);
+            }
+            if (this.serialPort || this.device) this.onDisconnected();
+            else this._resetConnectBtn();
+        }
+    }
+
+    async connectWifi() {
+        // Raw TCP can't be opened from a browser; only the native Android host
+        // can. Off-app, explain why and where it works (the button is shown
+        // everywhere by request).
+        if (!window.__MESHCORE_NATIVE__ || typeof window.__mcMakeWifiPort !== 'function') {
+            // Flash the WiFi button as the pressed/active one while the
+            // explanatory message is up, then restore it — same feedback as
+            // BLE/USB get, even though WiFi can't actually connect in a browser.
+            this._beginConnectAttempt('wifi');
+            // Let the browser paint the pressed state before the blocking alert.
+            await new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
+            alert('WiFi connection isn’t available in the browser.\n\n'
+                + 'MeshCore’s WiFi companion firmware speaks raw TCP, and browsers can’t open raw TCP '
+                + 'sockets — so connecting over WiFi only works in the Android app, which opens the socket '
+                + 'natively.\n\n'
+                + 'Here in the browser, use Bluetooth or USB instead.\n\n'
+                + 'Note: repeaters have no WiFi (and no Bluetooth) — they connect over USB only.');
+            if (this.connectWifiBtn) this.connectWifiBtn.disabled = false;
+            return;
+        }
+        this._openWifiModal();
+    }
+
+    _initWifiModal() {
+        const modal = document.getElementById('wifiModal');
+        if (!modal) return;
+        const close = () => this._closeWifiModal();
+        document.getElementById('wifiModalClose')?.addEventListener('click', close);
+        document.getElementById('wifiModalCancel')?.addEventListener('click', close);
+        modal.addEventListener('click', e => { if (e.target === modal) close(); });
+        document.getElementById('wifiModalConnect')?.addEventListener('click', () => this._submitWifiModal());
+        for (const id of ['wifiHostInput', 'wifiPortInput']) {
+            document.getElementById(id)?.addEventListener('keydown', e => {
+                if (e.key === 'Enter') { e.preventDefault(); this._submitWifiModal(); }
+            });
+        }
+    }
+
+    _openWifiModal() {
+        const modal = document.getElementById('wifiModal');
+        if (!modal) return;
+        const hostEl = document.getElementById('wifiHostInput');
+        const portEl = document.getElementById('wifiPortInput');
+        const errEl  = document.getElementById('wifiModalError');
+        if (hostEl) hostEl.value = Store.get('wifiHost', '');
+        if (portEl) portEl.value = Store.get('wifiPort', '5000');
+        if (errEl)  { errEl.textContent = ''; errEl.classList.add('hidden'); }
+        modal.classList.remove('hidden');
+        setTimeout(() => hostEl?.focus(), 50);
+    }
+
+    _closeWifiModal() {
+        document.getElementById('wifiModal')?.classList.add('hidden');
+    }
+
+    _submitWifiModal() {
+        const host = (document.getElementById('wifiHostInput')?.value || '').trim();
+        const port = parseInt(document.getElementById('wifiPortInput')?.value, 10);
+        const errEl = document.getElementById('wifiModalError');
+        const fail = (msg) => { if (errEl) { errEl.textContent = msg; errEl.classList.remove('hidden'); } };
+        if (!host || !/^[0-9a-zA-Z.\-]+$/.test(host)) { fail('Enter a valid IP address or hostname.'); return; }
+        if (!(port >= 1 && port <= 65535)) { fail('Enter a port between 1 and 65535.'); return; }
+        Store.set('wifiHost', host);
+        Store.set('wifiPort', String(port));
+        this._closeWifiModal();
+        this._doWifiConnect(host, port);
+    }
+
+    // Open a WiFi/TCP companion at host:port. Shared by the connect form and by
+    // quick-reconnect of a saved WiFi device.
+    async _doWifiConnect(host, port) {
+        try {
+            this._beginConnectAttempt('wifi');
+            this.updateStatus('Connecting…', 'connecting');
+            const port_ = window.__mcMakeWifiPort(host, port);
+            await this.connectToSerialPort(port_);
+        } catch (error) {
+            alert('WiFi connection failed: ' + (error.message || error));
+            if (this.serialPort || this.device) this.onDisconnected();
+            else this._resetConnectBtn();
+        }
+    }
+
+    async quickConnectWifi(saved) {
+        if (!window.__MESHCORE_NATIVE__ || typeof window.__mcMakeWifiPort !== 'function') {
+            alert('This is a saved WiFi device — WiFi connection only works in the Android app.');
+            return;
+        }
+        await this._doWifiConnect(saved.host, saved.port);
+    }
+
+    async connectToSerialPort(port) {
+        // A WiFi/TCP companion is a serial-like port (same frame protocol) but
+        // surfaced through the native host; track which so the right button acts
+        // as Cancel/Disconnect and so we can tailor messaging.
+        let isWifi = false;
+        try { isWifi = !!port.getInfo?.().wifi; } catch (e) {}
+        this._serialBtnKind = isWifi ? 'wifi' : 'serial';
+
+        this._setActiveTransportBtn(this._serialBtnKind, 'Cancel', () => this.disconnect());
+        this.updateStatus('Connecting…', 'connecting');
+
+        await port.open({ baudRate: 115200 });
+
+        this.transportKind = 'serial';
+        this.connectionMode = null;        // unknown until detection completes
+        this.serialPort = port;
+        // A lightweight stand-in for the BLE device object so that the many
+        // `this.device` "are we connected?" guards across the app keep working.
+        this.device = { kind: 'serial' };
+        this._serialReadBuffer = new Uint8Array(0);
+        this._serialTextBuffer = '';
+        this._serialClosing = false;
+        this._sawCompanionFrame = false;
+        this.serialReader = port.readable.getReader();
+
+        // Physical unplug fires a 'disconnect' event on the port.
+        this._onSerialDisconnect = () => this.onDisconnected();
+        port.addEventListener('disconnect', this._onSerialDisconnect);
+
+        this._startSerialReadLoop(port);
+
+        // --- Device-type detection (three-way) ---
+        // 1) Companion: answers our binary frames with 0x3e (radio→app) replies.
+        //    APP_START alone may not self-reply, so we also send a contacts
+        //    request, which a companion always answers.
+        // 2) Repeater: speaks a plain-text CLI — it answers 'ver' with a "  -> "
+        //    reply. (A companion radio usually speaks the companion protocol only
+        //    over Bluetooth, so a companion plugged in by USB answers neither and
+        //    must be reported as an error, not a fake connection.)
+        this.updateStatus('Detecting device…', 'connecting');
+
+        // Phase 1 — companion probe.
+        await this.sendAppStart();
+        await new Promise(r => setTimeout(r, 200));
+        if (this.serialPort === port && !this._sawCompanionFrame) {
+            try { await this._sendFrame(new Uint8Array([0x04])); } catch (e) {}  // CMD_GET_CONTACTS
+        }
+        for (let i = 0; i < 14 && !this._sawCompanionFrame && this.serialPort === port; i++) {
+            await new Promise(r => setTimeout(r, 100));
+        }
+        if (this.serialPort !== port) return;   // disconnected mid-detection
+        if (this._sawCompanionFrame) { await this._finishCompanionConnect(port); return; }
+
+        // WiFi only ever reaches a companion (repeaters have no WiFi), and the
+        // text CLI probe below is meaningless over TCP — so stop here with a
+        // WiFi-specific message rather than falling through to the repeater path.
+        if (isWifi) {
+            this.updateStatus('No MeshCore companion found', 'disconnected');
+            alert('No MeshCore companion answered at that WiFi address.\n\n'
+                + 'Check that:\n'
+                + '• the IP and port are correct,\n'
+                + '• the device runs the WiFi companion firmware,\n'
+                + '• your phone is on the same WiFi network.');
+            this.onDisconnected();
+            return;
+        }
+
+        // Phase 2 — repeater probe over the text CLI.
+        this.connectionMode = 'repeater';   // route the read loop to the text parser
+        this._serialReadBuffer = new Uint8Array(0);
+        this._serialTextBuffer = '';
+        this._sawRepeaterReply = false;
+        await this._serialWriteText('\r\n');
+        await new Promise(r => setTimeout(r, 150));
+        await this._serialWriteText('ver\r\n');
+        for (let i = 0; i < 14 && !this._sawRepeaterReply && this.serialPort === port; i++) {
+            await new Promise(r => setTimeout(r, 100));
+        }
+        if (this.serialPort !== port) return;
+
+        if (this._sawRepeaterReply) {
+            await this._finishRepeaterConnect(port);
+        } else {
+            // Phase 3 — neither protocol answered.
+            this.updateStatus('Unsupported device', 'disconnected');
+            alert('This USB serial device didn\'t respond as a MeshCore companion or repeater.\n\n'
+                + 'Note: connecting a companion radio over USB usually requires a special USB firmware build. '
+                + 'Some companion devices do have this firmware, so if yours does, it should work here. '
+                + 'Standard companion radios connect via Bluetooth. '
+                + 'USB is also supported for MeshCore repeaters.');
+            this.onDisconnected();
+        }
+    }
+
+    // Finalise a companion (binary frame protocol) serial connection.
+    async _finishCompanionConnect(port) {
+        this.connectionMode = 'companion';
+        await this.sendGetContacts();
+        this._setConnectedDeviceName(this.saveSerialPort(port));
+        this.updateStatus('Connected (companion)', 'connected');
+        this._setActiveTransportBtn(this._serialBtnKind || 'serial', 'Disconnect', () => this.disconnect());
+        this._updateSoundHighlight();
+        this._collecting = true;
+        // A fully-established connection: from here a drop we didn't initiate is
+        // a surprise disconnect and should raise the alarm.
+        this._wasConnected = true;
+        this._intentionalDisconnect = false;
+        this._updatePauseBtn();
+        if (this.emptyState) {
+            const p = this.emptyState.querySelector('p');
+            if (p) p.textContent = 'Connected. Waiting for first RX log…';
+        }
+    }
+
+    // Finalise a repeater (text CLI) serial connection: switch serial parsing to
+    // line mode, flush the binary probe junk out of the repeater's command
+    // buffer, then start packet logging.
+    async _finishRepeaterConnect(port) {
+        this.connectionMode = 'repeater';
+        // From here the stream is text; drop whatever the frame detector held.
+        this._serialReadBuffer = new Uint8Array(0);
+        this._serialTextBuffer = '';
+        // A leading newline terminates the leftover APP_START bytes sitting in
+        // the repeater's CLI buffer (run as one bogus command, harmlessly), so
+        // the following 'log start' parses cleanly.
+        await this._serialWriteText('\r\n');
+        await new Promise(r => setTimeout(r, 150));
+        await this._serialWriteText('log start\r\n');   // enable packet logging to file
+        await this._serialWriteText('log erase\r\n');   // drop stale backlog; we timestamp at reception
+
+        this._neighborSeen = new Map();
+        this._pendingRaw = [];
+        this._startRepeaterPolling();
+        // Read the repeater's own configured position once, a moment after the
+        // connect-time command burst settles (the CLI serialises writes loosely).
+        setTimeout(() => { if (this.connectionMode === 'repeater') this._queryRepeaterLocation(); }, 600);
+
+        this._setConnectedDeviceName(this.saveSerialPort(port));
+        this.updateStatus('Connected (repeater)', 'connected');
+        this._setActiveTransportBtn('serial', 'Disconnect', () => this.disconnect());   // repeaters are USB-only
+        this._updateSoundHighlight();
+        this._collecting = true;
+        // A fully-established connection: from here a drop we didn't initiate is
+        // a surprise disconnect and should raise the alarm.
+        this._wasConnected = true;
+        this._intentionalDisconnect = false;
+        this._updatePauseBtn();
+        if (this.emptyState) {
+            const p = this.emptyState.querySelector('p');
+            if (p) p.textContent = 'Connected to a repeater. Waiting for RX log lines…';
+        }
+    }
+
+    // Write plain text to the serial port (repeater CLI commands).
+    async _serialWriteText(text) {
+        if (!this.serialPort) return;
+        const writer = this.serialPort.writable.getWriter();
+        try { await writer.write(new TextEncoder().encode(text)); }
+        finally { try { writer.releaseLock(); } catch (e) {} }
+    }
+
+    async _startSerialReadLoop(port) {
+        try {
+            while (this.serialPort === port) {
+                const { value, done } = await this.serialReader.read();
+                if (done) break;
+                if (value && value.length) this._onSerialBytes(value);
+            }
+        } catch (e) {
+            // TypeError is expected when the reader lock is released on disconnect.
+            if (!this._serialClosing && !(e instanceof TypeError)) {
+                console.warn('Serial read error:', e);
+            }
+        }
+        // Read loop ended unexpectedly (cable pulled / device reset) — tear down.
+        if (this.serialPort === port && !this._serialClosing) this.onDisconnected();
+    }
+
+    // Reassemble length-prefixed serial frames from a (possibly partial) byte
+    // chunk. Frame = [type, lenLSB, lenMSB, ...payload]; type 0x3e ('>') is
+    // radio→app, 0x3c ('<') is app→radio. Unknown leading bytes are skipped to
+    // resynchronise after any corruption.
+    _onSerialBytes(chunk) {
+        // Repeater links speak text, not binary frames.
+        if (this.connectionMode === 'repeater') { this._onSerialText(chunk); return; }
+        if (this._serialReadBuffer.length) {
+            const merged = new Uint8Array(this._serialReadBuffer.length + chunk.length);
+            merged.set(this._serialReadBuffer, 0);
+            merged.set(chunk, this._serialReadBuffer.length);
+            this._serialReadBuffer = merged;
+        } else {
+            this._serialReadBuffer = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+        }
+
+        const buf = this._serialReadBuffer;
+        const HDR = 3;
+        let offset = 0;
+        while (buf.length - offset >= HDR) {
+            const type = buf[offset];
+            if (type !== 0x3e && type !== 0x3c) { offset++; continue; }
+            const len = buf[offset + 1] | (buf[offset + 2] << 8);
+            if (len === 0) { offset++; continue; }
+            if (buf.length - offset < HDR + len) break; // wait for the rest of the frame
+            const frame = buf.slice(offset + HDR, offset + HDR + len);
+            offset += HDR + len;
+            // Only 0x3e (radio→app) frames come from a companion. 0x3c (app→radio)
+            // seen on the read side is a repeater echoing our probe back — ignore
+            // it, and use a genuine 0x3e frame as proof this is a companion.
+            if (type === 0x3e) {
+                this._sawCompanionFrame = true;
+                try { this.handlePayload(frame); }
+                catch (e) { console.error('Frame handling error:', e); }
+            }
+        }
+        this._serialReadBuffer = offset > 0 ? buf.slice(offset) : buf;
+    }
+
+    // --- Repeater text-CLI parsing ---
+
+    // Accumulate the serial byte stream and dispatch complete text lines.
+    _onSerialText(chunk) {
+        this._serialTextBuffer += this._textDecoder.decode(chunk, { stream: true });
+        let nl;
+        while ((nl = this._serialTextBuffer.indexOf('\n')) >= 0) {
+            const line = this._serialTextBuffer.slice(0, nl).replace(/\r$/, '').trim();
+            this._serialTextBuffer = this._serialTextBuffer.slice(nl + 1);
+            if (line) {
+                try { this._handleRepeaterLine(line); }
+                catch (e) { console.error('Repeater line error:', e, line); }
+            }
+        }
+    }
+
+    _handleRepeaterLine(line) {
+        // RAW packet dump (MESH_PACKET_LOGGING builds): decode for full path /
+        // last-hop, hold it until the matching summary line brings SNR/RSSI.
+        const raw = line.match(/U RAW:\s*([0-9A-Fa-f]+)/);
+        if (raw) { this._sawRepeaterReply = true; this._handleRepeaterRaw(raw[1]); return; }
+
+        // Packet-log summary line, e.g.:
+        //  12:34:56 - 1/6/2026 U: RX, len=22 (type=2, route=D, payload_len=20) SNR=13 RSSI=-5 score=1000 [C7 -> 43]
+        const m = line.match(/^(\d{2}):(\d{2}):(\d{2}) - (\d{1,2})\/(\d{1,2})\/(\d{4}) U: (RX|TX|TX FAIL!), len=(\d+) \(type=(\d+), route=([DF]), payload_len=(\d+)\)(?:\s+SNR=(-?\d+)\s+RSSI=(-?\d+)\s+score=(-?\d+))?(?:\s*\[([0-9A-Fa-f]{2}) -> ([0-9A-Fa-f]{2})\])?/);
+        if (m) { this._sawRepeaterReply = true; this._handleRepeaterLogLine(m); return; }
+
+        // CLI reply text — strip the "  -> " prefix the repeater puts on line 1.
+        const body = line.replace(/^->\s*/, '');
+        // A "  -> ..." prefixed line is a CLI reply → this really is a repeater.
+        if (body !== line) this._sawRepeaterReply = true;
+
+        // End of a 'log' dump → erase the file so the next dump is only-new.
+        if (body === 'EOF') { this._serialWriteText('log erase\r\n').catch(() => {}); return; }
+
+        // Reply to our get lat / get lon location probe. The firmware answers
+        // each with a bare "> <decimal>" carrying no field name, so we map the
+        // replies to fields in the order we asked (lat first, then lon).
+        if (this._pendingPosFields && this._pendingPosFields.length) {
+            const pm = body.match(/^>\s*(-?\d+(?:\.\d+)?)$/);
+            if (pm) {
+                this._sawRepeaterReply = true;
+                const field = this._pendingPosFields.shift();
+                const val = parseFloat(pm[1]);
+                if (field === 'lat') this._repeaterLat = val; else this._repeaterLon = val;
+                if (!this._pendingPosFields.length) {
+                    clearTimeout(this._posQueryTimer);
+                    this._setDeviceLocation(this._repeaterLat, this._repeaterLon);
+                }
+                return;
+            }
+        }
+
+        // Neighbours-table row: "<8 hex>:<secs_ago>:<snr*4>".
+        const nb = body.match(/^([0-9A-Fa-f]{8}):(\d+):(-?\d+)$/);
+        if (nb) { this._sawRepeaterReply = true; this._handleNeighborLine(nb[1], parseInt(nb[2], 10), parseInt(nb[3], 10)); return; }
+
+        // Other replies (logging on/off, -none-, errors, command echoes) ignored.
+    }
+
+    // Decode a RAW packet dump and queue it for pairing with the summary line
+    // that carries SNR/RSSI, giving full last-hop attribution.
+    //
+    // NOTE: unverified against a real MESH_PACKET_LOGGING build. On the firmware
+    // I've seen, RAW dumps stream to serial in real time (logRxRaw) while summary
+    // lines live in the log file we poll — so the two arrive on different timing.
+    // Hence a generous window and type+length matching rather than strict
+    // adjacency. May need tuning once tested on a logging-enabled repeater.
+    _handleRepeaterRaw(hex) {
+        if (!this._sawRepeaterRaw) {
+            this._sawRepeaterRaw = true;
+            // Logging build detected: every received packet now streams live as a
+            // RAW dump + summary line, with the full path for true last-hop
+            // attribution. The polled 'log' file is the same packets a second time,
+            // so stop reading it — its summary lines arrive with no RAW to pair
+            // with and would otherwise land as phantom 'unknown' duplicates next to
+            // the real identified entry.
+            this._stopLogPolling();
+        }
+        let packet;
+        try { packet = MeshCoreDecoder.decode(hex); } catch (e) { return; }
+        if (!packet || !packet.isValid) return;
+        // Adverts carry node name/pubkey/location — feed contacts right away so
+        // repeater names resolve even if no summary line pairs with this dump.
+        this._ingestContactFromPacket(packet);
+        const payloadLen = packet.payload?.raw ? packet.payload.raw.length / 2 : null;
+        const now = Date.now();
+        this._pendingRaw.push({ packet, rawHex: hex, payloadType: packet.payloadType, payloadLen, t: now });
+        const cutoff = now - 6000;
+        this._pendingRaw = this._pendingRaw.filter(r => r.t >= cutoff).slice(-16);
+    }
+
+    // A neighbours-table entry: identified repeater + SNR + age. Dedup on the
+    // real heard-time (so we only add a point when the node is heard afresh), but
+    // stamp the point at reception time — the table can report a long-ago advert,
+    // and an old timestamp would drop it straight out of the display window.
+    _handleNeighborLine(id, secsAgo, snrX4) {
+        const fullId = id.toUpperCase();
+        const heardEpoch = Date.now() - secsAgo * 1000;
+        const prev = this._neighborSeen.get(fullId) ?? 0;
+        if (heardEpoch <= prev + 2000) return;   // same reading (allow 1 s rounding jitter)
+        this._neighborSeen.set(fullId, heardEpoch);
+        const snr = snrX4 / 4;
+        const hash = 'nbr-' + fullId + '-' + heardEpoch;
+        this._ingestPacket(hash, fullId, 'Repeater Neighbour', null, snr, null,
+            { repeaterNeighbor: true, secsAgo }, null, {});
+    }
+
+    _handleRepeaterLogLine(m) {
+        if (m[7] !== 'RX') return;   // outgoing TX carries no SNR/RSSI — ignore entirely
+
+        const len        = parseInt(m[8], 10);
+        const payloadType = parseInt(m[9], 10);
+        const route      = m[10];                 // 'D' | 'F'
+        const payloadLen = parseInt(m[11], 10);
+        const snr  = m[12] != null ? parseInt(m[12], 10) : null;
+        const rssi = m[13] != null ? parseInt(m[13], 10) : null;
+        const src  = m[15] ? m[15].toUpperCase() : null;
+        const dest = m[16] ? m[16].toUpperCase() : null;
+
+        // Reception time = now (when the line reached us). The repeater's own
+        // clock string is unreliable — an unset RTC stamps packets years off,
+        // which would push them outside the chart/map TTL window.
+
+        // Rich path (logging build): a RAW dump for this same packet should be
+        // queued — pairing gives the real last hop from the decoded path.
+        if (this._pendingRaw.length) {
+            let idx = -1;
+            for (let i = this._pendingRaw.length - 1; i >= 0; i--) {
+                const r = this._pendingRaw[i];
+                if (r.payloadType === payloadType && (r.payloadLen == null || r.payloadLen === payloadLen)) { idx = i; break; }
+            }
+            if (idx >= 0) {
+                const r = this._pendingRaw.splice(idx, 1)[0];
+                this._processPacket(r.packet, r.rawHex, snr, rssi);
+                return;
+            }
+        }
+
+        // Stock fallback: no usable hop identity — a flood line names the origin
+        // (not the node we actually heard), and direct traffic is almost always
+        // our own nearby companion. So bucket by route only, and never merge.
+        //
+        // On a logging build, though, every real packet is captured by the live
+        // RAW+summary pairing above. An unpaired summary here is then a redundant
+        // copy from the polled 'log' file (one may still be in flight when the
+        // first RAW flips us to logging mode) — not a new packet — so suppress it
+        // rather than spawn a phantom 'unknown' alongside the identified entry.
+        if (this._sawRepeaterRaw) return;
+
+        const col  = route === 'D' ? 'direct' : 'unknown';
+        const hash = this._makeUnknownHash();
+        const type = (route === 'D' ? 'Direct ' : 'Flood ') + Utils.getPayloadTypeName(payloadType);
+        const meta = { repeaterLog: true, route, payloadType, len, payloadLen, src, dest };
+        this._ingestPacket(hash, col, type, null, snr, rssi, meta, null, {});
+
+        // Summary lines with no accompanying RAW dump ⇒ stock firmware ⇒ limited
+        // data. Surface the caveat once.
+        if (!this._sawRepeaterRaw && !this._repeaterStockNoticed) {
+            this._repeaterStockNoticed = true;
+            this._showRepeaterNotice();
+        }
+    }
+
+    _showRepeaterNotice() {
+        document.getElementById('repeaterNotice')?.classList.remove('hidden');
+    }
+
+    // Read the repeater's own configured position once over the CLI. There's no
+    // single command for both, and the replies are unlabelled ("> <decimal>"),
+    // so we ask lat then lon and pair the answers by order (see the parser in
+    // _handleRepeaterLine). A repeater with no position set answers "> 0.0",
+    // which _setDeviceLocation treats as unset. Firmware that doesn't know the
+    // commands answers non-numerically, so the pending fields simply time out.
+    async _queryRepeaterLocation() {
+        this._repeaterLat = null;
+        this._repeaterLon = null;
+        this._pendingPosFields = ['lat', 'lon'];
+        // Await between writes — the serial writer is single-locked, so firing
+        // both at once would make the second getWriter() throw.
+        await this._serialWriteText('get lat\r\n').catch(() => {});
+        await this._serialWriteText('get lon\r\n').catch(() => {});
+        clearTimeout(this._posQueryTimer);
+        this._posQueryTimer = setTimeout(() => { this._pendingPosFields = []; }, 5000);
+    }
+
+    // Repeater data is pulled, not pushed. Both the neighbours table and the
+    // packet log are polled over the CLI (reading them transmits nothing). The
+    // log is a stored file with no streaming, so each cycle we dump it ('log')
+    // and clear it ('log erase' on the EOF marker) to get only-new entries.
+    _startRepeaterPolling() {
+        this._stopRepeaterPolling();
+        const alive = () => this.connectionMode === 'repeater' && this.serialPort;
+        this._neighborPollTimer = setInterval(() => {
+            if (alive()) this._serialWriteText('neighbors\r\n').catch(() => {});
+        }, 5000);
+        this._logPollTimer = setInterval(() => {
+            if (alive()) this._serialWriteText('log\r\n').catch(() => {});
+        }, 2500);
+        // Seed immediately on connect.
+        this._serialWriteText('neighbors\r\n').catch(() => {});
+        this._serialWriteText('log\r\n').catch(() => {});
+    }
+
+    _stopRepeaterPolling() {
+        if (this._neighborPollTimer) { clearInterval(this._neighborPollTimer); this._neighborPollTimer = null; }
+        this._stopLogPolling();
+    }
+
+    // Stop dumping the packet-log file. Used both on disconnect and the moment a
+    // logging build is detected (its live stream supersedes the polled file).
+    _stopLogPolling() {
+        if (this._logPollTimer) { clearInterval(this._logPollTimer); this._logPollTimer = null; }
+    }
+
+    // Wrap a MeshCore command in a serial frame and write it to the port.
+    async _serialSendFrame(data) {
+        if (!this.serialPort) return;
+        const frame = new Uint8Array(3 + data.length);
+        frame[0] = 0x3c; // "<" app → radio
+        frame[1] = data.length & 0xff;
+        frame[2] = (data.length >> 8) & 0xff;
+        frame.set(data, 3);
+        const writer = this.serialPort.writable.getWriter();
+        try { await writer.write(frame); }
+        finally { try { writer.releaseLock(); } catch (e) {} }
+    }
+
+    // Transport-agnostic frame send: raw notification write over BLE, or
+    // length-prefixed frame over serial.
+    async _sendFrame(bytes) {
+        if (this.transportKind === 'serial') {
+            await this._serialSendFrame(bytes);
+        } else if (this.bleRxCharacteristic) {
+            await this.bleRxCharacteristic.writeValueWithoutResponse(bytes);
+        }
+    }
+
+    // True when a transport is up and able to accept commands.
+    _canSend() {
+        return this.transportKind === 'serial' ? !!this.serialPort : !!this.bleRxCharacteristic;
+    }
+
     async sendAppStart() {
-        // CMD_APP_START = 0x01, firmware target version = 0x03, 6 padding bytes, app name
-        const payload = new Uint8Array([0x01, 0x03, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x72, 0x78, 0x6D, 0x6F, 0x6E]);
-        await this.bleRxCharacteristic.writeValueWithoutResponse(payload);
+        // CMD_APP_START = [0x01, app_ver 0x03, 6 padding bytes, app_name (UTF-8)].
+        // app_name only identifies this client to the device (informational, not
+        // echoed back in SELF_INFO), so its length is irrelevant — the frame stays
+        // tiny either way.
+        const header = [0x01, 0x03, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20];
+        const name = new TextEncoder().encode('signal-tester');
+        const payload = new Uint8Array(header.length + name.length);
+        payload.set(header, 0);
+        payload.set(name, header.length);
+        await this._sendFrame(payload);
     }
 
     async sendGetContacts() {
-        if (!this.bleRxCharacteristic) return;
+        if (!this._canSend()) return;
+        this._contactsRetries = 0;
+        this._contactsLastStallSize = -1;
+        this._contactsFetchedKeys.clear();
+        this._contactsFetchActive = true;
+        this._setContactsLoading(true);
+        await this._sendGetContactsCmd();
+    }
+
+    // Send the raw CMD_GET_CONTACTS frame and arm the stall watchdog. Separate
+    // from sendGetContacts() so a retry can re-request without resetting the
+    // retry counter.
+    async _sendGetContactsCmd() {
         // CMD_GET_CONTACTS = 0x04; optional 4-byte LE lastmod for incremental sync
         const cmd = new Uint8Array(this._contactsLastmod > 0 ? 5 : 1);
         cmd[0] = 0x04;
         if (this._contactsLastmod > 0)
             new DataView(cmd.buffer).setUint32(1, this._contactsLastmod, true);
-        this._setContactsLoading(true);
-        try { await this.bleRxCharacteristic.writeValueWithoutResponse(cmd); }
+        this._armContactsWatchdog();
+        try { await this._sendFrame(cmd); }
         catch (e) { this._setContactsError('Contact request failed: ' + (e?.message || e)); }
+    }
+
+    _armContactsWatchdog() {
+        clearTimeout(this._contactsStallTimer);
+        this._contactsStallTimer = setTimeout(() => this._onContactsStall(), CONTACTS_STALL_MS);
+    }
+
+    // The contact stream went quiet before END_OF_CONTACTS — almost always a
+    // dropped frame on a busy BLE link. Re-request and merge; contacts upsert by
+    // key, so each pass fills more gaps. Stop once a pass adds nothing new (the
+    // list is as complete as it'll get — likely just the END frame was lost) or
+    // after the retry cap.
+    _onContactsStall() {
+        if (!this._canSend() || this.connectionMode !== 'companion') {
+            this._contactsFetchActive = false;
+            this._setContactsLoading(false);
+            return;
+        }
+        // Count only what THIS fetch has pulled, not the whole contact map
+        // (which may already hold CSV-imported or previously-known contacts).
+        const fetched = this._contactsFetchedKeys.size;
+        const noProgress = this._contactsRetries > 0 && fetched === this._contactsLastStallSize;
+        if (noProgress || this._contactsRetries >= CONTACTS_MAX_RETRIES) {
+            this._contactsReceiving = false;
+            this._contactsFetchActive = false;
+            this._updateContactsCount();
+            if (fetched === 0) {
+                this._setContactsError('Contact fetch failed — try reconnecting.');
+            } else {
+                // Partial list and further retries aren't pulling the rest — say
+                // so rather than stopping silently, so the user knows to reconnect.
+                this._setContactsError(`Synced ${fetched} contacts — some may be missing. Reconnect to retry.`);
+            }
+            return;
+        }
+        this._contactsLastStallSize = fetched;
+        this._contactsRetries++;
+        if (this.contactsLoadingMsg) {
+            this.contactsLoadingMsg.style.display = '';
+            this.contactsLoadingMsg.textContent = `Syncing contacts… (${fetched} so far)`;
+        }
+        this._sendGetContactsCmd();
     }
 
     _setContactsLoading(on) {
@@ -1116,14 +1987,11 @@ class MeshCoreApp {
             this.contactsLoadingMsg.style.display = on ? '' : 'none';
             if (on) this.contactsLoadingMsg.textContent = 'Fetching contacts…';
         }
-        clearTimeout(this._contactsLoadingTimeout);
-        if (on) this._contactsLoadingTimeout = setTimeout(() => {
-            if (this.contactsLoadingMsg) this.contactsLoadingMsg.textContent = 'Contact fetch failed — try reconnecting.';
-        }, 15000);
+        if (!on) clearTimeout(this._contactsStallTimer);
     }
 
     _setContactsError(msg) {
-        clearTimeout(this._contactsLoadingTimeout);
+        clearTimeout(this._contactsStallTimer);
         if (this.contactsLoadingMsg) {
             this.contactsLoadingMsg.style.display = '';
             this.contactsLoadingMsg.textContent = msg;
@@ -1156,8 +2024,16 @@ class MeshCoreApp {
         if (payload.length >= 144) lon = ((payload[140] | (payload[141] << 8) | (payload[142] << 16) | (payload[143] << 24)) | 0) / 1e6;
         if (payload.length >= 148) lastmod = payload[144] | (payload[145] << 8) | (payload[146] << 16) | (payload[147] << 24);
         this._contacts.set(pubKeyFull, { name: name || null, type, lat, lon, lastAdvert, lastmod, pubKeyFullHex: pubKeyFull });
-        if (lastmod > this._contactsLastmod) this._contactsLastmod = lastmod;
+        // NB: do NOT advance _contactsLastmod here. The incremental-sync marker
+        // must only move forward once a FULL contact list has been received
+        // (END_OF_CONTACTS). Advancing it per-contact meant an interrupted fetch
+        // (e.g. another client grabbed the single-client companion) left the
+        // marker partway, so every later reconnect did an incremental sync that
+        // skipped the missing contacts — and only restarting the app (which
+        // resets the marker to 0) recovered. Re-fetching a contact we already
+        // have via push is a harmless upsert.
         this._updateContactsCount();
+        return pubKeyFull;
     }
 
     _contactsByPrefix(hexPrefix) {
@@ -1171,6 +2047,33 @@ class MeshCoreApp {
 
     _contactByPrefix(hexPrefix) {
         return this._contactsByPrefix(hexPrefix)[0] ?? null;
+    }
+
+    // Map a contact's full public key back to the live repeater column it
+    // belongs to. Columns are keyed by a short hash *prefix* of the repeater id
+    // (often just 2 hex chars, sometimes promoted longer, or an "a/b" collision
+    // key) — NOT by a fixed 6-char pubkey slice. A pinned map marker must resolve
+    // its real column this way; keying it off slice(0,6) instead selects a
+    // phantom column that matches no data, so the dots, table and chart all come
+    // up empty (looking as if everything were filtered out). Picks the longest
+    // (most specific) matching prefix. Null when no current column matches.
+    _colForPubKey(pubKeyHex) {
+        if (!pubKeyHex) return null;
+        const pk = pubKeyHex.toLowerCase();
+        let bestKey = null, bestLen = -1;
+        for (const key of this.repeaterColumns) {
+            for (const seg of key.split('/')) {
+                if (seg === 'direct' || seg === 'unknown') continue;
+                // Column keys are stored upper-case, contact pub keys lower-case,
+                // so compare case-insensitively. Return the ORIGINAL key so it
+                // still matches the rx data / _selectedCol exactly.
+                const s = seg.toLowerCase();
+                if (s && pk.startsWith(s) && s.length > bestLen) {
+                    bestKey = key; bestLen = s.length;
+                }
+            }
+        }
+        return bestKey;
     }
 
     _contactNameForCol(col) {
@@ -1195,6 +2098,20 @@ class MeshCoreApp {
         return matches.filter(c => c.name && (c.lat !== 0 || c.lon !== 0));
     }
 
+    // Toggle whether all GPS contacts of a repeater column are kept on the 3D
+    // map permanently. Driven by the pushpin button in the map infobox (A).
+    _toggleMapPinForCol(col) {
+        const contacts = this._contactsForMapButtons(col);
+        if (!contacts.length) return;
+        const anyPinned = contacts.some(c => this._mapPins.has(c.pubKeyFullHex));
+        for (const c of contacts) {
+            if (anyPinned) this._mapPins.delete(c.pubKeyFullHex);
+            else           this._mapPins.add(c.pubKeyFullHex);
+        }
+        this._updateMapPins();
+        this._updateCornerNotices();
+    }
+
     _updateMapPins() {
         if (!this.signalMap) return;
         const markers = [];
@@ -1215,7 +2132,10 @@ class MeshCoreApp {
             if (seen.has(pubKeyFullHex)) continue;
             const contact = this._contacts.get(pubKeyFullHex);
             if (!contact?.name || (contact.lat === 0 && contact.lon === 0)) continue;
-            const col = pubKeyFullHex.slice(0, 6);
+            // Resolve the live data column so clicking the marker selects the
+            // same key the dots/table/chart use; fall back to a 6-char prefix
+            // only when the repeater isn't currently in the data.
+            const col = this._colForPubKey(pubKeyFullHex) ?? pubKeyFullHex.slice(0, 6);
             if (this._repFilterTerms.length && !this._colMatchesRepFilter(col)) continue;
             seen.add(pubKeyFullHex);
             markers.push({ lat: contact.lat, lon: contact.lon, name: contact.name,
@@ -1230,7 +2150,7 @@ class MeshCoreApp {
         if (!col) return false;
         if (col === this._selectedCol && this._contactsForMapButtons(col).length) return true;
         for (const pubKeyFullHex of this._mapPins) {
-            if (pubKeyFullHex.slice(0, 6) === col) return true;
+            if (this._colForPubKey(pubKeyFullHex) === col) return true;
         }
         return false;
     }
@@ -1240,11 +2160,34 @@ class MeshCoreApp {
         if (this.contactsHstat) this.contactsHstat.style.display = this._contacts.size > 0 ? '' : 'none';
     }
 
+    _updateSoundHighlight() {
+        const label = this.soundSelect?.closest('.sound-toggle');
+        if (!label) return;
+        // Only highlight when sound is enabled AND a device is connected — without
+        // a connection nothing produces sound anyway.
+        const active = (this.soundSelect.value || 'off') !== 'off' && this._canSend();
+        label.classList.toggle('sound-active', active);
+    }
+
     // Send one DISCOVER_REQ, then wait 2 s to collect responses before re-enabling the button.
     async startDiscoverSequence(filterMask) {
         const btn = document.getElementById('discoverBtn');
-        if (!this.bleRxCharacteristic) {
-            if (btn) { btn.textContent = '⚠ Not connected'; setTimeout(() => { btn.textContent = 'Discover nodes'; }, 2500); }
+        if (!this._canSend()) {
+            if (btn) {
+                btn.textContent = '⚠ Not connected';
+                btn.classList.add('btn-error');
+                setTimeout(() => { btn.textContent = 'Discover nodes'; btn.classList.remove('btn-error'); }, 2500);
+            }
+            return;
+        }
+        // Repeater CLI: trigger an active neighbour discovery. Responses refresh
+        // the repeater's neighbours table (ingested by a later phase).
+        if (this.connectionMode === 'repeater') {
+            await this._serialWriteText('discover.neighbors\r\n');
+            if (btn) { btn.textContent = 'Discovering…'; setTimeout(() => { btn.textContent = 'Discover nodes'; }, 2000); }
+            // Read the table back once responses have had time to arrive (the
+            // periodic poll would catch them too, just less promptly).
+            setTimeout(() => this._serialWriteText('neighbors\r\n').catch(() => {}), 1500);
             return;
         }
         if (this._discoverActive) return; // prevent double-click overlap
@@ -1267,7 +2210,7 @@ class MeshCoreApp {
     }
 
     async sendDiscoverRequest(filterMask, tag) {
-        if (!this.bleRxCharacteristic) return;
+        if (!this._canSend()) return;
         // CMD_SEND_CONTROL_DATA (0x37) + CTL_TYPE_NODE_DISCOVER_REQ (0x80) + filter + tag (4 B LE)
         // filter bits: 0=Chat, 1=Repeater, 2=Room, 3=Sensor
         if (tag === undefined) tag = (Math.random() * 0xFFFFFFFF) >>> 0;
@@ -1278,7 +2221,7 @@ class MeshCoreApp {
         if (!this._discoverTags) this._discoverTags = new Map();
         this._discoverTags.set(tag, Date.now());
         try {
-            await this.bleRxCharacteristic.writeValueWithoutResponse(bytes);
+            await this._sendFrame(bytes);
         } catch (e) { console.error('sendDiscoverRequest:', e); }
     }
 
@@ -1289,15 +2232,67 @@ class MeshCoreApp {
     }
 
     saveDevice(device) {
+        let devices = this.getSavedDevices();
+        // Web Bluetooth's device.id is NOT reliably stable across
+        // requestDevice() calls — getDevices() (the zero-friction reconnect
+        // path) needs an experimental Chrome flag, so a quick-connect usually
+        // falls back to re-pairing, which can mint a fresh id for the very same
+        // physical device. Keyed on id alone, those re-pairs piled up duplicate
+        // saved entries over time. So also match a prior BLE entry by name
+        // (MeshCore names carry a unique suffix) and collapse onto one entry.
+        const prior = devices.find(d => d.id === device.id
+            || (device.name && d.transport === 'ble' && d.name === device.name));
+        const name = device.name || prior?.name || 'Unknown';
+        devices = devices.filter(d => d.id !== device.id
+            && !(device.name && d.transport === 'ble' && d.name === device.name));
+        devices.push({ id: device.id, name, transport: 'ble' });
+        Store.set('devices', JSON.stringify(devices));
+        this._renderSavedDevices();
+        return name;
+    }
+
+    // Serial ports expose no stable id or name — only the USB vendor/product id
+    // (and only for USB-backed ports). We key the saved entry on those so a
+    // previously-authorised port can be re-opened without the picker. Two
+    // identical adapters are indistinguishable and collapse to one entry.
+    saveSerialPort(port) {
+        let info = {};
+        try { info = port.getInfo?.() || {}; } catch (e) {}
+        // WiFi/TCP companion: persisted by host:port so it appears in the Saved
+        // list and can be reconnected with one tap (Android only).
+        if (info.wifi) {
+            const id = `wifi:${info.host}:${info.port}`;
+            const name = `WiFi ${info.host}:${info.port}`;
+            const devices = this.getSavedDevices();
+            const existing = devices.find(d => d.id === id);
+            if (existing) {
+                existing.name = name; existing.transport = 'wifi';
+                existing.host = info.host; existing.port = info.port;
+            } else {
+                devices.push({ id, name, transport: 'wifi', host: info.host, port: info.port });
+            }
+            Store.set('devices', JSON.stringify(devices));
+            this._renderSavedDevices();
+            return name;
+        }
+        const vid = info.usbVendorId;
+        const pid = info.usbProductId;
+        const hex4 = n => (n == null ? '????' : n.toString(16).padStart(4, '0').toUpperCase());
+        const id = `serial:${hex4(vid)}:${hex4(pid)}`;
+        const name = (vid != null || pid != null) ? `USB ${hex4(vid)}:${hex4(pid)}` : 'USB device';
         const devices = this.getSavedDevices();
-        const existing = devices.find(d => d.id === device.id);
+        const existing = devices.find(d => d.id === id);
         if (existing) {
-            existing.name = device.name || existing.name;
+            existing.name = name;
+            existing.transport = 'serial';
+            existing.usbVendorId = vid;
+            existing.usbProductId = pid;
         } else {
-            devices.push({ id: device.id, name: device.name || 'Unknown' });
+            devices.push({ id, name, transport: 'serial', usbVendorId: vid, usbProductId: pid });
         }
         Store.set('devices', JSON.stringify(devices));
         this._renderSavedDevices();
+        return name;
     }
 
     forgetDevice(deviceId) {
@@ -1341,17 +2336,28 @@ class MeshCoreApp {
             return;
         }
 
+        // PACKET_SELF_INFO (0x05): the device's own info, returned in reply to
+        // APP_START. We only want the configured advertised position from it.
+        if (pushCode === 0x05) { this._handleSelfInfo(payload); return; }
+
         // Contact list responses (from CMD_GET_CONTACTS = 0x04)
         if (pushCode === 0x02) {
             this._contactsReceiving = true;
+            this._armContactsWatchdog();   // stream started — reset the stall timer
             return;
         }
         if (pushCode === 0x03) {
-            if (this._contactsReceiving) this._parseContact(payload);
+            if (this._contactsReceiving) {
+                const key = this._parseContact(payload);
+                if (key) this._contactsFetchedKeys.add(key);   // count what THIS fetch pulled
+                this._armContactsWatchdog();   // got a contact — keep the stream alive
+            }
             return;
         }
         if (pushCode === 0x04 && this._contactsReceiving) {
             this._contactsReceiving = false;
+            this._contactsRetries = 0;
+            this._contactsFetchActive = false;
             this._setContactsLoading(false);
             if (payload.length >= 5)
                 this._contactsLastmod = payload[1] | (payload[2]<<8) | (payload[3]<<16) | (payload[4]<<24);
@@ -1398,6 +2404,70 @@ class MeshCoreApp {
             const packet = MeshCoreDecoder.decode(rawHex);
             if (packet.isValid) this._processPacket(packet, rawHex, snr, rssi);
         } catch (e) { console.error('Decode error:', e); }
+    }
+
+    // PACKET_SELF_INFO (0x05) layout: [0]=code, [1]=adv_type, [2-3]=tx powers,
+    // [4-35]=pub_key, [36-39]=adv_lat, [40-43]=adv_lon (int32 LE / 1e6),
+    // [45]=adv_loc_policy. We read only the device's own advertised position.
+    _handleSelfInfo(payload) {
+        if (payload.length < 44) return;
+        const lat = ((payload[36] | (payload[37] << 8) | (payload[38] << 16) | (payload[39] << 24)) | 0) / 1e6;
+        const lon = ((payload[40] | (payload[41] << 8) | (payload[42] << 16) | (payload[43] << 24)) | 0) / 1e6;
+        // adv_loc_policy: 0 = none (not shared), 1 = share (live GPS from the
+        // device's sensor), 2 = prefs (static stored lat/lon).
+        this._deviceLocPolicy = payload.length >= 46 ? payload[45] : null;
+        this._setDeviceLocation(lat, lon);
+        this._updateDeviceLocationRefresh();
+    }
+
+    // Periodically re-read the device's own position while the user is watching
+    // its 3D-map marker. SELF_INFO always reports the device's LIVE sensor
+    // position (sensors.node_lat), so for a companion with onboard GPS this keeps
+    // moving even when its advert_loc_policy is 'none' — that policy only governs
+    // what goes into adverts, NOT whether GPS is running. Re-issuing APP_START
+    // pulls the fresh position; its SELF_INFO reply updates the marker.
+    //
+    // We deliberately do NOT gate on advert_loc_policy === 'share': that wrongly
+    // excluded GPS devices that simply don't advertise their location, so we'd
+    // read the position once at connect and never again — which is why only
+    // reconnecting refreshed it. The poll is cheap, so we run it for any
+    // connected companion with the marker shown. A device with no GPS just keeps
+    // reporting the same coordinates, which is harmless.
+    //
+    // This method is called both on marker/connection changes AND from
+    // _handleSelfInfo (every poll reply), so it must be idempotent: if the timer
+    // is already running we leave it alone. Otherwise the immediate poll() below
+    // would re-fire on every SELF_INFO reply, turning the interval into a tight
+    // reply-driven loop that hammers the device. We refresh once per second; the
+    // device's GPS updates at ~1 Hz and the round-trip is tiny (~90 bytes), so
+    // this is negligible BT load. Gated purely on the (default-off) device marker
+    // — turning it on is the user opting in.
+    _updateDeviceLocationRefresh() {
+        const wants = this.connectionMode === 'companion' && this._showDeviceMarker;
+        if (!wants) {
+            clearInterval(this._deviceRefreshTimer);
+            this._deviceRefreshTimer = null;
+            return;
+        }
+        if (this._deviceRefreshTimer) return;   // already polling — don't restart or double-poll
+        const poll = () => {
+            // Never poll while contacts are being fetched: re-issuing APP_START
+            // mid-stream disrupts the companion's contact dump and stalls it.
+            if (this.connectionMode === 'companion' && this._canSend() && !this._contactsFetchActive) {
+                this.sendAppStart().catch(() => {});   // its SELF_INFO reply refreshes the position
+            }
+        };
+        poll();                                        // refresh now so toggling the marker updates immediately
+        this._deviceRefreshTimer = setInterval(poll, 1000);
+    }
+
+    // Record the connected device's own configured position and place it on the
+    // 3D map. lat/lon of 0,0 (or null) means unset / unsupported → clear it. The
+    // zero-zero convention matches how contacts and adverts mark "no position".
+    _setDeviceLocation(lat, lon) {
+        const has = lat != null && lon != null && !(lat === 0 && lon === 0);
+        this._deviceLocation = has ? { lat, lon } : null;
+        this.signalMap?.setDeviceLocation(has ? lat : null, has ? lon : null);
     }
 
     _handleAdvertPush(_payload) {
@@ -1561,6 +2631,24 @@ class MeshCoreApp {
     }
 
     _extractRepeater(packet) {
+        // Trace packets (payloadType 9) are the one case where the header `path`
+        // field does NOT hold node IDs: it holds one per-hop SNR byte
+        // (signed / 4 = dB). The real traversed node hashes live in
+        // payload.decoded.pathHashes, so for traces that is the only correct
+        // source of the last repeater (empty = a 0-hop/direct trace).
+        if (packet.payloadType === 9) {
+            const hops = packet.payload?.decoded?.pathHashes;
+            return Array.isArray(hops) && hops.length > 0
+                ? (hops[hops.length - 1] || 'unknown')
+                : 'direct';
+        }
+        // Every other type: the header path accumulates forwarder hashes as the
+        // packet floods, so its last element is the last repeater. NOTE: Path
+        // payloads (type 8) also expose payload.decoded.pathHashes, but it is
+        // meaningless — the real PATH body is "dest/src hashes, MAC, encrypted
+        // (path, extra)", and the decoder misreads that ciphertext as a
+        // plaintext path (often erroring on a reserved hash-size bit pattern).
+        // The header path is plaintext and stays valid regardless, so use it.
         if (packet.path && packet.path.length > 0) {
             return packet.path[packet.path.length - 1] || 'unknown';
         }
@@ -2104,7 +3192,7 @@ class MeshCoreApp {
             const repHeaders = visibleCols.map(r => {
                 const cName = this._contactNameForCol(r);
                 const nameTag = cName ? `<br><span class="col-contact-name">${this._escHtml(cName)}</span>` : '';
-                return `<th colspan="2" class="msg-col-rep" data-col="${this._escHtml(r)}"><span class="rl-dot" style="background:${this._dotColor(r)}"></span>${this.displayId(r)}${nameTag}</th>`;
+                return `<th colspan="2" class="msg-col-rep" data-col="${this._escHtml(r)}"><span class="rl-dot" style="${this._repDotStyle(r)}"></span>${this.displayId(r)}${nameTag}</th>`;
             }).join('');
             const subHeaders = visibleCols.map(() =>
                 `<th class="msg-sub-snr">SNR</th><th class="msg-sub-rssi">RSSI</th>`
@@ -2282,18 +3370,17 @@ class MeshCoreApp {
                 : '';
             const rs = repEntry.remoteSnr ?? data.meta?.remoteSnr;
             const uplinkPart = rs != null
-                ? ` &nbsp; Uplink SNR <span style="color:${this._signalColor(rs, 13, -10, 0)};font-weight:700">${rs.toFixed(1)} dB</span>`
+                ? ` &nbsp; Uplink SNR <span style="color:${this._signalColor(rs, 13, -10, 0)};font-weight:700">${this._fmtSnr(rs)} dB</span>`
                 : '';
-            const dotColor = this._dotColor(col);
             const colContact = this._contactByPrefix(col);
             const colName = colContact?.name ?? null;
             header = `<div class="detail-sig">` +
-                `<span class="rl-dot" style="background:${dotColor}"></span>` +
+                `<span class="rl-dot" style="${this._repDotStyle(col)}"></span>` +
                 `<b>${this._escHtml(this.displayId(col))}</b>` +
                 (colName ? ` <span class="detail-col-name">${this._escHtml(colName)}</span>` : '') +
                 (timeStr ? ` &nbsp; <span class="detail-time">${timeStr}</span>` : '') +
                 ` &nbsp; RSSI <span style="color:${rc};font-weight:700">${repEntry.rssi ?? '—'}</span>` +
-                ` &nbsp; SNR <span style="color:${sc};font-weight:700">${repEntry.snr?.toFixed(1) ?? '—'}</span>` +
+                ` &nbsp; SNR <span style="color:${sc};font-weight:700">${this._fmtSnr(repEntry.snr)}</span>` +
                 uplinkPart +
                 hexPart +
                 `</div>`;
@@ -2323,7 +3410,7 @@ class MeshCoreApp {
         const rc = this._signalColor(rssi, -70, -130);
         const sc = this._signalColor(snr,  13, -10, 0);
         const rssiStr = rssi != null ? rssi : '—';
-        const snrStr  = snr  != null ? snr.toFixed(1) : '—';
+        const snrStr  = this._fmtSnr(snr);
         return `<td class="sig-snr"  data-hash="${hash}" data-col="${col}" style="color:${sc}">${snrStr}</td>` +
                `<td class="sig-rssi" data-hash="${hash}" data-col="${col}" style="color:${rc}">${rssiStr}</td>`;
     }
@@ -2339,7 +3426,8 @@ class MeshCoreApp {
 
     // --- Chart ---
 
-    getRepeaterColor(col) {
+    // Stable 32-bit FNV-1a hash of the display id (cached).
+    _repeaterHash(col) {
         if (!this.chartColors.has(col)) {
             const id = this.displayId(col);
             let h = 0x811c9dc5;
@@ -2347,17 +3435,86 @@ class MeshCoreApp {
                 h ^= id.charCodeAt(i);
                 h = Math.imul(h, 0x01000193);
             }
-            const hue = (h >>> 0) % 360;
-            this.chartColors.set(col, hue);
+            this.chartColors.set(col, h >>> 0);
         }
-        const hue = this.chartColors.get(col);
-        return `hsl(${hue}, 72%, 44%)`;
+        return this.chartColors.get(col);
     }
 
+    // Hue, saturation and lightness — each from a different slice of the hash, so
+    // repeaters vary in all three. Returns the light-theme lightness.
+    _repeaterHSL(col) {
+        const h = this._repeaterHash(col);
+        const hue = h % 360;
+        const sat = Math.round(REP_S_MIN + ((h >>> 10) & 0xFF) / 255 * (REP_S_MAX - REP_S_MIN));
+        const lit = Math.round(REP_L_MIN + ((h >>> 18) & 0xFF) / 255 * (REP_L_MAX - REP_L_MIN));
+        return { hue, sat, lit };
+    }
+
+    // Light colour — used by the 3D map, whose background is always light.
+    getRepeaterColor(col) {
+        const { hue, sat, lit } = this._repeaterHSL(col);
+        return `hsl(${hue}, ${sat}%, ${lit}%)`;
+    }
+
+    // Theme-aware colour for the 2D UI: dark theme lifts the lightness.
     _dotColor(col) {
-        const hue = this.chartColors.has(col) ? this.chartColors.get(col) : (() => { this.getRepeaterColor(col); return this.chartColors.get(col); })();
+        const { hue, sat, lit } = this._repeaterHSL(col);
         const isDark = !document.documentElement.classList.contains('light-theme');
-        return isDark ? `hsl(${hue}, 85%, 68%)` : `hsl(${hue}, 72%, 44%)`;
+        const l = isDark ? Math.min(90, lit + REP_DARK_BUMP) : lit;
+        return `hsl(${hue}, ${sat}%, ${l}%)`;
+    }
+
+    // Stock-firmware repeater RX lines carry no packet hash: a flood summary
+    // names the origin (not the node we heard) and direct traffic has no hop
+    // identity at all. Such packets must never be merged with one another — each
+    // is its own distinct observation — so we mint a globally-unique sentinel
+    // hash for every one at capture time. That UUID is written to the CSV, so it
+    // also keeps observations distinct across capture sessions and imports, while
+    // re-importing the same file stays idempotent (identical hashes are deduped).
+    _makeUnknownHash() {
+        const rand = (typeof crypto !== 'undefined' && crypto.randomUUID)
+            ? crypto.randomUUID()
+            : (Date.now().toString(36) + '-' + Math.random().toString(36).slice(2));
+        return 'unknown-' + rand;
+    }
+
+    // The two pseudo columns aren't real nodes, so they get a reserved look the
+    // hash can never produce: a black-ringed circle, filled yellow (direct) or
+    // white (unknown).
+    _isPseudoCol(col) { return col === 'direct' || col === 'unknown'; }
+    _pseudoRing(col)  { return col === 'direct' ? '#111' : '#c00'; }
+    _pseudoFill(col)  { return col === 'direct' ? '#ffd400' : '#fff'; }
+
+    // Inline style for a .rl-dot swatch.
+    _repDotStyle(col) {
+        if (this._isPseudoCol(col))
+            return `background:${this._pseudoFill(col)};border:2px solid ${this._pseudoRing(col)};box-sizing:border-box`;
+        return `background:${this._dotColor(col)}`;
+    }
+
+    // Same, applied to an existing element (JS-updated dots).
+    _applyDotStyle(el, col) {
+        if (!el) return;
+        if (this._isPseudoCol(col)) {
+            el.style.background = this._pseudoFill(col);
+            el.style.border = `2px solid ${this._pseudoRing(col)}`;
+            el.style.boxSizing = 'border-box';
+        } else {
+            el.style.background = this._dotColor(col);
+            el.style.border = '';
+        }
+    }
+
+    // SVG marker paint for chart dots.
+    _markerFill(col)         { return this._isPseudoCol(col) ? this._pseudoFill(col) : this._dotColor(col); }
+    _markerStroke(col, base) { return this._isPseudoCol(col) ? this._pseudoRing(col) : base; }
+    _markerStrokeW(col, base){ return this._isPseudoCol(col) ? Math.max(base, 2) : base; }
+
+    // Format an SNR for display: whole numbers (e.g. the repeater log, which
+    // truncates SNR to integer dB) show without a decimal; finer values keep one.
+    _fmtSnr(v) {
+        if (v == null || !isFinite(v)) return '—';
+        return Number.isInteger(v) ? String(v) : v.toFixed(1);
     }
 
     _renderCharts() {
@@ -2442,9 +3599,13 @@ class MeshCoreApp {
         }
         if (!nearest || minDist > 2500) {
             if (this._selectedCol) this._selectRepeater(null);
+            this.hideChartTooltip(true);
             return;
         }
-        this._selectRepeater(this._selectedCol === nearest.col ? null : nearest.col);
+        const deselect = this._selectedCol === nearest.col;
+        this._selectRepeater(deselect ? null : nearest.col);
+        if (deselect) this.hideChartTooltip(true);
+        else this.showChartTooltip(e, type, true);
     }
 
     _xLabelStepMs(rangeMs, chartWidthPx) {
@@ -2599,7 +3760,7 @@ class MeshCoreApp {
         for (const [col, dPts] of decimGroups) {
             const validPts = dPts.filter(p => valOf(p) != null);
             if (validPts.length < 2) continue;
-            const color = this._dotColor(col);
+            const color = this._isPseudoCol(col) ? this._pseudoRing(col) : this._dotColor(col);
             const isHighlighted = !selected || selected === col;
             const strokeW = (selected && selected === col) ? 2.5 : 1;
             const strokeOp = isHighlighted ? 0.65 : 0.15;
@@ -2613,7 +3774,7 @@ class MeshCoreApp {
             if (selected && selected === col) continue;
             for (const p of dPts) {
                 if (valOf(p) == null) continue;
-                parts.push(`<circle cx="${xOf(p.time)}" cy="${yOf(valOf(p))}" r="${ds}" fill="${this._dotColor(p.col)}" fill-opacity="${selected ? 0.10 : 0.90}" stroke="${dotStroke}" stroke-width="0.8"/>`);
+                parts.push(`<circle cx="${xOf(p.time)}" cy="${yOf(valOf(p))}" r="${ds}" fill="${this._markerFill(p.col)}" fill-opacity="${selected ? 0.10 : 0.90}" stroke="${this._markerStroke(p.col, dotStroke)}" stroke-width="${this._markerStrokeW(p.col, 0.8)}"/>`);
             }
         }
         if (selected) {
@@ -2621,7 +3782,7 @@ class MeshCoreApp {
             if (selPts) {
                 for (const p of selPts) {
                     if (valOf(p) == null) continue;
-                    parts.push(`<circle cx="${xOf(p.time)}" cy="${yOf(valOf(p))}" r="${ds * 1.43}" fill="${this._dotColor(p.col)}" fill-opacity="0.95" stroke="${dotStroke}" stroke-width="1"/>`);
+                    parts.push(`<circle cx="${xOf(p.time)}" cy="${yOf(valOf(p))}" r="${ds * 1.43}" fill="${this._markerFill(p.col)}" fill-opacity="0.95" stroke="${this._markerStroke(p.col, dotStroke)}" stroke-width="${this._markerStrokeW(p.col, 1)}"/>`);
                 }
             }
         }
@@ -2701,8 +3862,10 @@ class MeshCoreApp {
         return result.sort((a, b) => a.time - b.time);
     }
 
-    showChartTooltip(e, type) {
+    showChartTooltip(e, type, pin = false) {
         if (!this.tooltip) return;
+        // Note: hover still updates the infobox even while a point is pinned, so
+        // the live preview keeps working after a repeater is selected.
         const incomingPts = (type === 'snr' && !this._snrShowIncoming) ? [] : this._visibleChartPoints();
         const sentPts = type === 'snr' ? (this._snrShowOutgoing ? this._visibleSentSnrPts() : []) : [];
         const pts = type === 'snr' ? [...incomingPts, ...sentPts] : incomingPts;
@@ -2745,32 +3908,63 @@ class MeshCoreApp {
             const d = dx * dx + dy * dy;
             if (d < minDist) { minDist = d; nearest = p; }
         }
-        if (!nearest || minDist > 1600) { this.hideChartTooltip(); return; }
+        if (!nearest || minDist > 1600) { if (!this._tooltipPinned) this.hideChartTooltip(); return; }
 
         const isSent = sentPts.includes(nearest);
         const time = new Date(nearest.time).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         const color = this._dotColor(nearest.col);
         const dotShape = isSent
             ? `<span style="color:${color};font-size:13px;line-height:1;margin-right:5px;vertical-align:middle;flex-shrink:0">★</span>`
-            : `<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${color};margin-right:5px;vertical-align:middle;flex-shrink:0"></span>`;
+            : `<span style="display:inline-block;width:9px;height:9px;border-radius:50%;${this._repDotStyle(nearest.col)};margin-right:5px;vertical-align:middle;flex-shrink:0"></span>`;
         const cName = this._contactNameForCol(nearest.col);
-        const nameHtml = cName ? `<span style="color:#7ab;font-size:11px;margin-left:3px">${this._escHtml(cName)}</span>` : '';
+        const nameHtml = cName ? `<span class="ct-colname">${this._escHtml(cName)}</span>` : '';
+        // Signal values and time share one line, with the time pushed to the end
+        // (matching the 3D map infobox layout).
         const valLine = isSent
-            ? `Sent SNR ${nearest.snr?.toFixed(1) ?? '—'} dB ↗`
-            : `SNR ${nearest.snr?.toFixed(1) ?? '—'} &nbsp; RSSI ${nearest.rssi ?? '—'}`;
+            ? `Sent SNR ${this._fmtSnr(nearest.snr)} dB ↗`
+            : `SNR ${this._fmtSnr(nearest.snr)} &nbsp; RSSI ${nearest.rssi ?? '—'}`;
         this.tooltip.innerHTML =
-            `${dotShape}<b>${this._escHtml(this.displayId(nearest.col))}</b>${nameHtml}<br>` +
-            `${time}<br>${valLine}`;
+            `<div class="ct-name">${dotShape}<b>${this._escHtml(this.displayId(nearest.col))}</b>${nameHtml}</div>` +
+            `<div class="ct-sig">${valLine}<span class="ct-time">${time}</span></div>`;
 
-        const tx = e.clientX + 14;
-        const ty = e.clientY - 10;
-        this.tooltip.style.left = `${Math.min(tx, window.innerWidth - 160)}px`;
-        this.tooltip.style.top  = `${Math.max(ty, 4)}px`;
+        // Anchor the infobox to the data point itself (not the cursor/tap, which
+        // can land a bit off), centred above it. The tooltip is position:absolute
+        // inside <body>; since <body> may carry a transform: scale() (text-size /
+        // desktop zoom), convert the point's viewport position into body-local
+        // (un-scaled, scroll-included) coordinates so it stays anchored and
+        // scrolls with the page.
         this.tooltip.style.display = 'block';
+        const nv = type === 'rssi' ? nearest.rssi : nearest.snr;
+        let scale = 1;
+        const tr = getComputedStyle(document.body).transform;
+        const m = tr && tr !== 'none' ? tr.match(/matrix\(([^)]+)\)/) : null;
+        if (m) scale = parseFloat(m[1].split(',')[0]) || 1;
+        const px = (rect.left + xOf(nearest.time) + window.scrollX) / scale;
+        const py = (rect.top  + yOf(nv)           + window.scrollY) / scale;
+        const tw = this.tooltip.offsetWidth;
+        const th = this.tooltip.offsetHeight;
+        const margin = 8;
+        const viewTop = window.scrollY / scale;
+        let left = px - tw / 2;
+        let top  = py - th - 12;                 // above the point
+        if (top < viewTop + margin) top = py + 16; // not enough room above → below it
+        left = Math.max(margin, Math.min(left, document.body.clientWidth - tw - margin));
+        this.tooltip.style.left = `${left}px`;
+        this.tooltip.style.top  = `${top}px`;
+        if (pin) {
+            this._tooltipPinned = true;
+            this.tooltip.classList.add('pinned');
+        }
     }
 
-    hideChartTooltip() {
-        if (this.tooltip) this.tooltip.style.display = 'none';
+    hideChartTooltip(force = false) {
+        // A pinned infobox only hides when explicitly dismissed (force = true).
+        if (this._tooltipPinned && !force) return;
+        this._tooltipPinned = false;
+        if (this.tooltip) {
+            this.tooltip.style.display = 'none';
+            this.tooltip.classList.remove('pinned');
+        }
     }
 
     // --- Cleanup ---
@@ -3000,10 +4194,10 @@ class MeshCoreApp {
             const cName = this._contactNameForCol(repeater);
             const nameTag = cName ? `<span class="rl-name">${this._escHtml(cName)}</span>` : '';
             return `<tr data-col="${this._escHtml(repeater)}"${rowCls ? ` class="${rowCls}"` : ''}>
-                <td class="rl-id rl-id-clickable"><span class="rl-dot" style="background:${this._dotColor(repeater)}"></span>${this.displayId(repeater)}${nameTag}</td>
+                <td class="rl-id rl-id-clickable"><span class="rl-dot" style="${this._repDotStyle(repeater)}"></span>${this.displayId(repeater)}${nameTag}</td>
                 <td class="rl-num">${d.count}</td>
-                <td class="rl-num" style="color:${msc}">${d.maxSnr?.toFixed(1) ?? '—'}</td>
-                <td class="rl-num" style="color:${lsc}">${d.lastSnr?.toFixed(1) ?? '—'}</td>
+                <td class="rl-num" style="color:${msc}">${this._fmtSnr(d.maxSnr)}</td>
+                <td class="rl-num" style="color:${lsc}">${this._fmtSnr(d.lastSnr)}</td>
                 <td class="rl-num" style="color:${mrc}">${d.maxRssi ?? '—'}</td>
                 <td class="rl-num" style="color:${lrc}">${d.lastRssi ?? '—'}</td>
                 <td class="rl-time">${this._formatTime(d.lastSeen)}</td>
@@ -3042,31 +4236,22 @@ class MeshCoreApp {
         const hasFilter = this._repFilterTerms.length > 0;
         const hasSel    = !!this._selectedCol;
 
-        const fSnr = v => v != null && isFinite(v) ? `${v >= 0 ? '+' : ''}${Number(v).toFixed(1)}` : '—';
+        const fSnr = v => v != null && isFinite(v) ? `${v >= 0 ? '+' : ''}${Number.isInteger(v) ? v : Number(v).toFixed(1)}` : '—';
 
         const buildExtra = (col, showMore, noticePrefix) => {
             const stats = col ? this._colStats(col) : null;
             const contacts = col && col !== 'direct' ? this._contactsByPrefix(col) : [];
             const contactsWithName = contacts.filter(c => c.name);
             const mapBtns = col ? this._contactsForMapButtons(col) : [];
-            const isAutoShown = col && col === this._selectedCol;
             const checkId = `${noticePrefix}ShowMore`;
             let mapHtml = '';
+            // Only when the repeater's GPS location is known: a "Show on map"
+            // button that scrolls to the 3D map and turns the camera toward it
+            // (same as the eye in the map infobox). Keeping it on the map is done
+            // via the pushpin in the map infobox.
             if (mapBtns.length) {
-                mapHtml += `<div class="cn-map-btns">`;
-                // Collapse all contacts into a single button regardless of count
-                const anyPinned = mapBtns.some(c => this._mapPins.has(c.pubKeyFullHex));
                 const allPubkeys = mapBtns.map(c => c.pubKeyFullHex).join('|');
-                let label, cls;
-                if (anyPinned) {
-                    label = '✕ Remove pin'; cls = 'cn-map-btn cn-map-btn-active';
-                } else if (isAutoShown) {
-                    label = '📌 Keep on map'; cls = 'cn-map-btn';
-                } else {
-                    label = '📍 Show on map'; cls = 'cn-map-btn';
-                }
-                mapHtml += `<button class="${cls}" data-pubkeys="${this._escHtml(allPubkeys)}">${label}</button>`;
-                mapHtml += `</div>`;
+                mapHtml += `<div class="cn-map-btns"><button class="cn-map-btn" data-pubkeys="${this._escHtml(allPubkeys)}">📍 Show on map</button></div>`;
             }
             let html = `<div class="cn-showmore-row"><label class="cn-showmore-label"><input type="checkbox" id="${checkId}"${showMore ? ' checked' : ''}> Show more</label>${mapHtml}</div>`;
             if (showMore && stats) {
@@ -3098,13 +4283,15 @@ class MeshCoreApp {
             document.querySelectorAll(`#${noticePrefix}NoticeExtra .cn-map-btn`).forEach(btn => {
                 btn.addEventListener('click', () => {
                     const pks = (btn.dataset.pubkeys || '').split('|').filter(Boolean);
-                    const anyPinned = pks.some(pk => this._mapPins.has(pk));
-                    for (const pk of pks) {
-                        if (anyPinned) this._mapPins.delete(pk);
-                        else this._mapPins.add(pk);
+                    // Turn the map camera toward the repeater (centroid of its GPS
+                    // contacts), then scroll the 3D map into view.
+                    const locs = pks.map(pk => this._contacts.get(pk))
+                                    .filter(c => c && (c.lat || c.lon));
+                    if (locs.length) {
+                        const lat = locs.reduce((s, c) => s + c.lat, 0) / locs.length;
+                        const lon = locs.reduce((s, c) => s + c.lon, 0) / locs.length;
+                        this.signalMap?.faceLatLon(lat, lon);
                     }
-                    this._updateMapPins();
-                    this._updateCornerNotices();
                     document.getElementById('mapWrap')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
                 });
             });
@@ -3120,8 +4307,9 @@ class MeshCoreApp {
                 const exactCol = matchingCols.length === 1 && !matchingCols[0].includes('/') ? matchingCols[0] : null;
                 const dot = document.getElementById('filterNoticeDot');
                 if (dot) {
-                    dot.style.background = exactCol ? this._dotColor(exactCol) : '';
-                    dot.style.display    = exactCol ? '' : 'none';
+                    if (exactCol) this._applyDotStyle(dot, exactCol);
+                    else { dot.style.background = ''; dot.style.border = ''; }
+                    dot.style.display = exactCol ? '' : 'none';
                 }
                 const nameEl = document.getElementById('filterNoticeName');
                 if (nameEl) {
@@ -3144,7 +4332,7 @@ class MeshCoreApp {
             if (hasSel && !hasFilter) {
                 document.getElementById('selNoticeRep').textContent = this.displayId(this._selectedCol);
                 const dot = document.getElementById('selNoticeDot');
-                if (dot) dot.style.background = this._dotColor(this._selectedCol);
+                this._applyDotStyle(dot, this._selectedCol);
                 const nameEl = document.getElementById('selNoticeName');
                 if (nameEl) {
                     const cName = this._contactNameForCol(this._selectedCol);
@@ -3253,6 +4441,45 @@ class MeshCoreApp {
         beep(baseFreq * Math.pow(2, (snr ?? 0) / 10), d1, d2);
     }
 
+    // An interrupted two-tone alarm (880-440-880-440-880-440 Hz) for the
+    // unexpected-disconnect alert. Only plays when sound alerts are enabled.
+    _playDisconnectAlarm() {
+        const mode = this.soundSelect?.value ?? 'off';
+        if (mode === 'off') return;
+        try {
+            if (!this.audioCtx) this.audioCtx = new AudioContext();
+            const ctx = this.audioCtx;
+            if (ctx.state === 'suspended') ctx.resume();
+            const now = ctx.currentTime;
+            const freqs = [880, 440, 880, 440, 880, 440];
+            const dur = 0.16, gap = 0.08;   // gap between tones → "interrupted"
+            freqs.forEach((f, i) => {
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = 'square';
+                osc.frequency.value = f;
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                const start = now + i * (dur + gap);
+                gain.gain.setValueAtTime(0.0001, start);
+                gain.gain.exponentialRampToValueAtTime(0.13, start + 0.01);
+                gain.gain.setValueAtTime(0.13, start + dur - 0.02);
+                gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+                osc.start(start);
+                osc.stop(start + dur + 0.01);
+            });
+        } catch (e) { console.warn('Alarm sound failed:', e); }
+    }
+
+    _showDisconnectAlarm() {
+        document.getElementById('disconnectAlarm')?.classList.remove('hidden');
+        this._playDisconnectAlarm();
+    }
+
+    _hideDisconnectAlarm() {
+        document.getElementById('disconnectAlarm')?.classList.add('hidden');
+    }
+
     // --- BLE Device Battery ---
 
     _updateBleBattery(pct) {
@@ -3318,12 +4545,23 @@ class MeshCoreApp {
         if ((data.type || '').toLowerCase().includes(filter)) return true;
         if (this._abbreviateType(data.type).toLowerCase().includes(filter)) return true;
         for (const col of data.repeaters.keys()) {
+            // Match the short ID label AND the repeater's synced contact name.
             if (this.displayId(col).toLowerCase().includes(filter)) return true;
+            const cName = this._contactNameForCol(col);
+            if (cName && cName.toLowerCase().includes(filter)) return true;
         }
         const m = data.meta;
         if (m?.text?.toLowerCase().includes(filter)) return true;
         if (m?.sender?.toLowerCase().includes(filter)) return true;
         if (m?.name?.toLowerCase().includes(filter)) return true;
+        // An advert's own node name, resolved from the contact list (this is what
+        // the expanded packet detail shows).
+        if (m?.pubKeyFull) {
+            const cn = this._contacts.get(m.pubKeyFull)?.name;
+            if (cn && cn.toLowerCase().includes(filter)) return true;
+        }
+        // Raw bytes too, so a hex substring from the packet can be searched.
+        if (data.rawHex?.toLowerCase().includes(filter)) return true;
         return false;
     }
 
@@ -3356,6 +4594,10 @@ class MeshCoreApp {
     _applyRepFilter() {
         this._renderRepTable();
         this._renderMsgTable();
+        // Filtering changes how many repeater columns are shown, so the table
+        // width changes too — re-check overflow (allowing a return to full type
+        // names) once the new layout has been laid out.
+        requestAnimationFrame(() => this._checkTableOverflow(true));
         this._scheduleChartRender();
         this._updateStats();
         this.signalMap?.setFilterFn(
@@ -3568,9 +4810,11 @@ class MeshCoreApp {
         const importBtn = document.getElementById('importCsvBtn');
         const prevBtnText = importBtn?.textContent;
         if (importBtn) { importBtn.textContent = 'Importing…'; importBtn.disabled = true; }
-        const prevStatus = this.statusEl?.textContent;
-        const prevClass  = this.statusEl?.className;
-        this.updateStatus('Importing CSV…', 'importing');
+        const prevStatus = this.statusTextEl?.textContent;
+        if (this.statusTextEl) this.statusTextEl.textContent = 'Importing CSV…';
+        // Overlay the yellow "importing" tint without dropping the current
+        // connection-state class (which governs child visibility).
+        this.statusEl?.classList.add('importing');
 
         await new Promise(r => setTimeout(r, 0)); // yield to let the browser repaint
 
@@ -3664,12 +4908,37 @@ class MeshCoreApp {
         requestAnimationFrame(() => this._checkTableOverflow(true));
 
         if (importBtn) { importBtn.textContent = prevBtnText; importBtn.disabled = false; }
-        if (this.statusEl && prevStatus != null) { this.statusEl.textContent = prevStatus; this.statusEl.className = prevClass; }
+        this.statusEl?.classList.remove('importing');
+        if (this.statusTextEl && prevStatus != null) this.statusTextEl.textContent = prevStatus;
     }
 
     updateStatus(text, className) {
-        this.statusEl.textContent = text;
+        if (this.statusTextEl) this.statusTextEl.textContent = text;
         this.statusEl.className = `status ${className}`;
+        this._lastStatusText = text;
+        // Mirror the connection status into the native foreground-service
+        // notification so it reflects reality (including self-disconnects).
+        this._refreshNativeStatus();
+    }
+
+    // Build the text shown in the Android foreground-service notification from
+    // the current state: the base connection status, plus a speaker icon when
+    // sound alerts are armed and capture is live, plus a paused marker when the
+    // capture is stopped. No-op outside the Android wrapper.
+    _refreshNativeStatus() {
+        let text = this._lastStatusText || '';
+        if (this._canSend()) {
+            const soundOn = (this.soundSelect?.value || 'off') !== 'off';
+            if (!this._collecting) text += ' — paused';
+            else if (soundOn) text = '🔊 ' + text;
+        }
+        try { window.AndroidScreen?.setStatus?.(text); } catch (e) {}
+    }
+
+    // Show the name/id of the currently connected device (same label as the
+    // matching "Saved:" entry). Hidden by CSS while not connected.
+    _setConnectedDeviceName(name) {
+        if (this.connectedNameEl) this.connectedNameEl.textContent = name || '';
     }
 
     // --- Utilities ---
@@ -3688,6 +4957,16 @@ class MeshCoreApp {
     }
 
     async disconnect() {
+        // The user explicitly asked to disconnect — suppress the surprise-
+        // disconnect alarm that onDisconnected() would otherwise raise.
+        this._intentionalDisconnect = true;
+        // Serial teardown is handled synchronously inside onDisconnected().
+        if (this.transportKind === 'serial') {
+            this._serialClosing = true;
+            this.onDisconnected();
+            return;
+        }
+
         // Grab refs before onDisconnected nulls them
         const device = this.device;
         const txChar = this.txCharacteristic;
@@ -3731,6 +5010,7 @@ class MeshCoreApp {
 
     onDisconnected() {
         this.releaseWakeLock();
+        this._stopRepeaterPolling();
         clearTimeout(this._monitorDelay);
         clearInterval(this._connectionMonitor);
         this._monitorDelay = null;
@@ -3751,18 +5031,62 @@ class MeshCoreApp {
         this._batteryCharacteristic = null;
         this.txCharacteristic = null;
         this.bleRxCharacteristic = null;
+        // Serial teardown: release the reader lock (this unblocks the read loop)
+        // and close the port. Releasing the lock with a read pending makes that
+        // read() reject with a TypeError, which the read loop swallows.
+        if (this._onSerialDisconnect && this.serialPort) {
+            try { this.serialPort.removeEventListener('disconnect', this._onSerialDisconnect); } catch (e) {}
+        }
+        this._onSerialDisconnect = null;
+        try { this.serialReader?.releaseLock(); } catch (e) {}
+        this.serialReader = null;
+        if (this.serialPort) {
+            const sp = this.serialPort;
+            this.serialPort = null;
+            Promise.resolve().then(() => sp.close()).catch(() => {});
+        }
+        this._serialReadBuffer = new Uint8Array(0);
+        this._serialTextBuffer = '';
+        this.transportKind = null;
+        this.connectionMode = null;
+        this._sawCompanionFrame = false;
+        this._sawRepeaterReply = false;
+        this._sawRepeaterRaw = false;
+        this._repeaterStockNoticed = false;
+        this._neighborSeen = new Map();
+        this._pendingRaw = [];
+        this._pendingPosFields = [];
+        clearTimeout(this._posQueryTimer);
+        clearInterval(this._deviceRefreshTimer);
+        this._deviceRefreshTimer = null;
+        this._deviceLocPolicy = null;
+        this._setDeviceLocation(null, null);
+        // Clear any in-flight contact fetch so a fresh connection starts clean
+        // (a stuck _contactsReceiving from an interrupted stream would otherwise
+        // linger). The lastmod marker is intentionally kept — it only ever
+        // reflects a fully-completed sync now, so incremental sync stays correct.
+        this._contactsReceiving = false;
+        this._contactsFetchActive = false;
+        this._setContactsLoading(false);
+        document.getElementById('repeaterNotice')?.classList.add('hidden');
         this.device = null; // null before hiding so queued battery events are ignored by guards below
         if (this.batteryEl) this.batteryEl.classList.add('hidden');
         this.updateStatus('Disconnected', 'disconnected');
-        this.connectBtn.textContent = 'Connect Bluetooth';
-        this.connectBtn.disabled = false;
-        this.connectBtn.onclick = () => this.connectBluetooth();
+        this._setConnectedDeviceName('');
+        this._setConnectIdle();
+        this._updateSoundHighlight();
         this._collecting = false;
         this._updatePauseBtn();
         if (this.emptyState) {
             const p = this.emptyState.querySelector('p');
-            if (p) p.textContent = 'Connect to a MeshCore companion device via Bluetooth to start monitoring RX logs.';
+            if (p) p.textContent = 'Connect to a MeshCore companion device via Bluetooth or USB to start monitoring RX logs.';
         }
+        // A drop on an established connection that we didn't initiate ourselves
+        // is a surprise disconnect — flash the screen red and sound the alarm.
+        const surprise = this._wasConnected && !this._intentionalDisconnect;
+        this._wasConnected = false;
+        this._intentionalDisconnect = false;
+        if (surprise) this._showDisconnectAlarm();
     }
 }
 

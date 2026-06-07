@@ -68,12 +68,20 @@ export class Signal3DMap {
         this.colorFor  = opts.colorFor  || (() => '#667eea');
         this.displayId = opts.displayId || (col => col);
         this.nameForCol = opts.nameForCol || null;
+        // True while the app is actively capturing packets (connected, not
+        // paused). When live we keep the user's own position inside the tiled
+        // area so fast movement without incoming packets doesn't drive off the
+        // map. When just viewing an imported dataset this is false, so a far-away
+        // current position never drags the tiles away from the data.
+        this.isLiveCapture = opts.isLiveCapture || (() => false);
 
         this._rxPoints       = [];     // { lat, lon, rssi, snr, col, time }
         this._pins     = [];   // { lat, lon, name, color }
         this._pinGroups = [];
         this._userLoc      = null;
         this._watchId      = null;
+        this._followUser   = false;  // when true, camera tracks the user's GPS position
+        this.onFollowChange = opts.onFollowChange || null;
         this._tileBounds   = null;   // { x0, y0, nx, ny, zoom }
         this._planeDim     = null;   // { w, h } in world units
         this._mapMesh      = null;
@@ -91,6 +99,9 @@ export class Signal3DMap {
         this._sphereSize   = (opts.initialSphereSize > 0) ? opts.initialSphereSize : 1.0;
         this._showLines   = opts.showLines !== false;
         this._showMarker  = opts.showMarker !== false;
+        this._showDevice  = !!opts.showDevice;   // connected-device marker, default off
+        this._deviceLoc   = null;                // { lat, lon } of the device, or null
+        this._deviceMarker = null;
         this._clusterRadius = (opts.initialClusterRadius > 0) ? opts.initialClusterRadius : 0; // metres; 0 = off
         this._selectedCol = null;
         this._perspSize   = opts.initialPerspSize !== false; // default on
@@ -101,16 +112,20 @@ export class Signal3DMap {
         this._lineSegsDim = null;   // vertical lines for dim (unselected) points
         this._hitPoints = [];
         this._clickedPoint = null;  // the specific point instance last clicked
-        // Shared hit-test geometry & sprite textures (created once)
-        this._hitGeo      = new THREE.SphereGeometry(1, 6, 4);
+        // Shared sprite textures (created once)
         this._sphereTex   = this._makeSphereTex();
         this._starTex     = this._makeStarTex();
+        // Black-ringed discs for the pseudo columns (always face the camera, so
+        // they read as a circle from any angle): direct=yellow, unknown=white.
+        this._ringTexDirect  = this._makeRingTex('#111111', '#ffd400');
+        this._ringTexUnknown = this._makeRingTex('#cc0000', '#ffffff');
         this._outgoingPts     = [];   // { lat, lon, snr, col, time } — outgoing SNR points
         this.infoEl          = opts.infoEl          || null;
         this.onSelect        = opts.onSelect        || null;
         this.onFilter        = opts.onFilter        || null;
         this.onRemoveMarker  = opts.onRemoveMarker  || null;
         this.onPinMarker     = opts.onPinMarker     || null;
+        this.onToggleMapPin  = opts.onToggleMapPin  || null;
         // Sprite lists for static marker hit-testing
         this._pinSprites  = [];   // [{sprite, col, pubKeyFullHex, isClose}]
 
@@ -166,6 +181,21 @@ export class Signal3DMap {
         return new THREE.CanvasTexture(canvas);
     }
 
+    // Filled disc with a coloured rim, for the pseudo-column markers. Rendered
+    // with a white vertex colour so the baked fill/rim colours show true.
+    _makeRingTex(rim, fill) {
+        const s = 64, c = s / 2, r = s / 2 - 2;
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = s;
+        const ctx = canvas.getContext('2d');
+        ctx.beginPath(); ctx.arc(c, c, r, 0, Math.PI * 2);
+        ctx.fillStyle = fill; ctx.fill();
+        ctx.lineWidth = s * 0.24;
+        ctx.strokeStyle = rim;
+        ctx.beginPath(); ctx.arc(c, c, r - ctx.lineWidth / 2, 0, Math.PI * 2); ctx.stroke();
+        return new THREE.CanvasTexture(canvas);
+    }
+
     // ---- Scene setup ----
 
     _initScene() {
@@ -202,6 +232,9 @@ export class Signal3DMap {
             clearTimeout(this._viewUpdateTimer);
             this._viewUpdateTimer = setTimeout(() => this._updateOverlay(), 700);
         });
+        // User interaction cancels any running camera fly/turn animation and
+        // leaves "follow me" mode — the user has taken manual control.
+        this.controls.addEventListener('start', () => { this._camAnim = null; this.setFollowUser(false); });
 
         // Two-finger twist: rotate camera azimuth by the angular change between the
         // two touch points.  rotateLeft() is private in Three.js ≥0.155, so we
@@ -282,11 +315,18 @@ export class Signal3DMap {
                     this.onSelect?.(null);
                 } else if (e.target.closest('.smi-filter')) {
                     this.onFilter?.(this._selectedCol);
+                } else if (e.target.closest('.smi-look')) {
+                    const loc = this._repeaterLocation(this._selectedCol);
+                    if (loc) this.faceLatLon(loc.lat, loc.lon);
+                } else if (e.target.closest('.smi-pin')) {
+                    this.onToggleMapPin?.(this._selectedCol);
+                    this._updateInfoPanel();   // reflect the new pin state
                 }
             });
         }
 
         const tick = () => {
+            this._stepCameraAnim();
             this.controls.update();
             this._scaleMarkerToScreen();
             this.renderer.render(this.scene, this.camera);
@@ -320,8 +360,12 @@ export class Signal3DMap {
                 if (p.state === 'granted') {
                     if (!this._watchId) this.startWatching();
                 } else if (p.state === 'denied') {
-                    this._setStatus('Location denied — new packets won\'t be placed on the map. You can still view and rotate existing data.');
-                    if (this.btnEl) { this.btnEl.disabled = true; this.btnEl.textContent = 'Location denied'; }
+                    // Keep the button live so the user can retry — "denied" is also
+                    // what some browsers report when location is simply turned off at
+                    // the OS level, and that recovers once it's switched back on.
+                    // A permanently-disabled button would leave no way back.
+                    this._setStatus('Location off or denied — enable it, then tap “Enable location”.');
+                    if (this.btnEl) { this.btnEl.disabled = false; this.btnEl.textContent = 'Enable location'; }
                 } else {
                     this._setStatus('Location not enabled.');
                 }
@@ -369,6 +413,9 @@ export class Signal3DMap {
                 }
                 this._scheduleMapUpdate();
                 this._updateUserMarker();
+                // In follow mode, keep the user centred as they move (shorter,
+                // smoother glide than the initial fly-to).
+                if (this._followUser) this.flyToUser(450);
             },
             err => {
                 resolved = true;
@@ -495,17 +542,42 @@ export class Signal3DMap {
 
         let newCol = null;
         let clickedPt = null;
-        if (this._hitMesh) {
-            const hits = this._raycaster.intersectObject(this._hitMesh);
-            if (hits.length > 0) {
-                const c = this._hitPoints[hits[0].instanceId];
-                if (c) {
-                    // Clicking the exact same bead again deselects. Clicking any
-                    // other bead — even one of the already-selected repeater —
-                    // shows that specific bead's SNR/RSSI in the info panel.
-                    if (this._clickedPoint === c) { newCol = null; clickedPt = null; }
-                    else { newCol = c.col; clickedPt = c; }
-                }
+        // Screen-space pick against the actually-rendered dot positions. The dots
+        // are drawn at ~constant screen size (dampened-perspective shader), so a
+        // 3D ray-vs-world-sphere test mis-selects when dots stack vertically
+        // (same lat/lon, different SNR height) or sit near each other. Projecting
+        // each dot and choosing the one nearest the cursor matches what the user
+        // sees — and clicking the guide line (away from the ball) no longer hits.
+        {
+            const px = e.clientX - rect.left, py = e.clientY - rect.top;
+            const groupSy = this._rxPointsGroup?.scale.y ?? 1;
+            const PICK_RADIUS = 16; // CSS px around a dot centre
+            const TIE = 8;          // dots this close on screen count as overlapping
+            const _v = new THREE.Vector3();
+            const candidates = [];
+            for (const p of this._hitPoints) {
+                const wp = this._latLonToWorld(p.lat, p.lon);
+                if (!wp) continue;
+                _v.set(wp.x, this._signalToHeight(p.snr) * groupSy, wp.z);
+                const camDist = this.camera.position.distanceTo(_v);
+                _v.project(this.camera);
+                if (_v.z > 1) continue; // behind the camera
+                const sx = (_v.x * 0.5 + 0.5) * rect.width;
+                const sy = (-_v.y * 0.5 + 0.5) * rect.height;
+                const d = Math.hypot(sx - px, sy - py);
+                if (d <= PICK_RADIUS) candidates.push({ p, d, camDist });
+            }
+            // Nearest to the cursor wins; for dots overlapping on screen prefer the
+            // front-most (the one visually on top).
+            let best = null;
+            for (const c of candidates) {
+                if (!best) { best = c; continue; }
+                if (Math.abs(c.d - best.d) <= TIE) { if (c.camDist < best.camDist) best = c; }
+                else if (c.d < best.d) best = c;
+            }
+            if (best) {
+                if (this._clickedPoint === best.p) { newCol = null; clickedPt = null; }
+                else { newCol = best.p.col; clickedPt = best.p; }
             }
         }
         this._clickedPoint = clickedPt;
@@ -520,10 +592,16 @@ export class Signal3DMap {
         if (!this.infoEl) return;
         const col = this._selectedCol;
         if (!col || !this._infoPanelFromClick) { this.infoEl.classList.add('hidden'); return; }
-        const pts = this._rxPoints.filter(p => p.col === col);
+        // Consider both received (sphere) and sent (star) points so a repeater
+        // we've only ever transmitted to still shows a panel when clicked.
+        const pts = this._rxPoints.filter(p => p.col === col)
+            .concat(this._outgoingPts.filter(p => p.col === col));
         if (!pts.length) { this.infoEl.classList.add('hidden'); return; }
-        const color    = this.colorFor(col);
-        const dot      = `<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${color};margin-right:5px;flex-shrink:0"></span>`;
+        const isPseudo = col === 'direct' || col === 'unknown';
+        const dotStyle = isPseudo
+            ? `background:${col === 'direct' ? '#ffd400' : '#fff'};border:2px solid ${col === 'direct' ? '#111' : '#c00'};box-sizing:border-box`
+            : `background:${this.colorFor(col)}`;
+        const dot      = `<span style="display:inline-block;width:9px;height:9px;border-radius:50%;${dotStyle};margin-right:5px;flex-shrink:0"></span>`;
         const name     = this.nameForCol ? this.nameForCol(col) : null;
         const nameHtml = name ? ` <span class="smi-colname">${this._escHtml(name)}</span>` : '';
         // Use the exact clicked point; fall back to latest point for the column
@@ -536,9 +614,30 @@ export class Signal3DMap {
                           rssiStr ? `RSSI <b>${this._escHtml(rssiStr)}</b>` : null].filter(Boolean);
         const sigHtml = sigParts.length
             ? `<div class="smi-sig">${sigParts.join(' &nbsp; ')}<span class="smi-time">${timeStr}</span></div>` : '';
+        // When the repeater's own GPS location is known (it has a static marker),
+        // offer an "eye" button (turn the map toward it) and a pushpin button
+        // (keep it on the map permanently / remove). Tilted pin = shown only
+        // temporarily; upright pin = kept on the map.
+        const hasLoc = this._repeaterLocation(col) != null;
+        let actionsHtml = '';
+        if (hasLoc) {
+            const pinned = (this._pins || []).some(m => m.col === col && (m.lat || m.lon) && m.isPinned);
+            const pinTitle = pinned
+                ? 'Kept on the map — click to remove'
+                : 'Shown temporarily — click to keep on the map';
+            // Inline SVG pushpin (orientation is controlled by CSS rotation, not by
+            // platform emoji rendering): tilted = temporary, upright = kept.
+            const pinSvg = `<svg class="smi-pin-svg" viewBox="0 0 24 24" aria-hidden="true">` +
+                `<rect x="10.5" y="7" width="3" height="6" fill="currentColor"/>` +
+                `<path d="M12 22 L10.5 13 L13.5 13 Z" fill="currentColor"/>` +
+                `<ellipse cx="12" cy="6" rx="7.5" ry="3.6" fill="#e53935"/></svg>`;
+            actionsHtml =
+                `<button class="smi-look" title="Turn the map toward this repeater">👁</button>` +
+                `<button class="smi-pin${pinned ? ' pinned' : ''}" title="${pinTitle}">${pinSvg}</button>`;
+        }
         this.infoEl.innerHTML =
             `<button class="smi-close" title="Deselect">✕</button>` +
-            `<div class="smi-name">${dot}<b>${this._escHtml(this.displayId(col))}</b>${nameHtml}</div>` +
+            `<div class="smi-name">${dot}<b>${this._escHtml(this.displayId(col))}</b>${nameHtml}${actionsHtml}</div>` +
             sigHtml;
         this.infoEl.classList.remove('hidden');
     }
@@ -660,7 +759,7 @@ export class Signal3DMap {
         sprite.renderOrder = 10;
         const aspect = c.width / c.height;
         sprite.scale.set(aspect * 2.4, 2.4, 1);
-        sprite.position.set(0, 7.0, 0);
+        sprite.position.set(0, 3.6, 0);
         return sprite;
     }
 
@@ -686,16 +785,8 @@ export class Signal3DMap {
             base.position.y = 0.06;
             group.add(base);
 
-            // Thin mast
-            const mast = new THREE.Mesh(
-                new THREE.CylinderGeometry(0.07, 0.1, 2.8, 8),
-                new THREE.MeshBasicMaterial({ color: col3 })
-            );
-            mast.position.y = 1.4;
-            group.add(mast);
-
-            // 📡 emoji sprite — click target for selection
-            const emojiSprite = this._makeEmojiSprite('📡', 3.8);
+            // 📡 emoji sprite — sits on the ground (no mast). Click target for selection.
+            const emojiSprite = this._makeEmojiSprite('📡', 1.2);
             group.add(emojiSprite);
             this._pinSprites.push({ sprite: emojiSprite, col: markerCol, pubKeyFullHex, isClose: false, isLabel: false });
 
@@ -747,6 +838,26 @@ export class Signal3DMap {
     setShowMarker(v) {
         this._showMarker = !!v;
         if (this._userMarker) this._userMarker.visible = this._showMarker;
+        this._scheduleMapUpdate();
+    }
+
+    setShowDeviceMarker(v) {
+        this._showDevice = !!v;
+        if (this._deviceMarker) this._deviceMarker.visible = this._showDevice && !!this._deviceLoc;
+        this._scheduleMapUpdate();
+    }
+
+    // The connected device's own (configured/advertised) position. Pass null —
+    // or 0,0 — to clear it (no position / unsupported).
+    setDeviceLocation(lat, lon) {
+        if (lat == null || lon == null || (lat === 0 && lon === 0)) {
+            this._deviceLoc = null;
+            if (this._deviceMarker) this._deviceMarker.visible = false;
+            this._scheduleMapUpdate();
+            return;
+        }
+        this._deviceLoc = { lat, lon };
+        this._updateDeviceMarker();
         this._scheduleMapUpdate();
     }
 
@@ -865,7 +976,13 @@ export class Signal3DMap {
         const locs = this._rxPoints
             .filter(p => (!cutoff || p.time >= cutoff) && (!this._filterFn || this._filterFn(p.col)))
             .map(p => ({ lat: p.lat, lon: p.lon }));
-        if (this._userLoc && this._showMarker) locs.push({ lat: this._userLoc.lat, lon: this._userLoc.lon });
+        // Include the user's own position in the tile bbox when the marker is
+        // shown OR we're live-capturing — the latter keeps tiles under the user
+        // even if they've hidden their marker and are moving with no packets
+        // arriving. (When viewing a static import this is false, so a position
+        // somewhere else doesn't pull the map off the data.)
+        if (this._userLoc && (this._showMarker || this.isLiveCapture()))
+            locs.push({ lat: this._userLoc.lat, lon: this._userLoc.lon });
         if (!locs.length) return null;
         let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
         for (const l of locs) {
@@ -937,6 +1054,7 @@ export class Signal3DMap {
         const key = `${sourceId}/${zoom}/${x0}/${y0}/${x1}/${y1}`;
         if (key === this._lastMapKey) {
             this._updateUserMarker();  // tiles unchanged — just move the user pin
+            this._updateDeviceMarker();
             return;
         }
 
@@ -968,6 +1086,7 @@ export class Signal3DMap {
             this._rebuildDots();
             this._rebuildPins();   // reposition markers against the new tile scale
             this._updateUserMarker();
+            this._updateDeviceMarker();
             this._fitCameraOnce();         // no-op after the first tile load
 
             // Restore the camera to the same geographic look-at point and eye position.
@@ -1007,6 +1126,133 @@ export class Signal3DMap {
     fitCamera() {
         this._cameraFit = false;
         this._forceFit  = true;
+    }
+
+    // ---- Camera fly / turn animations ----
+
+    // Known GPS location of a repeater column, or null. Looked up from the
+    // static markers (a repeater only has a location once it has advertised GPS).
+    // On a collision (several repeaters sharing this column, each with its own
+    // GPS) we aim at the centroid — the midpoint of all known locations.
+    _repeaterLocation(col) {
+        if (!col) return null;
+        const ms = (this._pins || []).filter(p => p.col === col && (p.lat || p.lon));
+        if (!ms.length) return null;
+        const lat = ms.reduce((s, p) => s + p.lat, 0) / ms.length;
+        const lon = ms.reduce((s, p) => s + p.lon, 0) / ms.length;
+        return { lat, lon };
+    }
+
+    // Drive a camera animation via a per-frame apply(easedProgress) closure.
+    _animate(apply, duration = 700) {
+        this._camAnim = { apply, start: performance.now(), duration };
+    }
+
+    _stepCameraAnim() {
+        const a = this._camAnim;
+        if (!a) return;
+        const k = Math.min(1, (performance.now() - a.start) / a.duration);
+        const e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2; // easeInOutQuad
+        a.apply(e);
+        this.controls.target.y = 0;
+        this._updateHeightScale();
+        if (k >= 1) this._camAnim = null;
+    }
+
+    // Recenter the view on the user's current GPS location (keeps angle/zoom).
+    // Returns false (and shows a status message) when the location is unknown.
+    flyToUser(duration = 700) {
+        if (!this._userLoc) {
+            this._setStatus('Location not known yet — tap “Enable location” first.');
+            return false;
+        }
+        const pos = this._latLonToWorld(this._userLoc.lat, this._userLoc.lon);
+        if (!pos) return false;
+        const delta    = new THREE.Vector3(pos.x - this.controls.target.x, 0, pos.z - this.controls.target.z);
+        const fromT    = this.controls.target.clone();
+        const fromE    = this.camera.position.clone();
+        const toT      = new THREE.Vector3(pos.x, 0, pos.z);
+        const toE      = this.camera.position.clone().add(delta);
+        this._animate(e => {
+            this.controls.target.lerpVectors(fromT, toT, e);
+            this.camera.position.lerpVectors(fromE, toE, e);
+        }, duration);
+        return true;
+    }
+
+    // "Center on me" is a toggle: pressing it once centres on the user and
+    // enters follow mode (camera tracks GPS); pressing it again — or any manual
+    // map movement — leaves follow mode.
+    toggleFollowUser() {
+        if (this._followUser) { this.setFollowUser(false); return; }
+        if (this.flyToUser()) this.setFollowUser(true);
+    }
+
+    setFollowUser(on) {
+        on = !!on;
+        if (this._followUser === on) return;
+        this._followUser = on;
+        this.onFollowChange?.(on);
+    }
+
+    // Turn the camera (orbit around its current target) so it looks toward the
+    // given location — i.e. that direction becomes "into the screen". Keeps the
+    // zoom (orbit radius) constant. If the target is so far / the view so
+    // top-down that it would fall above the frame, the camera is also tilted
+    // toward the horizon (polar angle) so the repeater becomes visible.
+    faceLatLon(lat, lon) {
+        const R = this._latLonToWorld(lat, lon);
+        if (!R) return false;
+        const T = this.controls.target.clone();
+        const dx = R.x - T.x, dz = R.z - T.z;
+        const d = Math.hypot(dx, dz);
+        if (d < 1e-3) return false; // already centred there
+
+        // Current camera position in spherical coords around the target.
+        const cx = this.camera.position.x - T.x;
+        const cy = this.camera.position.y - T.y;
+        const cz = this.camera.position.z - T.z;
+        const r = Math.hypot(cx, cy, cz) || 1;
+        const phi0   = Math.acos(Math.max(-1, Math.min(1, cy / r))); // polar from +Y
+        const theta0 = Math.atan2(cz, cx);                            // azimuth
+        // Camera must sit on the far side of the target from R so the view faces R.
+        const thetaTo = Math.atan2(-dz, -dx);
+        let dTheta = thetaTo - theta0;
+        while (dTheta >  Math.PI) dTheta -= 2 * Math.PI;
+        while (dTheta < -Math.PI) dTheta += 2 * Math.PI;
+
+        // Vertical angle of R above the view centre (target) once R is straight
+        // ahead. R is always above centre (it's farther along the ground), so if
+        // that angle exceeds half the vertical FOV we tilt toward the horizon
+        // (larger polar angle) until it fits comfortably.
+        const maxPhi  = this.controls.maxPolarAngle ?? (Math.PI / 2 - 0.08);
+        const fovRad  = this.camera.fov * Math.PI / 180;
+        const offsetAt = phi => (Math.PI / 2 - phi) - Math.atan2(r * Math.cos(phi), d + r * Math.sin(phi));
+        let phiTo = phi0;
+        if (offsetAt(phi0) > fovRad / 2 * 0.85) {
+            const want = fovRad / 2 * 0.6;       // place R ~60% toward the top edge
+            if (offsetAt(maxPhi) >= want) {
+                phiTo = maxPhi;                  // as horizontal as allowed
+            } else {
+                let lo = phi0, hi = maxPhi;      // offset decreases as phi grows
+                for (let i = 0; i < 24; i++) {
+                    const m = (lo + hi) / 2;
+                    if (offsetAt(m) > want) lo = m; else hi = m;
+                }
+                phiTo = hi;
+            }
+        }
+        const dPhi = phiTo - phi0;
+
+        this._animate(e => {
+            const theta = theta0 + dTheta * e;
+            const phi   = phi0   + dPhi   * e;
+            const sinP  = Math.sin(phi);
+            this.camera.position.x = T.x + r * sinP * Math.cos(theta);
+            this.camera.position.z = T.z + r * sinP * Math.sin(theta);
+            this.camera.position.y = T.y + r * Math.cos(phi);
+        });
+        return true;
     }
 
     _updateHeightScale() {
@@ -1209,8 +1455,6 @@ export class Signal3DMap {
         const litPts = sel ? visible.filter(p => p.col === sel) : visible;
         const dimPts = sel ? visible.filter(p => p.col !== sel) : [];
 
-        const _m4 = new THREE.Matrix4(), _v = new THREE.Vector3();
-        const _s  = new THREE.Vector3(), _q = new THREE.Quaternion();
         const _col = new THREE.Color();
 
         const fovFactor  = 2 * Math.tan((this.camera.fov / 2) * Math.PI / 180);
@@ -1226,8 +1470,12 @@ export class Signal3DMap {
                 pos[i*3]   = wp ? wp.x : 0;
                 pos[i*3+1] = wp ? this._signalToHeight(p.snr) : 0;
                 pos[i*3+2] = wp ? wp.z : 0;
-                _col.set(this.colorFor(p.col));
-                col[i*3] = _col.r; col[i*3+1] = _col.g; col[i*3+2] = _col.b;
+                if (p.col === 'direct' || p.col === 'unknown') {
+                    col[i*3] = 1; col[i*3+1] = 1; col[i*3+2] = 1;   // white — ring texture carries the rim colour
+                } else {
+                    _col.set(this.colorFor(p.col));
+                    col[i*3] = _col.r; col[i*3+1] = _col.g; col[i*3+2] = _col.b;
+                }
             }
             const geo = new THREE.BufferGeometry();
             geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
@@ -1281,27 +1529,25 @@ export class Signal3DMap {
             this._rxPointsGroup.add(m);
         };
 
-        addPoints(litPts, 1.0,  2.0);
-        addPoints(dimPts, 0.07, 2.0);
+        // Split each set by sprite texture: real repeaters use the shaded
+        // sphere, the two pseudo columns use white-filled rings.
+        const addGroup = (pts, opacity) => {
+            const normal = [], direct = [], unknown = [];
+            for (const p of pts) {
+                if (p.col === 'direct') direct.push(p);
+                else if (p.col === 'unknown') unknown.push(p);
+                else normal.push(p);
+            }
+            addPoints(normal,  opacity, 2.0, this._sphereTex);
+            addPoints(direct,  opacity, 2.0, this._ringTexDirect);
+            addPoints(unknown, opacity, 2.0, this._ringTexUnknown);
+        };
+        addGroup(litPts, 1.0);
+        addGroup(dimPts, 0.07);
 
-        // Invisible InstancedMesh for raycasting (stays separate from visual rendering)
+        // Points used for screen-space click picking (see _onCanvasClick).
+        // Outgoing TX stars are appended further below, once sentAll is built.
         this._hitPoints = visible;
-        this._hitMesh = new THREE.InstancedMesh(
-            this._hitGeo,
-            new THREE.MeshBasicMaterial({ visible: false }),
-            visible.length
-        );
-        for (let i = 0; i < visible.length; i++) {
-            const p   = visible[i];
-            const pos = this._latLonToWorld(p.lat, p.lon);
-            if (!pos) { _m4.makeScale(0, 0, 0); this._hitMesh.setMatrixAt(i, _m4); continue; }
-            const h  = this._signalToHeight(p.snr);
-            const hr = this._sphereSize + 1.8;
-            _m4.compose(_v.set(pos.x, h, pos.z), _q, _s.set(hr, hr, hr));
-            this._hitMesh.setMatrixAt(i, _m4);
-        }
-        this._hitMesh.instanceMatrix.needsUpdate = true;
-        this._rxPointsGroup.add(this._hitMesh);
 
         // Vertical lines — split into lit (coloured) and dim (flat grey, low opacity)
         const makeLines = (pts, mat) => {
@@ -1357,6 +1603,10 @@ export class Signal3DMap {
         addPoints(sentLit, 1.0,  3.2, this._starTex);
         addPoints(sentDim, 0.07, 3.2, this._starTex);
 
+        // Make the TX stars clickable too (clicking one selects its repeater,
+        // exactly like clicking an RX sphere).
+        this._hitPoints = this._hitPoints.concat(sentAll);
+
         this._rebuildPins();
         this._updatePerspUniforms();
     }
@@ -1370,6 +1620,7 @@ export class Signal3DMap {
         };
         // Cone local height = 2.8; target 40 CSS pixels tall on screen
         if (this._userMarker) scaleFor(this._userMarker, 2.8);
+        if (this._deviceMarker) scaleFor(this._deviceMarker, 3.1);
         for (const g of this._pinGroups) {
             scaleFor(g, 4.0);
         }
@@ -1399,6 +1650,42 @@ export class Signal3DMap {
             this.scene.add(this._userMarker);
         }
         this._userMarker.position.set(pos.x, 0, pos.z);  // scale handled by _scaleMarkerToScreen()
+    }
+
+    // The connected device's own position — drawn as a blue antenna (mast +
+    // ball), deliberately distinct from the red "my location" cone and from the
+    // repeater pins, so it reads as "this is the radio/repeater I'm talking to".
+    _updateDeviceMarker() {
+        if (!this._deviceLoc || !this._tileBounds) return;
+        const pos = this._latLonToWorld(this._deviceLoc.lat, this._deviceLoc.lon);
+        if (!pos) return;
+        if (!this._deviceMarker) {
+            const COL = 0x2299ff;
+            const group = new THREE.Group();
+            const mast = new THREE.Mesh(
+                new THREE.CylinderGeometry(0.18, 0.18, 2.4, 10),
+                new THREE.MeshBasicMaterial({ color: COL })
+            );
+            mast.position.y = 1.2;
+            group.add(mast);
+            const ball = new THREE.Mesh(
+                new THREE.SphereGeometry(0.5, 16, 12),
+                new THREE.MeshBasicMaterial({ color: COL })
+            );
+            ball.position.y = 2.6;
+            group.add(ball);
+            const base = new THREE.Mesh(
+                new THREE.CircleGeometry(1.44, 24),
+                new THREE.MeshBasicMaterial({ color: COL, transparent: true, opacity: 0.35 })
+            );
+            base.rotation.x = -Math.PI / 2;
+            base.position.y = 0.05;
+            group.add(base);
+            this._deviceMarker = group;
+            this.scene.add(this._deviceMarker);
+        }
+        this._deviceMarker.visible = this._showDevice;
+        this._deviceMarker.position.set(pos.x, 0, pos.z);  // scale handled by _scaleMarkerToScreen()
     }
 
 }

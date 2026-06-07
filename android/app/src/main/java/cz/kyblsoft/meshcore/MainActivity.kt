@@ -16,6 +16,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.View
+import android.view.ViewGroup
 import android.webkit.ConsoleMessage
 import android.webkit.GeolocationPermissions
 import android.webkit.ValueCallback
@@ -24,12 +26,16 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.widget.ArrayAdapter
+import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
 import org.json.JSONArray
@@ -38,6 +44,10 @@ import org.json.JSONObject
 class MainActivity : AppCompatActivity() {
 
     lateinit var ble: BleManager
+        private set
+    lateinit var serial: SerialManager
+        private set
+    lateinit var wifi: TcpManager
         private set
     lateinit var location: LocationHelper
         private set
@@ -74,6 +84,12 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestPermission()
     ) { /* user decides in settings; capture still works while screen is on */ }
 
+    // HTML5 fullscreen (the 3D map "fullscreen" button). When the page calls
+    // Element.requestFullscreen(), the WebView routes it through
+    // onShowCustomView; we host that view on top of the window decor.
+    private var customView: View? = null
+    private var customViewCallback: WebChromeClient.CustomViewCallback? = null
+
     // File picker for CSV import — result wired to the pending WebView callback
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
     private val openFileLauncher = registerForActivityResult(
@@ -86,23 +102,49 @@ class MainActivity : AppCompatActivity() {
 
     // File picker for CSV export — shows "Save as" dialog via SAF
     private var pendingCsvContent: String? = null
+    private var pendingCsvName: String? = null
     private val saveCsvLauncher = registerForActivityResult(
         ActivityResultContracts.CreateDocument("text/csv")
     ) { uri: Uri? ->
         val content = pendingCsvContent ?: return@registerForActivityResult
+        val suggested = pendingCsvName
         pendingCsvContent = null
-        if (uri == null) return@registerForActivityResult
+        pendingCsvName = null
+        if (uri == null) return@registerForActivityResult   // user cancelled the dialog
         try {
             contentResolver.openOutputStream(uri)?.use { it.write(content.toByteArray(Charsets.UTF_8)) }
+            Toast.makeText(this, "File ${displayNameOf(uri) ?: suggested} saved.", Toast.LENGTH_LONG).show()
         } catch (e: Exception) {
             Toast.makeText(this, "Save failed: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
+    // Hide/show the system bars while an HTML element is in fullscreen.
+    private fun setImmersiveFullscreen(on: Boolean) {
+        WindowCompat.setDecorFitsSystemWindows(window, !on)
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        if (on) {
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        } else {
+            controller.show(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
     fun launchCsvSavePicker(filename: String, content: String) {
         pendingCsvContent = content
+        pendingCsvName = filename
         saveCsvLauncher.launch(filename)
     }
+
+    // Best-effort human-readable name for a SAF document Uri (the user may have
+    // renamed the file in the dialog), falling back to the last path segment.
+    private fun displayNameOf(uri: Uri): String? = try {
+        contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+            ?: uri.lastPathSegment
+    } catch (e: Exception) { uri.lastPathSegment }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -113,6 +155,8 @@ class MainActivity : AppCompatActivity() {
 
         jsApi = JsApi(webView)
         ble = BleManager(applicationContext, jsApi)
+        serial = SerialManager(applicationContext, jsApi)
+        wifi = TcpManager(jsApi)
         location = LocationHelper(applicationContext, jsApi)
 
         with(webView.settings) {
@@ -124,6 +168,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         webView.addJavascriptInterface(BleBridge(this), "AndroidBle")
+        webView.addJavascriptInterface(SerialBridge(this), "AndroidSerial")
+        webView.addJavascriptInterface(WifiBridge(this), "AndroidWifi")
         webView.addJavascriptInterface(GeoBridge(this), "AndroidGeo")
         webView.addJavascriptInterface(FilesBridge(this), "AndroidFiles")
         webView.addJavascriptInterface(ScreenBridge(this), "AndroidScreen")
@@ -169,6 +215,66 @@ class MainActivity : AppCompatActivity() {
                 callback.invoke(origin, true, false)
             }
 
+            // window.prompt() (used for the WiFi IP:port input) needs an explicit
+            // handler in a WebView, otherwise it silently returns null on many
+            // devices. Show a simple input dialog.
+            override fun onJsPrompt(
+                view: WebView?,
+                url: String?,
+                message: String?,
+                defaultValue: String?,
+                result: android.webkit.JsPromptResult
+            ): Boolean {
+                val input = android.widget.EditText(this@MainActivity).apply {
+                    setText(defaultValue ?: "")
+                    setSingleLine(true)
+                }
+                AlertDialog.Builder(this@MainActivity)
+                    .setMessage(message)
+                    .setView(input)
+                    .setPositiveButton("OK") { _, _ -> result.confirm(input.text.toString()) }
+                    .setNegativeButton("Cancel") { _, _ -> result.cancel() }
+                    .setOnCancelListener { result.cancel() }
+                    .show()
+                return true
+            }
+
+            // HTML5 Fullscreen API support. Without these the page's
+            // requestFullscreen() silently does nothing in a WebView, so the
+            // 3D map "fullscreen" button appeared dead on Android.
+            override fun onShowCustomView(view: View, callback: CustomViewCallback) {
+                if (customView != null) {   // already in fullscreen — refuse the new one
+                    callback.onCustomViewHidden()
+                    return
+                }
+                customView = view
+                customViewCallback = callback
+                (window.decorView as FrameLayout).addView(
+                    view,
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                )
+                // INVISIBLE (not GONE): the custom view covers the WebView, but
+                // keeping it laid out preserves its scroll position. GONE drops it
+                // from layout (0 height), which resets the page scroll to the top.
+                webView.visibility = View.INVISIBLE
+                setImmersiveFullscreen(true)
+            }
+
+            override fun onHideCustomView() {
+                val view = customView ?: return
+                (window.decorView as FrameLayout).removeView(view)
+                customView = null
+                webView.visibility = View.VISIBLE
+                setImmersiveFullscreen(false)
+                // The page scroll is restored on the JS side (fullscreenchange),
+                // since the document scroll lives in Blink, not webView.scrollY.
+                customViewCallback?.onCustomViewHidden()
+                customViewCallback = null
+            }
+
             override fun onShowFileChooser(
                 webView: WebView,
                 filePathCallback: ValueCallback<Array<Uri>>,
@@ -186,7 +292,23 @@ class MainActivity : AppCompatActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (webView.canGoBack()) webView.goBack() else moveTaskToBack(true)
+                // Leave HTML5 fullscreen first if the map is maximised. Asking the
+                // page to exit keeps document.fullscreenElement in sync and fires
+                // onHideCustomView to tear down our overlay.
+                if (customView != null) {
+                    webView.evaluateJavascript(
+                        "document.exitFullscreen && document.exitFullscreen()", null
+                    )
+                    return
+                }
+                // Let the web app close an open overlay (help / settings) first;
+                // only leave the app when nothing was open to dismiss.
+                webView.evaluateJavascript(
+                    "(typeof window.__mcHandleBack==='function' && window.__mcHandleBack())===true"
+                ) { result ->
+                    if (result == "true") return@evaluateJavascript
+                    if (webView.canGoBack()) webView.goBack() else moveTaskToBack(true)
+                }
             }
         })
 
@@ -203,12 +325,12 @@ class MainActivity : AppCompatActivity() {
 
     // ---- permission gate (called at connect/scan time) ------------------
 
-    fun ensureConnectPermissions(onGranted: () -> Unit) {
+    fun ensureConnectPermissions(includeBluetooth: Boolean = true, onGranted: () -> Unit) {
         val needed = mutableListOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION
         )
-        if (Build.VERSION.SDK_INT >= 31) {
+        if (includeBluetooth && Build.VERSION.SDK_INT >= 31) {
             needed += Manifest.permission.BLUETOOTH_SCAN
             needed += Manifest.permission.BLUETOOTH_CONNECT
         }
@@ -232,6 +354,38 @@ class MainActivity : AppCompatActivity() {
     fun requestDevice(reqId: String, filtersJson: String) {
         val prefixes = parsePrefixes(filtersJson)
         main.post { ensureConnectPermissions { startScanDialog(reqId, prefixes) } }
+    }
+
+    // ---- USB serial picker (called from SerialBridge) -------------------
+
+    fun requestSerialPort(reqId: String) {
+        val drivers = serial.availableDrivers()
+        if (drivers.isEmpty()) {
+            Toast.makeText(
+                this,
+                "No USB serial device found. Plug in your device and tap Connect USB again.",
+                Toast.LENGTH_LONG
+            ).show()
+            jsApi.resolve(reqId, false, errJson("NotFoundError", "No USB serial devices found"))
+            return
+        }
+        // A single device goes straight to the system USB permission prompt;
+        // multiple devices get a chooser first.
+        if (drivers.size == 1) {
+            serial.requestPermission(reqId, drivers[0])
+            return
+        }
+        val labels = drivers.map { serial.deviceLabel(it.device) }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Select USB device")
+            .setItems(labels) { _, which -> serial.requestPermission(reqId, drivers[which]) }
+            .setNegativeButton("Cancel") { _, _ ->
+                jsApi.resolve(reqId, false, errJson("NotFoundError", "User cancelled device selection"))
+            }
+            .setOnCancelListener {
+                jsApi.resolve(reqId, false, errJson("NotFoundError", "User cancelled device selection"))
+            }
+            .show()
     }
 
     @SuppressLint("MissingPermission")

@@ -1,5 +1,6 @@
 package cz.kyblsoft.meshcore
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,12 +8,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 
 /**
  * Foreground service that keeps the process alive (and the CPU running via a
@@ -32,6 +35,7 @@ class MeshcoreService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        running = true
         startAsForeground()
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "meshcore:capture").apply {
@@ -46,6 +50,7 @@ class MeshcoreService : Service() {
     }
 
     override fun onDestroy() {
+        running = false
         try { wakeLock?.release() } catch (_: Exception) {}
         wakeLock = null
         super.onDestroy()
@@ -53,50 +58,48 @@ class MeshcoreService : Service() {
 
     private fun startAsForeground() {
         val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= 30) {
-            ServiceCompat.startForeground(
-                this, NOTIF_ID, notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-            )
-        } else if (Build.VERSION.SDK_INT >= 29) {
-            ServiceCompat.startForeground(
-                this, NOTIF_ID, notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-            )
-        } else {
+        if (Build.VERSION.SDK_INT < 29) {
             startForeground(NOTIF_ID, notification)
+            return
         }
+        // The service may run for BLE (connectedDevice + location) or for a
+        // USB-only connection where Bluetooth/location permissions aren't held.
+        // On Android 14+ each declared type must have its prerequisites met, so
+        // try the richest type set first and fall back until one is accepted.
+        val connected = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        val loc = ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+        val candidates = if (hasLocationPermission())
+            listOf(connected or loc, connected, loc)
+        else
+            listOf(connected)
+        for (type in candidates) {
+            try {
+                ServiceCompat.startForeground(this, NOTIF_ID, notification, type)
+                return
+            } catch (_: Exception) { /* try the next, less demanding type */ }
+        }
+        // Last resort: a plain foreground service with no special type.
+        try { startForeground(NOTIF_ID, notification) } catch (_: Exception) {}
     }
 
-    private fun buildNotification(): Notification {
-        if (Build.VERSION.SDK_INT >= 26) {
-            val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                getString(R.string.notif_channel_name),
-                NotificationManager.IMPORTANCE_LOW
-            )
-            mgr.createNotificationChannel(channel)
-        }
-        val openIntent = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE
-        )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.notif_title))
-            .setContentText(getString(R.string.notif_text))
-            .setSmallIcon(R.drawable.ic_stat_signal)
-            .setOngoing(true)
-            .setContentIntent(openIntent)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
-    }
+    private fun hasLocationPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED ||
+        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun buildNotification(): Notification =
+        buildNotification(this, statusText ?: getString(R.string.notif_text))
 
     companion object {
         private const val CHANNEL_ID = "capture"
         private const val NOTIF_ID = 1
+
+        // Latest connection-status line reported by the web app, mirrored into
+        // the notification. Volatile so the binder thread that calls
+        // updateStatus() and the service both see a consistent value.
+        @Volatile private var statusText: String? = null
+        @Volatile private var running = false
 
         fun start(context: Context) {
             val intent = Intent(context, MeshcoreService::class.java)
@@ -106,6 +109,41 @@ class MeshcoreService : Service() {
 
         fun stop(context: Context) {
             context.stopService(Intent(context, MeshcoreService::class.java))
+        }
+
+        /** Update the ongoing notification's text to the current connection state. */
+        fun updateStatus(context: Context, text: String) {
+            statusText = text
+            if (!running) return
+            try {
+                val mgr = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                mgr.notify(NOTIF_ID, buildNotification(context, text))
+            } catch (_: Exception) {}
+        }
+
+        private fun buildNotification(context: Context, text: String): Notification {
+            if (Build.VERSION.SDK_INT >= 26) {
+                val mgr = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    context.getString(R.string.notif_channel_name),
+                    NotificationManager.IMPORTANCE_LOW
+                )
+                mgr.createNotificationChannel(channel)
+            }
+            val openIntent = PendingIntent.getActivity(
+                context, 0,
+                Intent(context, MainActivity::class.java),
+                PendingIntent.FLAG_IMMUTABLE
+            )
+            return NotificationCompat.Builder(context, CHANNEL_ID)
+                .setContentTitle(context.getString(R.string.notif_title))
+                .setContentText(text)
+                .setSmallIcon(R.drawable.ic_stat_signal)
+                .setOngoing(true)
+                .setContentIntent(openIntent)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
         }
     }
 }
