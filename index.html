@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MeshCore Signal Tester</title>
     <link rel="icon" type="image/svg+xml" href="logo.svg">
-    <link rel="stylesheet" href="style.css?v=142">
+    <link rel="stylesheet" href="style.css?v=155">
     <script>try{
         if(localStorage.getItem("theme")==="light")document.documentElement.classList.add("light-theme");
         const _s=localStorage.getItem("uiScale");
@@ -13,7 +13,7 @@
         else if(_s==="large")document.documentElement.classList.add("ui-large");
         else if(_s==="larger")document.documentElement.classList.add("ui-larger");
     }catch(e){}</script>
-    <script src="native-bridge.js?v=6"></script>
+    <script src="native-bridge.js?v=7"></script>
     <script type="importmap">
     { "imports": { "three": "./vendor/three.module.js?v=1" } }
     </script>
@@ -39,14 +39,14 @@
         </div>
             <div class="header-row header-row-tools">
                 <button id="importCsvBtn" class="btn-pause" title="Import CSV file">Import CSV</button>
-                <input type="file" id="importCsvInput" accept=".csv,text/csv,text/plain,application/csv" style="display:none">
+                <input type="file" id="importCsvInput" accept=".csv,text/csv,text/plain,application/csv" style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0;opacity:0">
                 <button id="exportCsvBtn" class="btn-pause" title="Export visible packets as CSV" disabled>Export CSV</button>
                 <button id="clearDataBtn" class="btn-clear-data-header" title="Delete all captured data">Clear data</button>
-                <label class="ttl-header-label">Auto-remove<select id="ttlSelect" class="ttl-header-select"><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option><option value="300">5 min</option><option value="600">10 min</option><option value="900">15 min</option><option value="1800">30 min</option><option value="3600">1 h</option><option value="Infinity" selected>Never</option></select><span class="help-icon" data-help="ttl">?</span></label>
+                <label class="ttl-header-label">Auto-remove<select id="ttlSelect" class="ttl-header-select"><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option><option value="300">5 min</option><option value="900">15 min</option><option value="3600">1 h</option><option value="10800">3 h</option><option value="43200">12 h</option><option value="Infinity" selected>Never</option></select><span class="help-icon" data-help="ttl">?</span></label>
             </div>
             <div class="header-row header-row-tools">
                 <label class="sound-toggle">🔊 Sound<select id="soundSelect" class="ttl-header-select"><option value="off" selected>off</option><option value="short">short</option><option value="medium">medium</option><option value="long">long</option></select><span class="help-icon" data-help="sound">?</span></label>
-                <label class="ttl-header-label">Display<select id="hideSelect" class="ttl-header-select"><option value="all">All</option><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option><option value="300">5 min</option><option value="600">10 min</option><option value="900" selected>15 min</option><option value="1800">30 min</option><option value="3600">1 h</option></select><span class="help-icon" data-help="display">?</span></label>
+                <label class="ttl-header-label">Display<select id="hideSelect" class="ttl-header-select"><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option><option value="300">5 min</option><option value="900" selected>15 min</option><option value="3600">1 h</option><option value="10800">3 h</option><option value="43200">12 h</option><option value="all">All</option></select><span class="help-icon" data-help="display">?</span></label>
                 <label class="ttl-header-label">Text size<select id="uiScaleSelect" class="ttl-header-select"><option value="small" style="font-size:10px">Small</option><option value="normal" selected style="font-size:13px">Normal</option><option value="large" style="font-size:17px">Large</option><option value="larger" style="font-size:24px">Larger</option></select></label>
                 <label class="size-label">2D graphs dot size<input type="range" id="dotSizeInput" class="size-range" min="0.3" max="2.5" step="0.1" value="1"><span id="dotSizeVal" class="size-val">1</span></label>
                 <label class="sound-toggle"><input type="checkbox" id="keepScreenChk" checked> Keep screen on<span class="help-icon" data-help="keepscreen">?</span></label>
@@ -91,14 +91,14 @@
                 <p>Connect to a MeshCore companion device via Bluetooth or USB to start monitoring RX logs.</p>
             </div>
 
-            <div class="rep-filter-bar" id="repFilterBar">
+            <div class="rep-filter-bar">
                     <label class="rep-filter-label" for="repFilter">Filter repeaters</label>
                     <input type="text" id="repFilter" class="rep-filter-input" autocomplete="off" spellcheck="false">
                     <span class="help-icon" data-help="rep-filter">?</span>
                     <button id="repFilterClear" class="msg-filter-clear hidden" title="Show all repeaters">✕</button>
                     <span id="repFilterApplied" class="filter-applied-indicator hidden">Filter applied</span>
                 </div>
-            <div class="ping-bar" id="discoverBar">
+            <div class="ping-bar">
                 <button id="discoverBtn" class="btn-pause" title="Send DISCOVER_REQ — nearby nodes reply with their public key and the uplink SNR they measured (firmware ≥ v1.10)">Discover nodes</button>
                 <span class="ping-hint">Sends a discovery request — nearby nodes reply with their public key and the SNR they measured for your signal.<span class="help-icon" data-help="discover">?</span></span>
             </div>
@@ -125,8 +125,8 @@
                         </div>
                         <div id="repTableEmpty" class="rep-table-empty hidden">Waiting for data…</div>
                         <div class="rep-expand-bar" id="repExpandBar">
-                            <label class="rep-expand-label">
-                                <input type="checkbox" id="repExpandTable"> Show all rows
+                            <label class="rep-expand-label" title="Show the table at full height instead of scrolling inside it">
+                                <input type="checkbox" id="repExpandTable"> Expand table
                             </label>
                         </div>
                     </div>
@@ -175,7 +175,8 @@
                     <div class="map-inner">
                         <div class="map-controls">
                             <button id="enableLocationBtn" class="btn-primary">Enable location</button>
-                            <button id="centerOnMeBtn" class="btn-show-all-repeaters" title="Move the camera to my current location">📍 Center on me</button>
+                            <button id="centerOnMeBtn" class="btn-show-all-repeaters hidden" title="Move the camera to my current location">📍 Center on me</button>
+                            <span id="locationStatus" class="map-location-status">Location not enabled.</span>
                             <button id="showAllRepeatersBtn" class="btn-show-all-repeaters">Show all repeaters</button>
                             <span class="map-hint">Drag to pan · scroll/pinch to zoom · two-finger twist to tilt/rotate</span>
                             <div class="map-settings-wrap">
@@ -192,6 +193,26 @@
                                             <optgroup label="OpenStreetMap">
                                                 <option value="osm">OSM Standard</option>
                                                 <option value="opentopo">OpenTopoMap</option>
+                                                <option value="cyclosm">CyclOSM (cycling)</option>
+                                                <option value="osm-hot">OSM Humanitarian</option>
+                                                <option value="osm-de">OSM German style</option>
+                                                <option value="osm-fr">OSM French style</option>
+                                            </optgroup>
+                                            <optgroup label="CARTO">
+                                                <option value="cartodark">Dark Matter</option>
+                                                <option value="cartodark-nolabels">Dark Matter (no labels)</option>
+                                                <option value="cartolight">Positron (light)</option>
+                                                <option value="cartolight-nolabels">Positron (no labels)</option>
+                                                <option value="cartovoyager">Voyager</option>
+                                                <option value="cartovoyager-nolabels">Voyager (no labels)</option>
+                                            </optgroup>
+                                            <optgroup label="Esri">
+                                                <option value="esri-darkgray">Dark Gray Canvas</option>
+                                                <option value="esri-lightgray">Light Gray Canvas</option>
+                                                <option value="esri-imagery">Imagery (satellite)</option>
+                                            </optgroup>
+                                            <optgroup label="Other">
+                                                <option value="none">None (no map)</option>
                                             </optgroup>
                                         </select>
                                     </label>
@@ -200,17 +221,6 @@
                                     <label class="map-setting-toggle"><input type="checkbox" id="showLinesChk" checked> Guide lines</label>
                                     <label class="map-setting-toggle"><input type="checkbox" id="showMarkerChk" checked> My location</label>
                                     <label class="map-setting-toggle"><input type="checkbox" id="showDeviceChk"> Device location<span class="help-icon" data-help="device-location">?</span></label>
-                                    <label class="map-setting-toggle">Cluster radius
-                                        <select id="clusterRadiusSelect" class="ttl-header-select">
-                                            <option value="0" selected>Off</option>
-                                            <option value="5">5 m</option>
-                                            <option value="10">10 m</option>
-                                            <option value="20">20 m</option>
-                                            <option value="50">50 m</option>
-                                            <option value="100">100 m</option>
-                                        </select>
-                                    </label>
-                                    <span id="locationStatus" class="location-status-settings">Location not enabled.</span>
                                 </div>
                             </div>
                         </div>
@@ -249,7 +259,7 @@
                 </div>
             </div>
 
-            <div class="section-wrap" id="debugWrap">
+            <div class="section-wrap">
                 <div class="section-header">
                     <span class="section-title">Debug</span>
                     <button class="collapse-btn collapsed" data-target="debugBody" title="Toggle section">▾</button>
@@ -300,8 +310,8 @@
         </div>
     </div>
 
-    <!-- Corner notice: repeater filter active -->
-    <div id="filterNotice" class="corner-notice hidden">
+    <!-- Repeater filter active: a full-width bar pinned to the top of the screen -->
+    <div id="filterNotice" class="corner-notice notice-topbar hidden">
         <div class="corner-notice-line1">
             Filtered to <span class="corner-notice-dot" id="filterNoticeDot"></span><span class="corner-notice-id" id="filterNoticeRep"></span><span id="filterNoticeName" class="corner-notice-name-inline" style="display:none"></span>
             <span class="help-icon" data-help="rep-filter">?</span>
@@ -330,7 +340,7 @@
 
             <div class="help-section-title">Getting started</div>
             <p>Click <b>Connect Bluetooth</b> (or <b>Connect USB</b> for a wired serial connection, or <b>Connect WiFi</b> in the Android app) and select your MeshCore device. Packet data appears automatically as the device picks up LoRa traffic. Previously used devices (Bluetooth, USB and WiFi) appear as quick-connect buttons. Click any <b>section title</b> to collapse or expand that section. Use <b>⏹ Stop / ▶ Resume</b> to suspend data collection without disconnecting — collection pauses automatically on disconnect and resumes on reconnect.</p>
-            <p>Use <b>Import CSV</b> / <b>Export CSV</b> to save the captured packets to a file and reload them later, and <b>Clear data</b> to wipe the current session. If an established connection drops unexpectedly — cable unplugged, device reset, or out of range — a full-screen <b>alarm</b> warns you that data collection has stopped (a deliberate disconnect won't trigger it).</p>
+            <p>Use <b>Import CSV</b> / <b>Export CSV</b> to save the captured packets to a file and reload them later, and <b>Clear data</b> to wipe the current session. Captured data is also saved automatically as you go, so if you reload the page or the app restarts it offers to resume the previous session. If an established connection drops unexpectedly — cable unplugged, device reset, or out of range — a full-screen <b>alarm</b> warns you that data collection has stopped (a deliberate disconnect won't trigger it).</p>
 
             <div class="help-section-title">What you can connect to</div>
             <p>The app auto-detects the device — you don't pick a type. A <b>companion radio</b> (Bluetooth, USB, or WiFi in the Android app) pushes every received packet fully decoded, which is the richest source. A <b>repeater</b> (USB only) instead exposes a text CLI the app drives; how much it can report depends on its firmware (see below).</p>
@@ -399,6 +409,6 @@
         </div>
     </div>
 
-    <script type="module" src="app.js?v=237"></script>
+    <script type="module" src="app.js?v=292"></script>
 </body>
 </html>

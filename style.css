@@ -21,6 +21,7 @@
     --bg-row-sel:     #162840;
     --bg-row-flash:   rgba(50, 130, 210, 0.45);
     --bg-cell-flash:  rgba(150, 220, 70, 0.35);
+    --jh-key:  #c4b5fd; --jh-str:  #6ee7b7; --jh-num:  #93c5fd; --jh-bool: #fbbf24; --jh-null: #8aa0b4;
     --text-primary:   #E2F0FF;
     --text-secondary: #9EC8E8;
     --text-muted:     #5E90AC;
@@ -47,6 +48,7 @@ html.light-theme {
     --bg-row-sel:     #F0FDE0;
     --bg-row-flash:   rgba(186, 212, 238, 0.75);
     --bg-cell-flash:  rgba(140, 220, 80, 0.35);
+    --jh-key:  #7c3aed; --jh-str:  #059669; --jh-num:  #2563eb; --jh-bool: #d97706; --jh-null: #6b7280;
     --text-primary:   #0B1D2E;
     --text-secondary: #264A6A;
     --text-muted:     #506E85;
@@ -56,6 +58,11 @@ html.light-theme {
     --btn-primary-bg: #1565C0;
     --btn-primary-border: #0D47A1;
 }
+
+/* Global utility: anything with .hidden is removed from layout. !important so
+   it wins over component display rules of any specificity (and matches how the
+   per-component .foo.hidden rules used to beat e.g. .map-controls .btn-primary). */
+.hidden { display: none !important; }
 
 body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
@@ -97,11 +104,11 @@ html.ui-larger body {
     text-align: center;
     padding: 14px 16px 20px;
     font-size: 12px;
-    color: rgba(255, 255, 255, 0.55);
+    color: var(--text-muted);
 }
 
 .app-footer a {
-    color: rgba(255, 255, 255, 0.8);
+    color: var(--text-secondary);
     text-decoration: none;
 }
 
@@ -111,7 +118,7 @@ html.ui-larger body {
 
 .footer-sep {
     margin: 0 8px;
-    color: rgba(255, 255, 255, 0.3);
+    color: var(--border);
 }
 
 header {
@@ -367,10 +374,6 @@ html:not(.light-theme) .btn-connect:disabled {
     color: #cfe0f0;
 }
 
-.btn-primary.hidden {
-    display: none;
-}
-
 .btn-pause {
     -webkit-appearance: none;
     appearance: none;
@@ -548,10 +551,6 @@ html:not(.light-theme) .btn-connect:disabled {
     margin-bottom: 8px;
 }
 
-.section-wrap.hidden {
-    display: none;
-}
-
 .section-body {
     display: grid;
     grid-template-rows: 1fr;
@@ -621,8 +620,6 @@ html:not(.light-theme) .btn-connect:disabled {
     color: var(--text-muted);
     font-style: italic;
 }
-.rep-table-empty.hidden { display: none; }
-
 .rep-expand-bar {
     padding: 5px 10px 6px;
 }
@@ -743,11 +740,52 @@ html:not(.light-theme) .btn-connect:disabled {
 }
 
 .chart-svg-wrap {
+    position: relative;
     overflow: hidden;
     height: 180px;
     min-height: 80px;
     max-height: calc(100vh - 80px);
 }
+/* Let one finger scroll the page over a chart; two-finger pinch is handled in JS
+   to zoom the X axis (and the wheel zooms on desktop). */
+.chart-svg-wrap svg { touch-action: pan-y; }
+/* The SVG content is rebuilt on every render. Make the drawn elements ignore
+   pointer/touch events so gestures always target the persistent <svg> itself —
+   otherwise a touch that starts on a dot gets cancelled when that node is
+   replaced mid-gesture (pinch then fails on a densely filled chart). Hit-testing
+   for tooltips/selection is done in JS from coordinates, not the event target. */
+.chart-svg-wrap svg * { pointer-events: none; }
+
+/* Drag-to-zoom selection band */
+.chart-zoom-sel {
+    position: absolute;
+    top: 6px;
+    bottom: 24px;
+    display: none;
+    background: rgba(90, 150, 255, 0.18);
+    border-left: 1px solid rgba(90, 150, 255, 0.7);
+    border-right: 1px solid rgba(90, 150, 255, 0.7);
+    pointer-events: none;
+    z-index: 3;
+}
+
+/* "Reset zoom" button, shown only while a chart zoom is active */
+.chart-zoom-reset {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    z-index: 4;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border: 1px solid var(--btn-primary-border, var(--border));
+    border-radius: 6px;
+    background: var(--btn-primary-bg);
+    color: #fff;
+    cursor: pointer;
+    box-shadow: 0 1px 3px var(--shadow);
+}
+.chart-zoom-reset:hover { filter: brightness(1.15); }
 
 .chart-resize-handle {
     height: 14px;
@@ -799,13 +837,38 @@ html:not(.light-theme) .btn-connect:disabled {
     color: var(--text-muted);
     font-style: italic;
 }
-.msg-table-empty.hidden { display: none; }
-
 .msg-table-scroll {
     background: var(--bg-box);
     border-radius: 8px;
     box-shadow: 0 2px 4px var(--shadow);
     overflow-x: auto;
+}
+
+/* Prev/next pager beneath the packet table when browsing disk history. */
+.msg-table-pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 8px;
+    font-size: 12px;
+}
+.msg-table-pager .pager-btn {
+    background: var(--bg-box);
+    color: var(--text-primary);
+    border: 1px solid var(--border, #ccc);
+    border-radius: 6px;
+    padding: 4px 12px;
+    cursor: pointer;
+}
+.msg-table-pager .pager-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+.msg-table-pager .pager-info {
+    opacity: 0.8;
+    min-width: 90px;
+    text-align: center;
 }
 
 .msg-table {
@@ -846,7 +909,7 @@ html:not(.light-theme) .btn-connect:disabled {
 .msg-sub-rssi,
 .msg-sub-snr {
     font-size: 8px;
-    color: #bbb;
+    color: var(--text-muted);
     font-weight: 600;
     text-align: right;
     padding: 1px 4px 2px;
@@ -858,6 +921,9 @@ html:not(.light-theme) .btn-connect:disabled {
     font-size: 10px;
     text-align: right;
     padding: 1px 4px;
+    /* clickable — RSSI+SNR highlight together as a pair */
+    cursor: pointer;
+    user-select: none;
 }
 
 .empty-state {
@@ -870,19 +936,11 @@ html:not(.light-theme) .btn-connect:disabled {
     box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08);
 }
 
-.empty-state.hidden {
-    display: none;
-}
-
 .saved-devices {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
     gap: 6px;
-}
-
-.saved-devices.hidden {
-    display: none;
 }
 
 .saved-label {
@@ -931,13 +989,6 @@ html:not(.light-theme) .btn-connect:disabled {
     color: white;
 }
 
-/* Clickable signal cells — RSSI+SNR highlight together as a pair */
-.sig-rssi,
-.sig-snr {
-    cursor: pointer;
-    user-select: none;
-}
-
 .sig-rssi.sig-pair-hover,
 .sig-snr.sig-pair-hover {
     background: var(--bg-sig-hover);
@@ -978,18 +1029,18 @@ html:not(.light-theme) .btn-connect:disabled {
 }
 
 .msg-col-rx:hover {
-    background: #f0f0ff;
+    background: var(--bg-sig-hover);
 }
 
 .rx-time {
-    color: #aaa;
+    color: var(--text-muted);
     font-size: 9px;
 }
 
 .rx-type {
     font-size: 10px;
     font-weight: 600;
-    color: #555;
+    color: var(--text-secondary);
     margin-left: 4px;
     display: inline-block;
     max-width: 160px;
@@ -1011,30 +1062,30 @@ html:not(.light-theme) .btn-connect:disabled {
 
 .detail-content {
     font-size: 11px;
-    color: #444;
+    color: var(--text-secondary);
     line-height: 1.7;
 }
 
 .detail-content b {
-    color: #888;
+    color: var(--text-muted);
     font-weight: 600;
 }
 
 .detail-type {
     font-size: 13px;
     font-weight: 700;
-    color: #333;
+    color: var(--text-primary);
     margin-bottom: 6px;
 }
 .detail-pubkey {
     font-size: 11px;
-    color: #666;
+    color: var(--text-secondary);
     margin-bottom: 6px;
     word-break: break-all;
 }
 .detail-pubkey code {
     font-size: 11px;
-    color: #999;
+    color: var(--text-muted);
 }
 
 .detail-json {
@@ -1052,35 +1103,36 @@ html:not(.light-theme) .btn-connect:disabled {
 
 .detail-sig {
     font-size: 12px;
-    color: #444;
+    color: var(--text-secondary);
     margin-bottom: 6px;
     padding-bottom: 5px;
-    border-bottom: 1px solid #e8e8f0;
+    border-bottom: 1px solid var(--border);
     cursor: pointer;
 }
 
 .detail-col-name {
-    color: #555;
+    color: var(--text-secondary);
     margin-left: 4px;
     margin-right: 4px;
 }
 
 .detail-time {
-    color: #888;
+    color: var(--text-muted);
     font-size: 11px;
 }
 
 /* JSON syntax highlighting inside .detail-json */
-.detail-json .jh-key  { color: #7c3aed; font-weight: 600; }
-.detail-json .jh-str  { color: #059669; }
-.detail-json .jh-num  { color: #2563eb; }
-.detail-json .jh-bool { color: #d97706; }
-.detail-json .jh-null { color: #9ca3af; }
+.detail-json .jh-key  { color: var(--jh-key); font-weight: 600; }
+.detail-json .jh-str  { color: var(--jh-str); }
+.detail-json .jh-num  { color: var(--jh-num); }
+.detail-json .jh-bool { color: var(--jh-bool); }
+.detail-json .jh-null { color: var(--jh-null); }
 
 .raw-hex {
     font-family: 'Courier New', monospace;
     font-size: 9px;
-    background: #eee;
+    background: var(--bg-input);
+    color: var(--text-secondary);
     padding: 1px 4px;
     border-radius: 3px;
     cursor: pointer;
@@ -1236,10 +1288,6 @@ html.light-theme .ct-colname {
     white-space: nowrap;
 }
 
-.battery-status.hidden {
-    display: none;
-}
-
 .battery-status.battery-low {
     color: #c33;
 }
@@ -1378,10 +1426,6 @@ header .help-icon.active {
     box-sizing: border-box;
 }
 
-.help-modal-overlay.hidden {
-    display: none;
-}
-
 /* ---- WiFi connect modal ---- */
 .wifi-modal-overlay {
     position: fixed;
@@ -1394,7 +1438,6 @@ header .help-icon.active {
     padding: 16px;
     box-sizing: border-box;
 }
-.wifi-modal-overlay.hidden { display: none; }
 .wifi-modal {
     background: #fff;
     color: #333;
@@ -1426,7 +1469,6 @@ header .help-icon.active {
 .wifi-modal-error {
     color: #c0392b; font-size: 12px; margin: -4px 0 12px; line-height: 1.4;
 }
-.wifi-modal-error.hidden { display: none; }
 .wifi-modal-actions {
     display: flex; justify-content: flex-end; gap: 10px; margin-top: 6px;
 }
@@ -1562,10 +1604,6 @@ html.light-theme .help-modal a { color: #1565C0; }
     padding: 4px 0 5px;
 }
 
-.msg-filter-bar.hidden {
-    display: none;
-}
-
 .msg-filter-input {
     flex: 1;
     min-width: 0;
@@ -1598,10 +1636,6 @@ html.light-theme .help-modal a { color: #1565C0; }
     color: white;
 }
 
-.msg-filter-clear.hidden {
-    display: none;
-}
-
 html.light-theme .msg-filter-clear {
     background: rgba(0, 0, 0, 0.08);
     border: 1px solid rgba(0, 0, 0, 0.25);
@@ -1619,10 +1653,6 @@ html.light-theme .msg-filter-clear:hover {
     color: var(--text-secondary);
     white-space: nowrap;
     flex-shrink: 0;
-}
-
-.msg-filter-count.hidden {
-    display: none;
 }
 
 .rep-filter-bar {
@@ -1657,10 +1687,6 @@ html.light-theme .msg-filter-clear:hover {
     animation: filterAppliedPulse 1.6s ease-in-out infinite;
 }
 
-.filter-applied-indicator.hidden {
-    display: none;
-}
-
 @keyframes filterAppliedPulse {
     0%, 100% { box-shadow: 0 0 0 1px rgba(255, 80, 80, 0.4), 0 2px 6px rgba(255, 60, 60, 0.35); }
     50%      { box-shadow: 0 0 0 2px rgba(255, 80, 80, 0.6), 0 2px 10px rgba(255, 60, 60, 0.6); }
@@ -1685,22 +1711,9 @@ html.light-theme .msg-filter-clear:hover {
     gap: 10px;
     padding: 8px 4px;
     font-size: 12px;
-    color: rgba(255,255,255,0.8);
-}
-
-.map-controls .btn-primary.hidden {
-    display: none;
-}
-
-.location-status {
-    font-weight: 400;
-    opacity: 0.65;
-}
-
-.location-status-settings {
-    font-size: 11px;
-    color: #aaa;
-    font-style: italic;
+    /* The bar sits on the page background, not on the map — follow the theme
+       (was hardcoded white, invisible in light mode for the status/hint text). */
+    color: var(--text-secondary);
 }
 
 .btn-show-all-repeaters {
@@ -1713,17 +1726,22 @@ html.light-theme .msg-filter-clear:hover {
     cursor: pointer;
     white-space: nowrap;
 }
-.btn-show-all-repeaters:hover {
-    background: rgba(255,255,255,0.28);
-    border-color: rgba(255,255,255,0.7);
+/* Hover only on devices that really hover — on touch screens :hover sticks
+   after a tap, leaving the button looking pressed (and easily mistaken for
+   the blue .active follow state). */
+@media (hover: hover) {
+    .btn-show-all-repeaters:hover {
+        background: rgba(255,255,255,0.28);
+        border-color: rgba(255,255,255,0.7);
+    }
+    html.light-theme .btn-show-all-repeaters:hover {
+        background: rgba(0,0,0,0.22);
+    }
 }
 html.light-theme .btn-show-all-repeaters {
     border-color: rgba(0,0,0,0.35);
     background: rgba(0,0,0,0.12);
     color: #0f1a2e;
-}
-html.light-theme .btn-show-all-repeaters:hover {
-    background: rgba(0,0,0,0.22);
 }
 /* Pressed / active state (e.g. "Center on me" while follow mode is on).
    Scoped under html.light-theme as well so it beats the light-theme base
@@ -1743,26 +1761,38 @@ html.light-theme .btn-show-all-repeaters.active:hover {
     opacity: 0.65;
 }
 
+/* Shown in the controls row in place of "Center on me" while location is
+   unavailable (not enabled, requesting, error, …). */
+.map-location-status {
+    font-size: 12px;
+    font-style: italic;
+    opacity: 0.8;
+}
 .map-source-label {
     display: inline-flex;
     align-items: center;
     gap: 5px;
     font-size: 12px;
-    color: #c0c0c0;
+    color: var(--text-primary);
 }
 
 .map-source-select {
-    border: 1px solid #ddd;
-    background: #fff;
+    border: 1px solid var(--border);
+    background: var(--bg-input);
     border-radius: 4px;
     padding: 2px 6px;
     font-size: 12px;
-    color: #444;
+    color: var(--text-primary);
     cursor: pointer;
+    /* The longest option must not dictate the width — fill the row and let the
+       closed select truncate; the dropdown list itself still opens full-width. */
+    flex: 1;
+    min-width: 0;
+    max-width: 100%;
 }
 
 .map-source-select:hover {
-    border-color: #bbb;
+    border-color: var(--text-muted);
 }
 
 .map-container {
@@ -1819,8 +1849,12 @@ html.light-theme .btn-show-all-repeaters.active:hover {
     position: absolute;
     top: 8px;
     left: 8px;
-    background: rgba(255, 255, 255, 0.85);
-    border: none;
+    /* Theme-aware: this base is the dark theme (default). The button floats over
+       the map, so it carries its own background and a contrasting glyph + shadow
+       — visible over any tiles. Light theme overrides to the white variant below. */
+    background: rgba(16, 32, 48, 0.82);
+    color: #E2F0FF;
+    border: 1px solid rgba(255, 255, 255, 0.18);
     border-radius: 6px;
     width: 30px;
     height: 30px;
@@ -1829,7 +1863,7 @@ html.light-theme .btn-show-all-repeaters.active:hover {
     display: flex;
     align-items: center;
     justify-content: center;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
     z-index: 10;
     backdrop-filter: blur(4px);
     transition: background 0.15s;
@@ -1837,6 +1871,17 @@ html.light-theme .btn-show-all-repeaters.active:hover {
 }
 
 .map-fullscreen-btn:hover {
+    background: rgba(16, 32, 48, 0.95);
+}
+
+html.light-theme .map-fullscreen-btn {
+    background: rgba(255, 255, 255, 0.85);
+    color: #1f2d3d;
+    border-color: rgba(0, 0, 0, 0.12);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+}
+
+html.light-theme .map-fullscreen-btn:hover {
     background: rgba(255, 255, 255, 0.97);
 }
 
@@ -1870,10 +1915,6 @@ html.light-theme .btn-show-all-repeaters.active:hover {
     font-size: 13px;
     text-align: center;
     padding: 20px;
-}
-
-.map-empty.hidden {
-    display: none;
 }
 
 /* WebGL unavailable: collapse the map area to just an inline notice */
@@ -1920,10 +1961,6 @@ html.light-theme .map-offline .map-empty {
     pointer-events: auto;
 }
 
-.map-info.hidden {
-    display: none;
-}
-
 .smi-close {
     position: absolute;
     top: 5px;
@@ -1931,6 +1968,8 @@ html.light-theme .map-offline .map-empty {
     background: none;
     border: none;
     font-size: 11px;
+    /* .map-info is a white card over the map in both themes, so this stays
+       fixed-dark (theme text vars would be light → invisible in dark mode). */
     color: #999;
     cursor: pointer;
     padding: 2px 3px;
@@ -2131,10 +2170,10 @@ html.light-theme .map-settings-btn:hover { background: rgba(0,0,0,0.22); border-
     right: 0;
     top: calc(100% + 4px);
     z-index: 50;
-    background: #fff;
-    border: 1px solid #ddd;
+    background: var(--bg-box);
+    border: 1px solid var(--border);
     border-radius: 8px;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.13);
+    box-shadow: 0 4px 16px var(--shadow);
     padding: 12px 14px;
     display: flex;
     flex-direction: column;
@@ -2143,23 +2182,18 @@ html.light-theme .map-settings-btn:hover { background: rgba(0,0,0,0.22); border-
     max-width: min(320px, calc(100vw - 24px));
     white-space: normal;
     word-break: break-word;
-    color: #444;
+    color: var(--text-primary);
 }
-.map-settings-panel.hidden { display: none; }
-
 .map-setting-toggle {
     display: flex;
     align-items: center;
     gap: 7px;
     font-size: 12px;
     cursor: pointer;
-    color: #444;
+    color: var(--text-primary);
     white-space: normal;
 }
 .map-setting-toggle input[type="checkbox"] { cursor: pointer; }
-
-.map-settings-panel .size-label,
-.map-settings-panel .size-val { color: #444; }
 
 /* ---- Repeater table selection ---- */
 .rl-id-clickable { cursor: pointer; }
@@ -2178,6 +2212,9 @@ td.col-dim { opacity: 0.25; }
 /* ---- Corner notices (filter / selection) ---- */
 .corner-notice {
     position: fixed;
+    /* Re-parented to <html> (to escape the body text-size transform), so it no
+       longer inherits the body font — set it explicitly. */
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
     top: 16px;
     right: 16px;
     z-index: 200;
@@ -2194,7 +2231,48 @@ td.col-dim { opacity: 0.25; }
     font-size: 12px;
     color: var(--text-primary);
 }
-.corner-notice.hidden { display: none; }
+/* Modifier: the repeater-FILTER notice is a full-width bar pinned to the very
+   top of the screen (the selection notice stays a floating corner box). */
+.corner-notice.notice-topbar {
+    top: 0;
+    left: 0;
+    right: 0;
+    min-width: 0;
+    max-width: none;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 6px 12px;
+    border-radius: 0;
+    /* Prominent amber bar so it's obvious the view is filtered (not everything
+       is shown). Stands out from the app's blue chrome in both themes. */
+    background: linear-gradient(90deg, #d97706, #b45309);
+    color: #fff;
+    border: 0;
+    border-bottom: 2px solid #f59e0b;
+    padding: 9px 14px;
+    box-shadow: 0 3px 14px rgba(0, 0, 0, 0.35);
+}
+.notice-topbar .corner-notice-line1 { color: #fff; font-weight: 700; }
+.notice-topbar .corner-notice-id { color: #fff; }
+.notice-topbar .cn-showmore-label,
+.notice-topbar .cn-stats { color: rgba(255, 255, 255, 0.92); }
+.notice-topbar .cn-stats b { color: #fff; }
+.notice-topbar .help-icon { background: rgba(255,255,255,0.25); color: #fff; }
+/* Clear-filter button: light, high-contrast against the amber bar */
+.notice-topbar .corner-notice-btn {
+    flex: 0 0 auto;
+    background: #fff;
+    color: #7c2d12;
+    border-color: transparent;
+    font-weight: 700;
+}
+.notice-topbar .corner-notice-extra { flex-direction: row; align-items: center; flex-wrap: wrap; gap: 10px; }
+/* "Show more" stats flow horizontally in the bar instead of stacking */
+.notice-topbar .cn-stats { flex-direction: row; flex-wrap: wrap; gap: 2px 14px; }
+/* Keep the selection corner box clear of the bar when both are visible */
+.notice-topbar:not(.hidden) ~ #selNotice { top: 60px; }
 
 .corner-notice-line1 {
     display: flex;
@@ -2298,16 +2376,12 @@ td.col-dim { opacity: 0.25; }
     text-align: left;
 }
 .cn-map-btn:hover { background: rgba(40,70,120,0.4); border-color: rgba(80,140,200,0.6); }
-.cn-map-btn-active { background: rgba(40,100,40,0.3); border-color: rgba(80,180,80,0.45); color: #8dd88d; }
-.cn-map-btn-active:hover { background: rgba(40,100,40,0.45); }
 html.light-theme .cn-map-btn {
     border: 1px solid #b8d8e8;
     background: #e8f4fb;
     color: #2a6080;
 }
 html.light-theme .cn-map-btn:hover { background: #d0eaf8; border-color: #80b8d8; }
-html.light-theme .cn-map-btn-active { background: #c8e8c8; border-color: #80b880; color: #206020; }
-html.light-theme .cn-map-btn-active:hover { background: #b8ddb8; }
 
 html.light-theme .smi-colname,
 html.light-theme .corner-notice-name,
@@ -2408,7 +2482,6 @@ html.light-theme .theme-toggle-btn:hover {
 }
 
 /* Repeater stock-firmware caveat banner */
-.repeater-notice.hidden { display: none; }
 .repeater-notice {
     position: relative;
     margin: 0 0 14px;
@@ -2459,7 +2532,6 @@ html.light-theme .theme-toggle-btn:hover {
     padding: 20px;
     background: rgba(180, 30, 30, 0.22);
 }
-.disconnect-alarm.hidden { display: none; }
 .disconnect-alarm-box {
     background: var(--bg-box);
     border: 2px solid #c0392b;

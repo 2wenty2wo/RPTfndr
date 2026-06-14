@@ -1,12 +1,13 @@
 // MeshCore Signal Tester Application
 import { MeshCoreDecoder, Utils } from './vendor/meshcore-decoder.js?v=1';
-import { Signal3DMap } from './signal3d.js?v=103';
+import { Signal3DMap } from './signal3d.js?v=114';
+import { PacketStore } from './packet-store.js?v=13';
 
 // Single source of truth for the released app version, shown in the header (and
 // forwarded to the Android wrapper). Bump this on a release alongside the
 // CHANGELOG and the Android versionName. Distinct from the per-asset ?v= cache
 // busters, which change on every edit.
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 
 // Contact-sync resilience. The companion streams its whole contact list as a
 // burst of frames after one CMD_GET_CONTACTS; over BLE that burst can overflow
@@ -82,8 +83,6 @@ class MeshCoreApp {
         this._neighborPollTimer = null;
         this._logPollTimer = null;
         this._pendingRaw = [];             // decoded RAW dumps awaiting their summary line (logging build)
-        this._deviceLocation = null;       // connected device's own position { lat, lon }, or null
-        this._deviceLocPolicy = null;      // companion adv_loc_policy: 0 none, 1 share (live GPS), 2 prefs
         this._showDeviceMarker = false;    // is the 3D-map device marker enabled
         this._deviceRefreshTimer = null;   // periodic SELF_INFO re-request while the device marker is shown
         this._pendingPosFields = [];       // repeater get lat/lon replies awaited, in order
@@ -130,9 +129,61 @@ class MeshCoreApp {
         this._keepScreenOn = Store.bool('keepScreenOn', true);
         this._unsavedRxCount = 0; // packets received since last CSV export
         this._chartFrozenAt = Date.now();
+        this._chartZoom = null;          // {tMin,tMax} X-axis zoom window (null = auto/live)
+        this._lastChartWindow = null;    // [tMin,tMax] the charts were last drawn with
+        this._chartFullWindow = null;    // [tMin,tMax] un-zoomed extent (for clamping)
+
+        // --- Durable storage (IndexedDB) ---------------------------------
+        // The full session history lives on disk; RAM holds only a bounded
+        // recent window for rendering. This keeps "Auto-remove: Never" from
+        // growing the heap until the WebView renderer is OOM-killed, and lets
+        // captured data survive a renderer crash / app restart (it is replayed
+        // back from disk on startup).
+        this.store = new PacketStore();
+        this._storeReady = false;
+        this.RENDER_BUDGET_MS = 60 * 60 * 1000;  // raw points kept in RAM (≥ this much recent history)
+        this.MAX_RAW_VIEW    = 40000;            // above this a window renders downsampled
+        this.DOWNSAMPLE_BUCKETS = 1500;          // time-bucket count for wide-window charts
+        this._obsWriteBuf  = [];                 // pending obs records to flush to disk
+        this._sentWriteBuf = [];                 // pending outgoing-SNR records
+        this._hashWriteBuf = [];                 // pending per-hash payload records
+        this.WRITE_FLUSH_MS = 4000;              // debounce for batching disk writes
+        this._writeFlushTimer = null;
+        this._wideChartPoints = [];              // chart render array, derived from the bucket cache
+        this._wideSentPoints  = [];              // outgoing-SNR layer (disk) — live tail via _sentChartAt
+        this._chartBase       = null;            // incremental time-bucket cache {cells: Map, width, lo}
+        this._chartZoomLayer  = null;            // finer buckets over the zoom window {cells, width, lo, from, to}
+        this._sentChartAt     = 0;               // time the sent layer reflects
+        this._chartArrTimer   = null;            // coalesces bucket upserts into one array rebuild
+        this._renderCacheAt   = 0;               // time the table's disk page reflects; newer rows are the tail
+        this._lastMapView     = null;            // {bbox, mpp} of the current map zoom, for live refresh
+        this.MAP_TARGET_DOTS  = 2500;            // dot budget for the map grid layers
+        this._wideMapBase     = null;            // RAM cell cache: full-extent map layer {cells: Map, cell, at}
+        this._wideMapDetail   = null;            // finer cell layer for the zoomed-in bbox {cells, cell, bbox}
+        this._wideMapKey      = null;            // identity of the last applied map view (skip same-view re-query)
+        this._wideMapSentVer  = -1;              // dataVer the outgoing-SNR map layer was loaded for
+        this._pendingMapUpserts = null;          // packets ingested before the base layer exists
+        this._mapPushTimer    = null;            // coalesces cell upserts into one geometry push
+        this._dataVer         = 0;               // bumped whenever new records land on disk
+        this._tableHashCount   = 0;              // distinct hashes on disk (RAM-maintained for the pager)
+        this._mapRebuildBusy   = false;          // guards the map's dot-budget escape-valve rebuild
+        this._tablePageData   = new Map();       // disk-paged packet table snapshot (empty ⇒ tail alone)
+        this._tablePage       = 0;
+        this._tablePageSize   = 100;
+        this._tablePageCount  = 1;
+        // Narrowed pager: when the table is narrowed to one repeater — by a
+        // repeater filter, or just a selection (which hides non-matching rows) —
+        // it pages over only the hashes that repeater appears in, otherwise pages
+        // full of hidden rows would render empty. Built by one obs scan in
+        // _buildTableNarrowIndex, kept live at ingest, rebuilt on narrow change.
+        this._tableNarrowHashes = null;          // newest-first matching hashes (null = not narrowed / stale)
+        this._tableNarrowSet    = null;          // same content as a Set, for O(1) ingest checks
+        this._tableNarrowKeyApplied = '';        // narrow key the current page was loaded for
+        this._tableNarrowIndexKey   = '';        // narrow key the index hashes were built for
 
         this.initUI();
         this.startCleanupTimer();
+        this._initStore();
         this._renderSavedDevices();
         this._renderRepTable();
         this._renderMsgTable();
@@ -315,6 +366,7 @@ class MeshCoreApp {
             svg.addEventListener('mousemove', e => this.showChartTooltip(e, type));
             svg.addEventListener('mouseleave', () => this.hideChartTooltip());
             svg.addEventListener('click', e => this._onChartClick(e, type));
+            this._bindChartZoom(svg, type);
         };
         bindChartTooltip(this.rssiChartSvg, 'rssi');
         bindChartTooltip(this.snrChartSvg,  'snr');
@@ -348,16 +400,15 @@ class MeshCoreApp {
                 this.toggleDetailRow(sigCell.dataset.hash, sigCell.dataset.col);
                 return;
             }
-            // Time/type cell: toggle detail for first repeater that has data for this row
+            // Time/type cell: toggle detail for the left-most repeater that has
+            // data in this row. Read it straight from the rendered cells (the
+            // first cell carrying a data-col) so it matches what's on screen even
+            // for disk-sourced columns not in the live column model.
             const rxCell = e.target.closest('.msg-col-rx');
             if (rxCell) {
                 const row = rxCell.closest('tr[id^="row-"]');
-                if (!row) return;
-                const hash = row.id.slice(4);
-                const data = this.hashData.get(hash);
-                if (!data) return;
-                const firstCol = this.repeaterColumns.find(col => data.repeaters.has(col));
-                if (firstCol) this.toggleDetailRow(hash, firstCol);
+                const firstSig = row?.querySelector('.sig-snr[data-col], .sig-rssi[data-col]');
+                if (firstSig?.dataset.hash) this.toggleDetailRow(firstSig.dataset.hash, firstSig.dataset.col);
             }
         });
 
@@ -387,7 +438,12 @@ class MeshCoreApp {
         const ttlSelect  = document.getElementById('ttlSelect');
         const hideSelect = document.getElementById('hideSelect');
         if (ttlSelect) {
-            ttlSelect.value = Store.get('ttl', ttlSelect.value);
+            const dflt = ttlSelect.value;   // HTML default (Never)
+            ttlSelect.value = Store.get('ttl', dflt);
+            // A stored value whose option was removed (e.g. the old 10/30 min)
+            // leaves selectedIndex -1 and value "" → +""*1000 = 0 = instant
+            // expiry. Fall back to the default in that case.
+            if (ttlSelect.selectedIndex < 0) { ttlSelect.value = dflt; Store.set('ttl', dflt); }
             const v = ttlSelect.value;
             this.HASH_LIFETIME = v === 'Infinity' ? Infinity : +v * 1000;
             ttlSelect.addEventListener('change', () => {
@@ -466,6 +522,7 @@ class MeshCoreApp {
                 applyTheme(isLight);
                 Store.set('theme', isLight ? 'light' : 'dark');
                 this._renderCharts();
+                this.signalMap?.applyTheme();
             });
         }
 
@@ -623,6 +680,14 @@ class MeshCoreApp {
         }
 
         // Corner notice buttons
+        // These are position:fixed. The Text-size feature puts a transform on
+        // <body>, which makes <body> the containing block for fixed descendants —
+        // they'd then scroll away with the page instead of staying put. Re-parent
+        // them to <html> (never transformed) so they stay truly viewport-fixed.
+        for (const id of ['filterNotice', 'selNotice']) {
+            const el = document.getElementById(id);
+            if (el) document.documentElement.appendChild(el);
+        }
         document.getElementById('filterNoticeClear')?.addEventListener('click', () => {
             this._repFilterTerms = [];
             const inp = document.getElementById('repFilter');
@@ -686,7 +751,7 @@ class MeshCoreApp {
             const hash    = this._hashPayload(fakeHex);
             const rssi    = -60 - Math.floor(Math.random() * 50);
             const snr     = Math.round((Math.random() * 25 - 10) * 10) / 10;
-            this._ingestPacket(hash, repeater, 'Flood Debug', fakeHex, snr, rssi, { debug: true }, null, { forceIngest: true });
+            this._ingestPacket(hash, repeater, 'Flood Debug', fakeHex, snr, rssi, { debug: true }, null, { forceIngest: true, ...this._myLocation() });
             if (fbk) {
                 const col = this.findOrCreateColumn(repeater);
                 fbk.textContent = `→ column ${this.displayId(col)}`;
@@ -740,8 +805,9 @@ class MeshCoreApp {
         try {
             this.signalMap = new Signal3DMap({
                 canvas,
-                statusEl:      document.getElementById('locationStatus'),
                 btnEl:         document.getElementById('enableLocationBtn'),
+                statusEl:      document.getElementById('locationStatus'),
+                centerBtnEl:   document.getElementById('centerOnMeBtn'),
                 emptyEl:       document.getElementById('mapEmpty'),
                 infoEl:        document.getElementById('mapInfo'),
                 colorFor:      col => this.getRepeaterColor(col),
@@ -754,13 +820,37 @@ class MeshCoreApp {
                 },
                 nameForCol:    col => this._contactNameForCol(col),
                 isLiveCapture: () => this._collecting,   // tiles follow the user only while live
+                isDarkMode:    () => !document.documentElement.classList.contains('light-theme'),
                 initialSource:  sourceSel?.value,
                 initialSphereSize: this._sphereSize,
-                initialClusterRadius: Store.num('clusterRadius', 0),
                 initialPerspSize: Store.bool('perspSize', true),
                 showDevice:    Store.bool('showDevice', false),
                 onSelect:      col => {
                     this._selectRepeater(col);
+                },
+                onViewChange:  (bbox, mpp) => {
+                    // Zoom/pan → re-query a finer disk grid for the now-visible
+                    // region, and remember it so the live refresh keeps that zoom
+                    // instead of snapping to full extent.
+                    if (!this._storeReady) return;
+                    // Small moves don't need a re-query: the previous detail grid
+                    // over-covers the view, so only react once the camera has
+                    // moved a quarter of the span or zoomed by ≥25%. (Skipped
+                    // moves don't update _lastMapView, so drift accumulates and
+                    // eventually crosses the threshold.)
+                    const lv = this._lastMapView;
+                    if (lv) {
+                        const spanLat = lv.bbox.maxLat - lv.bbox.minLat;
+                        const spanLon = lv.bbox.maxLon - lv.bbox.minLon;
+                        const dLat = Math.abs((bbox.minLat + bbox.maxLat) - (lv.bbox.minLat + lv.bbox.maxLat)) / 2;
+                        const dLon = Math.abs((bbox.minLon + bbox.maxLon) - (lv.bbox.minLon + lv.bbox.maxLon)) / 2;
+                        const zoomRatio = (mpp && lv.mpp)
+                            ? Math.max(mpp, lv.mpp) / Math.max(1e-9, Math.min(mpp, lv.mpp))
+                            : Infinity;
+                        if (zoomRatio < 1.25 && dLat < spanLat * 0.25 && dLon < spanLon * 0.25) return;
+                    }
+                    this._lastMapView = { bbox, mpp };
+                    this._refreshWideMap(bbox, mpp);
                 },
                 onFilter:      col => {
                     if (!col) return;
@@ -825,7 +915,6 @@ class MeshCoreApp {
         const showLinesChk      = document.getElementById('showLinesChk');
         const showMarkerChk     = document.getElementById('showMarkerChk');
         const showDeviceChk     = document.getElementById('showDeviceChk');
-        const clusterSel        = document.getElementById('clusterRadiusSelect');
         const perspSizeChk      = document.getElementById('perspSizeChk');
         showLinesChk?.addEventListener('change', () => {
             this.signalMap?.setShowLines(showLinesChk.checked);
@@ -841,10 +930,6 @@ class MeshCoreApp {
             Store.set('showDevice', showDeviceChk.checked);
             this._updateDeviceLocationRefresh();   // start/stop position polling
         });
-        clusterSel?.addEventListener('change', () => {
-            this.signalMap?.setClusterRadius(parseFloat(clusterSel.value));
-            Store.set('clusterRadius', clusterSel.value);
-        });
         perspSizeChk?.addEventListener('change', () => {
             this.signalMap?.setPerspSize(perspSizeChk.checked);
             Store.set('perspSize', perspSizeChk.checked);
@@ -858,7 +943,6 @@ class MeshCoreApp {
         const showDevice = Store.bool('showDevice', false);
         this._showDeviceMarker = showDevice;
         if (showDeviceChk) { showDeviceChk.checked = showDevice; this.signalMap?.setShowDeviceMarker(showDevice); }
-        if (clusterSel)   clusterSel.value   = String(Store.num('clusterRadius', 0));
         if (perspSizeChk)    perspSizeChk.checked    = Store.bool('perspSize', true);
 
         document.getElementById('showAllRepeatersBtn')?.addEventListener('click', () => this._toggleAllRepeatersOnMap());
@@ -928,21 +1012,17 @@ class MeshCoreApp {
             'sound':
                 'off = silent. short / medium / long play a two-tone beep of increasing duration (long is 4× short) on each new packet. The first tone (1/3 of the beep) is a fixed 700 Hz click; the second tone (2/3) shifts pitch with SNR — higher SNR → higher pitch. When a repeater filter is active, the alert sounds only for packets from the filtered repeater(s). Setting is remembered across sessions.',
             'ttl':
-                'Data older than this window is permanently deleted — packets, signal history, seen repeaters, and 3D map points all expire together. Collision labels are recalculated when their evidence ages out. "Never" keeps everything for the whole session (set automatically on CSV import).',
+                'Data older than this window is permanently deleted — packets, signal history, seen repeaters, and 3D map points all expire together. Collision labels are recalculated when their evidence ages out. "Never" keeps everything for the whole session (set automatically on CSV import) — but note that when Auto-remove is "Never", the Display window below also bounds how much is held in memory, so the heap can\'t grow without limit on long runs.',
             'display':
-                'How far back to look when displaying data. Does not delete anything — data outside this window is still stored and continues to influence repeater ID merging and collision detection. "All" shows the full storage window. Can only be set equal to or shorter than Auto-remove.',
+                'How far back to look when displaying data. With a finite Auto-remove it deletes nothing — data outside this window is still stored and continues to influence repeater ID merging and collision detection. "All" shows the full storage window. When Auto-remove is "Never", anything older than this window is dropped from memory too (a finite Display window is what keeps a multi-hour session from exhausting memory and crashing). Can only be set equal to or shorter than Auto-remove.',
             'keepscreen':
                 'This could be necessary in a mobile browser to keep collection running — when the screen turns off, the browser suspends JavaScript and stops capturing. In the Android app, collection runs in a background service so the screen can be off without losing data — unless the system\'s battery optimization is active and kills the service. Setting is remembered across sessions.',
             'repeater':
                 '"direct" = flood-routed packet received at first hop. Otherwise the ID of the last forwarding repeater. Click a row to select that repeater — dims others in all views (charts, Received packets, 3D map); click again to deselect. Click a column header to sort by that field; click again to reverse. See "Show help" → Repeater ID prefix resolution for how partial IDs and collision labels work.',
-            'rssi':
-                'Received Signal Strength in dBm. Less negative = stronger. −70 dBm: excellent · −120 dBm: very weak.',
-            'snr':
-                'Signal-to-Noise Ratio in dB. Positive = signal is above the noise. LoRa can decode even at negative SNR (down to ~−20 dB).',
             'chart-snr':
-                'Click a dot to select that repeater — dims others across both charts, Seen Repeaters, Received Packets, and the 3D map; click again or elsewhere to deselect. A notice appears top-right with options to filter or deselect. Hover or tap a point to see its exact ID, SNR/RSSI and time in a small box; click the box to dismiss it. Circles (●) = incoming SNR; stars (★) = outgoing SNR reported by the remote node via Discover.',
+                'Click a dot to select that repeater — dims others across both charts, Seen Repeaters, Received Packets, and the 3D map; click again or elsewhere to deselect. A notice appears top-right with options to filter or deselect. Hover or tap a point to see its exact ID, SNR/RSSI and time in a small box; click the box to dismiss it. Circles (●) = incoming SNR; stars (★) = outgoing SNR reported by the remote node via Discover. Zoom the time axis with the mouse wheel, by dragging across a region, or by pinching with two fingers; once zoomed, pan with a one-finger drag or a horizontal (or Shift+) wheel. Double-click or Reset zoom to return to the full view.',
             'chart-interact':
-                'Click a dot to select that repeater — dims others across both charts, Seen Repeaters, Received Packets, and the 3D map; click again or elsewhere to deselect. A notice appears top-right with options to filter or deselect. Hover or tap a point to see its exact ID, RSSI/SNR and time in a small box; click the box to dismiss it. The shaded area shows the estimated noise floor (RSSI − SNR).',
+                'Click a dot to select that repeater — dims others across both charts, Seen Repeaters, Received Packets, and the 3D map; click again or elsewhere to deselect. A notice appears top-right with options to filter or deselect. Hover or tap a point to see its exact ID, RSSI/SNR and time in a small box; click the box to dismiss it. Zoom and pan the time axis just like the SNR chart (wheel, drag a region, or pinch; double-click or Reset zoom to reset) — both charts share one window. The shaded area shows the estimated noise floor (RSSI − SNR).',
             'rate':
                 'Packets received in the last 60 seconds (rolling). Resets to 0 when the network goes quiet.',
             'rep-filter':
@@ -952,7 +1032,7 @@ class MeshCoreApp {
             'msg-filter':
                 'Keeps only the packets that match what you type — a case-insensitive substring search across several fields at once: the packet type (full or abbreviated, e.g. "advert", "GT", "traceroute"), a repeater\'s short ID or its synced contact name, the decoded message text and sender (when available — most traffic is encrypted, so this is often empty), and the raw packet hex. The count next to the box shows matching / total. Clear with the ✕.',
             'msg-type':
-                'Type abbreviations — AD: Advert · GT: GroupText · TR: Traceroute · RS: Response · RQ: Request · PN: Ping · TX: TextMessage · PT: Path · CT: Control · PV: Private · RD: Repeater DSC (discover response, includes uplink SNR). Full type is shown in the expanded row.',
+                'Type abbreviations — AD: Advert · GT: GroupText · TR: Traceroute · RS: Response · RQ: Request · AQ: AnonRequest · PN: Ping · TX: TextMessage · PT: Path · CT: Control · PV: Private · RD: Repeater DSC (discover response, includes uplink SNR). Full type is shown in the expanded row.',
             'signal3d':
                 'Interactive 3D map of received signal quality. Each dot is positioned at your GPS location at reception time; height reflects SNR (taller = higher SNR). Click a dot to select that repeater — shows an info panel and syncs the selection across Seen Repeaters, charts, and Received Packets. When the repeater\'s own position is known, the info panel offers an eye button (turn the camera toward it) and a pushpin (keep it on the map — tilted = shown only temporarily, upright = kept permanently). "Center on me" is a toggle — it recentres on your location and then follows you as you move (the camera tracks your GPS); press it again, or pan/rotate the map yourself, to stop following. "Show all repeaters" adds every known position. Use ⚙ (top right) to change map source, dot size, guide lines, your own location marker, and the connected device\'s own location (a blue antenna marker, shown when the radio or repeater reports a position). Navigation: drag to pan · scroll/pinch to zoom · two-finger twist (or right-drag) to tilt/rotate.',
             'device-location':
@@ -1079,8 +1159,8 @@ class MeshCoreApp {
             });
             await this.connectToDevice(device);
         } catch (error) {
-            if (error.name !== 'NotFoundError') {
-                alert('Connection error: ' + error.message);
+            if (error.name !== 'NotFoundError' && error.name !== 'InvalidStateError') {
+                alert('Connection error: ' + error.message);   // InvalidStateError = BT off; already prompted natively
             }
             if (this.device) this.onDisconnected();
             else this._resetConnectBtn();
@@ -1109,8 +1189,8 @@ class MeshCoreApp {
                 try {
                     await this.connectToDevice(device);
                 } catch (error) {
-                    if (error.name !== 'NotFoundError') {
-                        alert('Connection error: ' + error.message);
+                    if (error.name !== 'NotFoundError' && error.name !== 'InvalidStateError') {
+                        alert('Connection error: ' + error.message);   // InvalidStateError = BT off; already prompted natively
                     }
                     if (this.device) this.onDisconnected();
                     else this._resetConnectBtn();
@@ -1136,8 +1216,8 @@ class MeshCoreApp {
             });
             await this.connectToDevice(device);
         } catch (error) {
-            if (error.name !== 'NotFoundError') {
-                alert('Connection error: ' + error.message);
+            if (error.name !== 'NotFoundError' && error.name !== 'InvalidStateError') {
+                alert('Connection error: ' + error.message);   // InvalidStateError = BT off; already prompted natively
             }
             if (this.device) this.onDisconnected();
             else this._resetConnectBtn();
@@ -1175,8 +1255,8 @@ class MeshCoreApp {
 
             await this.connectToSerialPort(port);
         } catch (error) {
-            if (error.name !== 'NotFoundError') {
-                alert('Connection error: ' + error.message);
+            if (error.name !== 'NotFoundError' && error.name !== 'InvalidStateError') {
+                alert('Connection error: ' + error.message);   // InvalidStateError = BT off; already prompted natively
             }
             if (this.serialPort || this.device) this.onDisconnected();
             else this._resetConnectBtn();
@@ -1261,7 +1341,9 @@ class MeshCoreApp {
                 break;
             } catch (e) {
                 if (!this.device) return;
-                if (attempt === 3) throw e;
+                // BT off (native InvalidStateError) won't recover by retrying —
+                // it already prompted; surface it to the caller immediately.
+                if (attempt === 3 || e.name === 'InvalidStateError') throw e;
                 await new Promise(r => setTimeout(r, attempt * 500));
             }
         }
@@ -1295,6 +1377,9 @@ class MeshCoreApp {
         // accurate than the BLE Battery Service which some devices report as 100%.
 
         this._setConnectedDeviceName(this.saveDevice(device));
+        // Upgrade the (possibly stale) cached name to the live GAP name if the
+        // device was renamed since it was saved — fire-and-forget.
+        this._refreshBleName(device, server);
 
         this.updateStatus('Connected (companion)', 'connected');
         this._setActiveTransportBtn('ble', 'Disconnect', () => this.disconnect());
@@ -1344,8 +1429,8 @@ class MeshCoreApp {
             const port = await navigator.serial.requestPort({ filters: [] });
             await this.connectToSerialPort(port);
         } catch (error) {
-            if (error.name !== 'NotFoundError') {
-                alert('Connection error: ' + error.message);
+            if (error.name !== 'NotFoundError' && error.name !== 'InvalidStateError') {
+                alert('Connection error: ' + error.message);   // InvalidStateError = BT off; already prompted natively
             }
             if (this.serialPort || this.device) this.onDisconnected();
             else this._resetConnectBtn();
@@ -1765,7 +1850,7 @@ class MeshCoreApp {
         const snr = snrX4 / 4;
         const hash = 'nbr-' + fullId + '-' + heardEpoch;
         this._ingestPacket(hash, fullId, 'Repeater Neighbour', null, snr, null,
-            { repeaterNeighbor: true, secsAgo }, null, {});
+            { repeaterNeighbor: true, secsAgo }, null, this._myLocation());
     }
 
     _handleRepeaterLogLine(m) {
@@ -1814,7 +1899,7 @@ class MeshCoreApp {
         const hash = this._makeUnknownHash();
         const type = (route === 'D' ? 'Direct ' : 'Flood ') + Utils.getPayloadTypeName(payloadType);
         const meta = { repeaterLog: true, route, payloadType, len, payloadLen, src, dest };
-        this._ingestPacket(hash, col, type, null, snr, rssi, meta, null, {});
+        this._ingestPacket(hash, col, type, null, snr, rssi, meta, null, this._myLocation());
 
         // Summary lines with no accompanying RAW dump ⇒ stock firmware ⇒ limited
         // data. Surface the caveat once.
@@ -2024,6 +2109,7 @@ class MeshCoreApp {
         if (payload.length >= 144) lon = ((payload[140] | (payload[141] << 8) | (payload[142] << 16) | (payload[143] << 24)) | 0) / 1e6;
         if (payload.length >= 148) lastmod = payload[144] | (payload[145] << 8) | (payload[146] << 16) | (payload[147] << 24);
         this._contacts.set(pubKeyFull, { name: name || null, type, lat, lon, lastAdvert, lastmod, pubKeyFullHex: pubKeyFull });
+        this._scheduleContactsPersist();
         // NB: do NOT advance _contactsLastmod here. The incremental-sync marker
         // must only move forward once a FULL contact list has been received
         // (END_OF_CONTACTS). Advancing it per-contact meant an interrupted fetch
@@ -2160,6 +2246,18 @@ class MeshCoreApp {
         if (this.contactsHstat) this.contactsHstat.style.display = this._contacts.size > 0 ? '' : 'none';
     }
 
+    // Persist contacts (debounced) to the session DB so they survive a reload /
+    // renderer-crash rebuild — restored in _initStore. The incremental-sync
+    // marker is saved too, so a reconnect resumes from it instead of re-pulling
+    // the whole contact list.
+    _scheduleContactsPersist() {
+        if (!this._storeReady) return;
+        clearTimeout(this._contactsPersistTimer);
+        this._contactsPersistTimer = setTimeout(() => {
+            this.store.setKV('contacts', { entries: [...this._contacts.values()], lastmod: this._contactsLastmod });
+        }, 1000);
+    }
+
     _updateSoundHighlight() {
         const label = this.soundSelect?.closest('.sound-toggle');
         if (!label) return;
@@ -2231,8 +2329,12 @@ class MeshCoreApp {
         return Store.json('devices', []);
     }
 
-    saveDevice(device) {
+    saveDevice(device, nameOverride) {
         let devices = this.getSavedDevices();
+        // The live name: a fresh GAP-read name when we have one (see
+        // _refreshBleName), else whatever the BLE layer reported — which on a
+        // saved-id reconnect can be Android's stale cached name.
+        const liveName = nameOverride || device.name;
         // Web Bluetooth's device.id is NOT reliably stable across
         // requestDevice() calls — getDevices() (the zero-friction reconnect
         // path) needs an experimental Chrome flag, so a quick-connect usually
@@ -2241,14 +2343,35 @@ class MeshCoreApp {
         // saved entries over time. So also match a prior BLE entry by name
         // (MeshCore names carry a unique suffix) and collapse onto one entry.
         const prior = devices.find(d => d.id === device.id
-            || (device.name && d.transport === 'ble' && d.name === device.name));
-        const name = device.name || prior?.name || 'Unknown';
+            || (liveName && d.transport === 'ble' && d.name === liveName));
+        const name = liveName || prior?.name || 'Unknown';
         devices = devices.filter(d => d.id !== device.id
-            && !(device.name && d.transport === 'ble' && d.name === device.name));
+            && !(liveName && d.transport === 'ble' && d.name === liveName));
         devices.push({ id: device.id, name, transport: 'ble' });
         Store.set('devices', JSON.stringify(devices));
         this._renderSavedDevices();
         return name;
+    }
+
+    // The device may have been renamed since it was saved. device.name on a
+    // saved-id reconnect is often Android's stale cached name, so read the live
+    // GAP "Device Name" (service 0x1800, char 0x2A00) and, if it differs, adopt
+    // it for the connection label and the saved entry. Fire-and-forget so it
+    // never delays "Connected". No-op on the web: Chrome block-lists the GAP
+    // service, so getPrimaryService rejects — caught here, leaving the cached
+    // name in place (the requestDevice picker path already gets a fresh name).
+    async _refreshBleName(device, server) {
+        if (!server) return;
+        let live = null;
+        try {
+            const gap = await server.getPrimaryService('00001800-0000-1000-8000-00805f9b34fb');
+            const ch  = await gap.getCharacteristic('00002a00-0000-1000-8000-00805f9b34fb');
+            const val = await ch.readValue();
+            live = new TextDecoder('utf-8').decode(val).replace(/\0+$/, '').trim();
+        } catch (_) { return; }
+        // Still the same live connection, and a real new name?
+        if (!live || this.device !== device || live === device.name) return;
+        this._setConnectedDeviceName(this.saveDevice(device, live));
     }
 
     // Serial ports expose no stable id or name — only the USB vendor/product id
@@ -2361,6 +2484,7 @@ class MeshCoreApp {
             this._setContactsLoading(false);
             if (payload.length >= 5)
                 this._contactsLastmod = payload[1] | (payload[2]<<8) | (payload[3]<<16) | (payload[4]<<24);
+            this._scheduleContactsPersist();   // full list received → persist with the new sync marker
             this._updateContactsCount();
             this._lastColKey = null; // force column header redraw with names
             this._renderMsgTable();
@@ -2413,9 +2537,6 @@ class MeshCoreApp {
         if (payload.length < 44) return;
         const lat = ((payload[36] | (payload[37] << 8) | (payload[38] << 16) | (payload[39] << 24)) | 0) / 1e6;
         const lon = ((payload[40] | (payload[41] << 8) | (payload[42] << 16) | (payload[43] << 24)) | 0) / 1e6;
-        // adv_loc_policy: 0 = none (not shared), 1 = share (live GPS from the
-        // device's sensor), 2 = prefs (static stored lat/lon).
-        this._deviceLocPolicy = payload.length >= 46 ? payload[45] : null;
         this._setDeviceLocation(lat, lon);
         this._updateDeviceLocationRefresh();
     }
@@ -2466,7 +2587,6 @@ class MeshCoreApp {
     // zero-zero convention matches how contacts and adverts mark "no position".
     _setDeviceLocation(lat, lon) {
         const has = lat != null && lon != null && !(lat === 0 && lon === 0);
-        this._deviceLocation = has ? { lat, lon } : null;
         this.signalMap?.setDeviceLocation(has ? lat : null, has ? lon : null);
     }
 
@@ -2512,11 +2632,14 @@ class MeshCoreApp {
             tagKnown,
         };
 
-        // Record uplink SNR in the Sent SNR History chart and 3D map
+        // Record uplink SNR in the Sent SNR History chart and 3D map. Persist the
+        // capture position too, so the map can show outgoing SNR from disk
+        // (clustered, surviving reload/export) the same way it shows incoming.
         const now = Date.now();
-        this._sentSnrHistory.push({ time: now, snr: remoteSnr, col: pubKeyHex, label: nodeName ?? pubKeyHex });
-        this._scheduleChartRender();
         const sentLoc = this.signalMap?.currentLocation() ?? null;
+        this._sentSnrHistory.push({ time: now, snr: remoteSnr, col: pubKeyHex, label: nodeName ?? pubKeyHex, lat: sentLoc?.lat ?? null, lon: sentLoc?.lon ?? null });
+        if (!this._storeDead) { this._sentWriteBuf.push({ time: now, snr: remoteSnr, rawId: pubKeyHex, label: nodeName ?? pubKeyHex, lat: sentLoc?.lat ?? null, lon: sentLoc?.lon ?? null }); this._scheduleWriteFlush(); }
+        this._scheduleChartRender();
         if (sentLoc && remoteSnr != null) {
             this.signalMap.addSentSnrPacket({ lat: sentLoc.lat, lon: sentLoc.lon, snr: remoteSnr, col: pubKeyHex, time: now, rawId: pubKeyHex });
         }
@@ -2525,7 +2648,7 @@ class MeshCoreApp {
         // Column = the responding node's pub key prefix so all its DSC responses share one column.
         const dscHash = 'DSC:' + (++this._dscSeq);
         const rawHex = Array.from(payload).map(b => b.toString(16).padStart(2, '0')).join('');
-        this._ingestPacket(dscHash, pubKeyHex, typeName + ' DSC', rawHex, ourSnr, ourRssi, meta, null, { remoteSnr });
+        this._ingestPacket(dscHash, pubKeyHex, typeName + ' DSC', rawHex, ourSnr, ourRssi, meta, null, { remoteSnr, ...this._myLocation() });
     }
 
     _handleTracePush(payload) {
@@ -2548,7 +2671,7 @@ class MeshCoreApp {
         const lastSnr = snrs[snrs.length - 1];
         const hash = 'TR:' + tag.toString(16).toUpperCase().padStart(8, '0');
         const meta = { pathLen, tag, snrs };
-        this._ingestPacket(hash, repeaterCol, 'Trace', null, lastSnr, null, meta, null);
+        this._ingestPacket(hash, repeaterCol, 'Trace', null, lastSnr, null, meta, null, this._myLocation());
     }
 
     _bufferToHex(buffer) {
@@ -2589,7 +2712,7 @@ class MeshCoreApp {
         this._ingestContactFromPacket(packet);
 
         if (hash && repeater) {
-            this._ingestPacket(hash, repeater, type, rawHex, snr, rssi, meta, packet);
+            this._ingestPacket(hash, repeater, type, rawHex, snr, rssi, meta, packet, this._myLocation());
         }
     }
 
@@ -2613,6 +2736,7 @@ class MeshCoreApp {
             pubKeyFullHex,
         });
         if (!existing) this._updateContactsCount();
+        this._scheduleContactsPersist();
     }
 
     _escHtml(s) {
@@ -2976,6 +3100,15 @@ class MeshCoreApp {
         return window.scrollY + window.innerHeight >= document.body.scrollHeight - margin;
     }
 
+    // The user's current GPS fix as { lat, lon } (null fields when unknown), to
+    // stamp onto a freshly received live packet. The geolocation watch lives in
+    // the 3D map; this is the single point that reads it, so callers (and
+    // _ingestPacket) stay decoupled from where the fix comes from.
+    _myLocation() {
+        const l = this.signalMap?.currentLocation();
+        return { lat: l?.lat ?? null, lon: l?.lon ?? null };
+    }
+
     _ingestPacket(hash, repeater, type, rawHex, snr, rssi, meta = {}, packet = null, opts = {}) {
         if (!this._collecting && !opts.importing && !opts.forceIngest) return;
         const wasAtBottom = !opts.importing && this._isAtPageBottom();
@@ -2987,8 +3120,12 @@ class MeshCoreApp {
         const prevColCount = this.repeaterColumns.length;
         const canonicalKey = this.findOrCreateColumn(repeater);
 
-        const loc = opts.lat != null ? { lat: opts.lat, lon: opts.lon }
-            : (this.signalMap?.currentLocation() ?? null);
+        // Position is supplied by the caller, never fetched here: live handlers
+        // stamp the current GPS fix (_myLocation), replay/import carry the stored
+        // one. A packet with no position (e.g. captured before location was on)
+        // arrives as null and STAYS null — it can never silently acquire the
+        // current location, so it's correctly omitted from the 3D map.
+        const loc = opts.lat != null ? { lat: opts.lat, lon: opts.lon } : null;
         const repEntry = { snr, rssi, packet, rawHex, rawId: repeater, time: now };
         if (loc) { repEntry.lat = loc.lat; repEntry.lon = loc.lon; }
         if (opts.remoteSnr != null) repEntry.remoteSnr = opts.remoteSnr;
@@ -3009,7 +3146,13 @@ class MeshCoreApp {
             // When importing, skip (hash, repeater) pairs that already exist — existing data wins
             if (opts.importing && data.repeaters.has(canonicalKey)) return;
             data.lastSeen = now;
-            data.repeaters.set(canonicalKey, repEntry);
+            // Keep the strongest-RSSI observation per (packet, repeater), matching
+            // the disk grid/page representative so the table cell reads the same
+            // value in every Display window.
+            const prevRep = data.repeaters.get(canonicalKey);
+            if (!prevRep || (rssi != null && (prevRep.rssi == null || rssi > prevRep.rssi))) {
+                data.repeaters.set(canonicalKey, repEntry);
+            }
         }
 
         const rawPrec  = this.idPrecision(repeater);
@@ -3025,38 +3168,98 @@ class MeshCoreApp {
         });
         if (snr != null || rssi != null) {
             this.chartPoints.push({ time: now, rssi, snr, col: canonicalKey, rawId: repeater });
+            // Fold it into the chart bucket cache so the charts show it without a
+            // disk re-query. Replay/import skip this — they end with a full disk
+            // rebuild of the layers anyway.
+            if (!opts.replaying && !opts.importing && this._storeReady) {
+                this._upsertChartCell(now, snr, rssi, repeater);
+            }
         }
-        if (loc) this.signalMap?.addPacket({ lat: loc.lat, lon: loc.lon, rssi, snr, col: canonicalKey, time: now, rawId: repeater });
+        if (loc) {
+            this.signalMap?.addPacket({ lat: loc.lat, lon: loc.lon, rssi, snr, col: canonicalKey, time: now, rawId: repeater });
+            // Fold it into the RAM map-cell cache so the wide view shows it
+            // immediately, no disk rescan. Replay/import skip this — they end
+            // with a full disk rebuild of the layers anyway.
+            if (!opts.replaying && !opts.importing && this._storeReady) {
+                this._upsertMapCell({ lat: loc.lat, lon: loc.lon, snr, rssi, time: now, rawId: repeater });
+            }
+        }
+
+        // Persist this observation (rawHex is per-path, so it lives per-obs).
+        // Skipped only while replaying from disk to avoid writing it back.
+        if (!opts.replaying) this._ingestToStore({ now, hash, repeater, rawHex, snr, rssi, meta, type, loc, remoteSnr: opts.remoteSnr }, isNewHash);
 
         if (opts.importing) return;
 
-        this._renderRepTable();
-        this._sortColumns();
-        this._renderMsgTable(isNewHash ? hash : null);
-        // Flash the two signal cells that just received new values
-        this.msgTableBody?.querySelectorAll(`[data-hash="${hash}"][data-col="${canonicalKey}"]`)
-            .forEach(el => {
-                el.classList.remove('cell-flash');
-                // Force reflow so the animation restarts even on rapid back-to-back updates
-                void el.offsetWidth;
-                el.classList.add('cell-flash');
-            });
-        if (this.repeaterColumns.length !== prevColCount) {
-            requestAnimationFrame(() => this._checkTableOverflow(false));
-        }
-        if (wasAtBottom) {
-            requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'instant' }));
-        }
+        // Heavy DOM work (both tables + stats) is coalesced so a busy mesh
+        // doesn't rebuild them on every packet and starve the 3D-map frame loop.
+        // The cells to flash and a pending "scroll to bottom" are remembered and
+        // applied by the coalesced pass.
+        (this._flashPending ??= new Set()).add(hash + '|' + canonicalKey);
+        this._scheduleLiveRender(wasAtBottom);
         this._scheduleChartRender();
+        const matchesRepFilter = !this._repFilterTerms.length || this._colMatchesRepFilter(canonicalKey);
 
-        // Sound only when the entry would actually appear under the current filters
+        // Keep the table pager's page count current without a disk count() —
+        // replay/import end with an authoritative _loadTablePage instead.
+        if (!opts.replaying && this._storeReady) {
+            if (isNewHash) this._tableHashCount++;
+            // Fold the packet into the narrow index too — note an OLD hash can
+            // newly join it when the narrowed repeater hears it for the first
+            // time. Guard on the index being current for the active narrowing.
+            const narrowFn = this._tableNarrowFn();
+            if (this._tableNarrowHashes && narrowFn
+                && this._tableNarrowIndexKey === this._tableNarrowKey()
+                && narrowFn(canonicalKey) && !this._tableNarrowSet.has(hash)) {
+                this._tableNarrowHashes.unshift(hash);
+                this._tableNarrowSet.add(hash);
+            }
+            const total = this._tableNarrowHashes ? this._tableNarrowHashes.length : this._tableHashCount;
+            this._tablePageCount = Math.max(1, Math.ceil(total / this._tablePageSize));
+        }
+
+        // Sound stays immediate (cheap, and its timing matters).
         const data = this.hashData.get(hash);
         const filterText = this._msgFilter.toLowerCase().trim();
         const matchesMsgFilter = !filterText || this._rowMatchesFilter(data, filterText);
-        const matchesRepFilter = !this._repFilterTerms.length || this._colMatchesRepFilter(canonicalKey);
         if (matchesMsgFilter && matchesRepFilter) this._playRxSound(snr);
-        this._updateStats();
         this.emptyState?.classList.add('hidden');
+    }
+
+    // Coalesce the per-packet table/stats render to ~7×/s. Rebuilding both
+    // tables on every packet (a busy mesh is many per second) saturates the main
+    // thread and makes the 3D map stutter while panning during capture.
+    _scheduleLiveRender(wasAtBottom = false) {
+        if (wasAtBottom) this._pendingScrollBottom = true;
+        if (this._liveRenderTimer) return;
+        const since = performance.now() - (this._lastLiveRender || 0);
+        this._liveRenderTimer = setTimeout(() => {
+            this._liveRenderTimer = null;
+            this._lastLiveRender = performance.now();
+            this._sortColumns();
+            this._renderRepTable();
+            this._renderMsgTable();
+            this._refreshTablePager();   // page count is maintained in RAM at ingest
+            this._updateStats();
+            // Flash the cells that received new values since the last render.
+            if (this._flashPending && this._flashPending.size) {
+                for (const key of this._flashPending) {
+                    const sep = key.lastIndexOf('|');
+                    const h = key.slice(0, sep), c = key.slice(sep + 1);
+                    this.msgTableBody?.querySelectorAll(`[data-hash="${h}"][data-col="${c}"]`).forEach(el => {
+                        el.classList.remove('cell-flash');
+                        void el.offsetWidth;   // restart the animation
+                        el.classList.add('cell-flash');
+                    });
+                }
+                this._flashPending.clear();
+            }
+            this._checkTableOverflow(false);
+            if (this._pendingScrollBottom) {
+                this._pendingScrollBottom = false;
+                requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'instant' }));
+            }
+        }, Math.max(0, 150 - since));
     }
 
     // --- Column management ---
@@ -3145,15 +3348,44 @@ class MeshCoreApp {
         const msgFilterBar = document.getElementById('msgFilterBar');
 
         const filter = this._msgFilter.toLowerCase().trim();
-        const displayCutoff = this._displayCutoffNow();
-        const allRows = Array.from(this.hashData.entries())
-            .filter(([, data]) => !data._stub && (!displayCutoff || data.lastSeen >= displayCutoff))
+        // Rows = the current disk page snapshot (see _loadTablePage) plus, on
+        // page 0, a live tail of packets newer than the cache so new rows show
+        // instantly. Pre-ready (store still opening) the page is empty and the
+        // cutoff-filtered tail alone is the full live RAM window — one path.
+        const cutoff = this._displayCutoffNow();
+        const narrowFn = this._tableNarrowFn();
+        const m = new Map(this._tablePageData);
+        if (this._tablePage === 0) {
+            for (const [h, d] of this.hashData) {
+                if (d.lastSeen <= this._renderCacheAt) continue;
+                // When narrowed the snapshot holds only matching hashes — keep the
+                // tail consistent so hidden rows don't eat the page cap.
+                if (narrowFn && ![...d.repeaters.keys()].some(narrowFn)) continue;
+                m.set(h, d);
+            }
+        }
+        // The Display-window cutoff applies to the snapshot too, not just the
+        // tail — the snapshot is loaded once and ages while it is on screen.
+        let allRows = [...m.entries()]
+            .filter(([, data]) => !data._stub && (!cutoff || data.firstSeen >= cutoff))
             .sort(([, a], [, b]) => b.firstSeen - a.firstSeen);
+        // Page 0 is maintained in RAM during capture (the disk snapshot is never
+        // periodically reloaded), so the live tail can outgrow the page — cap the
+        // rendered rows at the page size; older rows are reachable via the pager.
+        // Pre-ready (store still opening) there is no pager yet, so don't cap.
+        if (this._tablePage === 0 && this._storeReady && allRows.length > this._tablePageSize) {
+            allRows = allRows.slice(0, this._tablePageSize);
+        }
 
-        // Only include columns that actually appear in the visible rows (respects display cutoff)
+        // Only include columns that actually appear in the visible rows (respects
+        // display cutoff). The disk snapshot can surface a historical column that
+        // isn't in the live model, so union it with repeaterColumns.
         const activeColsInRows = new Set(allRows.flatMap(([, data]) => [...data.repeaters.keys()]));
-        const visibleCols = this.repeaterColumns
+        const colList = [...new Set([...this.repeaterColumns, ...activeColsInRows])];
+        const visibleCols = colList
             .filter(c => this._colMatchesRepFilter(c) && activeColsInRows.has(c));
+        this._visibleCols = visibleCols;   // columns actually rendered (used by the
+                                           // detail colspan and the filter notice)
 
         const msgTableEmpty = document.getElementById('msgTableEmpty');
         const msgTableScroll = this.msgTableHead?.closest('.msg-table-scroll');
@@ -3162,7 +3394,7 @@ class MeshCoreApp {
             if (msgFilterBar) msgFilterBar.classList.add('hidden');
             if (msgTableScroll) msgTableScroll.style.display = 'none';
             if (msgTableEmpty) {
-                msgTableEmpty.textContent = displayCutoff
+                msgTableEmpty.textContent = cutoff
                     ? 'No packets in the current display window.'
                     : 'Waiting for data…';
                 msgTableEmpty.classList.remove('hidden');
@@ -3180,9 +3412,11 @@ class MeshCoreApp {
         let rows = filter
             ? allRows.filter(([, data]) => this._rowMatchesFilter(data, filter))
             : allRows;
-        // When repeater filter is active, hide rows that have no data from visible columns
-        if (this._repFilterTerms.length) {
-            rows = rows.filter(([, data]) => visibleCols.some(c => data.repeaters.has(c)));
+        // When narrowed (filter or selection), drop rows with no data from a
+        // matching repeater — matches the paged hash index, so a full page of
+        // rows survives instead of mostly-hidden ones.
+        if (narrowFn) {
+            rows = rows.filter(([, data]) => [...data.repeaters.keys()].some(narrowFn));
         }
 
         // Rebuild header when column set changes
@@ -3218,7 +3452,7 @@ class MeshCoreApp {
         ).join('');
 
         for (const [hash, col] of openDetails) {
-            if (!this.hashData.has(hash)) continue;
+            if (!this._tableSource().has(hash) && !this.hashData.has(hash)) continue;
             // Drop detail for a column that is now filtered out
             if (col && !this._colMatchesRepFilter(col)) continue;
             const row = document.getElementById(`row-${hash}`);
@@ -3351,14 +3585,24 @@ class MeshCoreApp {
     }
 
     _buildDetailRow(hash, col = null) {
-        const data = this.hashData.get(hash);
+        const data = this._tableSource().get(hash) || this.hashData.get(hash);
         if (!data) return '';
-        const colspan = 1 + this.repeaterColumns.length * 2;
+        // Span every rendered column (the table shows the union of live + disk
+        // columns, which can exceed repeaterColumns).
+        const colCount = this._visibleCols?.length ?? this.repeaterColumns.length;
+        const colspan = 1 + colCount * 2;
 
         // Use per-repeater packet/rawHex when available (each repeater receives a different path)
         const repEntry = col ? data.repeaters.get(col) : null;
-        const pkt = repEntry?.packet ?? data.packet;
+        let pkt = repEntry?.packet ?? data.packet;
         const hex = repEntry?.rawHex ?? data.rawHex;
+        // Disk-paged rows carry packet:null (the decoded form isn't stored — see
+        // packet-store.js) — reconstruct it from the raw bytes on demand and
+        // cache it on the entry so re-renders of an open detail don't re-decode.
+        if (!pkt && hex) {
+            try { pkt = MeshCoreDecoder.decode(hex); } catch (_) { pkt = null; }
+            if (pkt) { if (repEntry) repEntry.packet = pkt; else data.packet = pkt; }
+        }
 
         let header = '';
         if (repEntry) {
@@ -3559,6 +3803,8 @@ class MeshCoreApp {
     }
 
     _onChartClick(e, type) {
+        // A drag-to-zoom gesture ends with a click event we must not treat as a tap.
+        if (this._suppressChartClick) { this._suppressChartClick = false; return; }
         const incomingPts = (type === 'snr' && !this._snrShowIncoming) ? [] : this._visibleChartPoints();
         const sentPts = type === 'snr' ? (this._snrShowOutgoing ? this._visibleSentSnrPts() : []) : [];
         const pts = type === 'snr' ? [...incomingPts, ...sentPts] : incomingPts;
@@ -3573,18 +3819,13 @@ class MeshCoreApp {
         const { l: pl, r: pr, t: pt, b: pb } = CHART_PAD;
         const cw = W - pl - pr;
         const ch = H - pt - pb;
+        // Use the exact window the chart was last rendered with, so hit-testing
+        // stays aligned with the dots even when the X axis is zoomed.
         const now = this._chartFrozenAt ?? Date.now();
-        let tMin;
-        if (isFinite(this.HASH_LIFETIME)) tMin = now - this.HASH_LIFETIME;
-        else {
-            const allIn  = type === 'snr' ? this._visibleChartPoints()  : incomingPts;
-            const allOut = type === 'snr' ? this._visibleSentSnrPts()   : [];
-            tMin = allIn.length  ? this._earliestTime(allIn)  : Infinity;
-            if (allOut.length) tMin = Math.min(tMin, this._earliestTime(allOut));
-            if (!isFinite(tMin)) tMin = now - 5 * 60000;
-        }
+        const win = this._lastChartWindow ?? { tMin: now - 5 * 60000, tMax: now };
+        const tMin = win.tMin, tMax = win.tMax;
         const { yMin, yMax } = this._chartYBounds(type);
-        const tRange = Math.max(1, now - tMin);
+        const tRange = Math.max(1, tMax - tMin);
         const yRange = Math.max(1e-9, yMax - yMin);
         const xOf = t => pl + (t - tMin) / tRange * cw;
         const yOf = v => pt + (1 - (v - yMin) / yRange) * ch;
@@ -3606,6 +3847,261 @@ class MeshCoreApp {
         this._selectRepeater(deselect ? null : nearest.col);
         if (deselect) this.hideChartTooltip(true);
         else this.showChartTooltip(e, type, true);
+    }
+
+    // ----- 2D-chart X-axis zoom ------------------------------------------
+    // Both charts share one zoom window (this._chartZoom) so the SNR and RSSI
+    // time axes stay aligned. Gestures: mouse wheel (zoom about the cursor),
+    // drag a region with the mouse, two-finger pinch on touch. Double-click or
+    // the "Reset zoom" button returns to the full auto/live window.
+
+    // A viewport clientX mapped into the SVG's own (local, pre-transform) pixel
+    // space — the space style.left and the SVG's internal drawing both use.
+    // The page may be CSS-scaled (the desktop / text-size zoom transforms
+    // <body>), so getBoundingClientRect() is in scaled viewport pixels while
+    // svg.clientWidth is the unscaled layout width; dividing by their ratio
+    // undoes the scale. (Without this the drag-zoom selection band, positioned
+    // via style.left, landed off to the side by the scale factor.)
+    _chartLocalX(svg, clientX) {
+        const rect = svg.getBoundingClientRect();
+        const scale = (rect.width && svg.clientWidth) ? rect.width / svg.clientWidth : 1;
+        return (clientX - rect.left) / scale;
+    }
+
+    // Map a clientX over `svg` to a time, using the window the chart was last
+    // drawn with (so it matches what's on screen).
+    _chartTimeAtClientX(svg, clientX) {
+        const win = this._lastChartWindow ?? this._chartFullWindow;
+        if (!win) return null;
+        const { l: pl, r: pr } = CHART_PAD;
+        const cw = Math.max(1, svg.clientWidth - pl - pr);
+        const frac = Math.max(0, Math.min(1, (this._chartLocalX(svg, clientX) - pl) / cw));
+        return win.tMin + frac * (win.tMax - win.tMin);
+    }
+
+    _setChartZoom(tMin, tMax) {
+        const full = this._chartFullWindow;
+        if (!full || !(tMax > tMin)) return;
+        // Clamp to the available data extent.
+        tMin = Math.max(full.tMin, tMin);
+        tMax = Math.min(full.tMax, tMax);
+        const MIN_SPAN = 1000;   // don't zoom tighter than 1 s
+        if (tMax - tMin < MIN_SPAN) {
+            const mid = (tMin + tMax) / 2;
+            tMin = Math.max(full.tMin, mid - MIN_SPAN / 2);
+            tMax = Math.min(full.tMax, mid + MIN_SPAN / 2);
+        }
+        // Covers (almost) the whole range ⇒ drop the zoom and resume auto/live —
+        // a ≥99%-of-full window isn't a meaningful zoom, so don't keep zoom state
+        // (and the Reset button) around for it.
+        if (tMax - tMin >= (full.tMax - full.tMin) * 0.99) { this._clearChartZoom(); return; }
+        this._chartZoom = { tMin, tMax };
+        this._updateZoomResetBtns();
+        this._scheduleChartRender();        // instant: rescale the current cache
+        this._scheduleChartCacheRefresh();  // then refine resolution for the new window
+    }
+
+    _clearChartZoom() {
+        const had = !!this._chartZoom;
+        this._chartZoom = null;
+        this._updateZoomResetBtns();
+        if (had) { this._scheduleChartRender(); this._scheduleChartCacheRefresh(); }
+    }
+
+    // Swallow the click that may trail a drag/pan gesture, but auto-expire so a
+    // later genuine tap is never lost (touch pan preventDefaults, so the click
+    // sometimes never arrives to consume the flag).
+    _suppressClickBriefly() {
+        this._suppressChartClick = true;
+        clearTimeout(this._suppressClickTimer);
+        this._suppressClickTimer = setTimeout(() => { this._suppressChartClick = false; }, 400);
+    }
+
+    // Slide the zoom window along the X axis by dtMs (keeping its span), clamped
+    // to the data extent. No-op unless currently zoomed.
+    _panChartZoom(dtMs) {
+        if (!this._chartZoom || !this._chartFullWindow || !dtMs) return;
+        const full = this._chartFullWindow;
+        const span = this._chartZoom.tMax - this._chartZoom.tMin;
+        let nMin = this._chartZoom.tMin + dtMs;
+        let nMax = this._chartZoom.tMax + dtMs;
+        if (nMin < full.tMin) { nMin = full.tMin; nMax = nMin + span; }
+        if (nMax > full.tMax) { nMax = full.tMax; nMin = nMax - span; }
+        this._chartZoom = { tMin: nMin, tMax: nMax };
+        this._updateZoomResetBtns();
+        this._scheduleChartRender();
+        this._scheduleChartCacheRefresh();
+    }
+
+    // React to a zoom change, debounced so a wheel/pinch gesture coalesces into
+    // one action once it settles. Zooming IN (or moving the zoom window) builds
+    // a finer disk layer for it; zooming OUT just drops the layer and re-derives
+    // from the always-current base — no disk read.
+    _scheduleChartCacheRefresh() {
+        clearTimeout(this._chartCacheTimer);
+        this._chartCacheTimer = setTimeout(() => {
+            if (this._chartZoom) {
+                this._rebuildChartZoomLayer();
+            } else {
+                this._chartZoomLayer = null;
+                this._rebuildChartArrays();
+            }
+        }, 140);
+    }
+
+    _updateZoomResetBtns() {
+        const zoomed = !!this._chartZoom;
+        for (const b of (this._zoomResetBtns ?? [])) b.classList.toggle('hidden', !zoomed);
+    }
+
+    _showZoomSel(svg, xa, xb) {
+        const wrap = svg.parentElement;
+        if (!wrap) return;
+        let band = this._zoomSelBand;
+        if (!band || band.parentElement !== wrap) {
+            band = document.createElement('div');
+            band.className = 'chart-zoom-sel';
+            wrap.appendChild(band);
+            this._zoomSelBand = band;
+        }
+        const { l: pl, r: pr } = CHART_PAD;
+        // Position in the SVG's local px (what style.left uses) — see _chartLocalX:
+        // a CSS-scaled page would otherwise offset the band by the scale factor.
+        const xaL = this._chartLocalX(svg, xa);
+        const xbL = this._chartLocalX(svg, xb);
+        const left  = Math.max(pl, Math.min(xaL, xbL));
+        const right = Math.min(svg.clientWidth - pr, Math.max(xaL, xbL));
+        band.style.left = left + 'px';
+        band.style.width = Math.max(0, right - left) + 'px';
+        band.style.display = 'block';
+    }
+
+    _hideZoomSel() {
+        if (this._zoomSelBand) this._zoomSelBand.style.display = 'none';
+    }
+
+    _bindChartZoom(svg, type) {
+        // Lazily add a per-chart "Reset zoom" button (shown only while zoomed).
+        const wrap = svg.parentElement;
+        if (wrap && !wrap.querySelector('.chart-zoom-reset')) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'chart-zoom-reset hidden';
+            btn.textContent = '⤢ Reset zoom';
+            btn.title = 'Reset X-axis zoom (or double-click the chart)';
+            btn.addEventListener('click', ev => { ev.stopPropagation(); this._clearChartZoom(); });
+            wrap.appendChild(btn);
+            (this._zoomResetBtns ??= []).push(btn);
+        }
+
+        // Wheel: zoom about the cursor (wheel up = zoom in). While zoomed,
+        // Shift+wheel or a horizontal wheel/trackpad gesture pans along X.
+        svg.addEventListener('wheel', e => {
+            const win = this._lastChartWindow ?? this._chartFullWindow;
+            if (!win) return;
+            const span = win.tMax - win.tMin;
+            if (this._chartZoom && (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY))) {
+                e.preventDefault();
+                const d = e.shiftKey ? e.deltaY : e.deltaX;
+                this._panChartZoom(Math.sign(d) * span * 0.2);
+                return;
+            }
+            const tAt = this._chartTimeAtClientX(svg, e.clientX);
+            if (tAt == null) return;
+            e.preventDefault();
+            const factor = e.deltaY < 0 ? 1 / 1.2 : 1.2;
+            this._setChartZoom(tAt - (tAt - win.tMin) * factor, tAt + (win.tMax - tAt) * factor);
+        }, { passive: false });
+
+        // Mouse drag → select an X region to zoom into. Distinguish from a click
+        // by a small movement threshold; a real drag suppresses the click.
+        let drag = null;
+        svg.addEventListener('mousedown', e => {
+            if (e.button !== 0) return;
+            e.preventDefault();   // don't start a text/SVG selection while dragging
+            drag = { startX: e.clientX, moved: false };
+        });
+        window.addEventListener('mousemove', e => {
+            if (!drag) return;
+            if (!drag.moved && Math.abs(e.clientX - drag.startX) > 4) drag.moved = true;
+            if (drag.moved) { this._showZoomSel(svg, drag.startX, e.clientX); this.hideChartTooltip(); }
+        });
+        window.addEventListener('mouseup', e => {
+            if (!drag) return;
+            const d = drag; drag = null;
+            this._hideZoomSel();
+            if (!d.moved) return;                 // it was a click → leave to _onChartClick
+            this._suppressClickBriefly();
+            const t1 = this._chartTimeAtClientX(svg, d.startX);
+            const t2 = this._chartTimeAtClientX(svg, e.clientX);
+            if (t1 != null && t2 != null) this._setChartZoom(Math.min(t1, t2), Math.max(t1, t2));
+        });
+
+        // Two-finger pinch on touch. Each finger stays pinned to the time it
+        // grabbed; we solve for the window that keeps both anchors under them.
+        let pinch = null, pan = null;
+        svg.addEventListener('touchstart', e => {
+            if (e.touches.length !== 2) return;
+            pan = null;   // a second finger landed → switch from pan to pinch
+            const t0 = this._chartTimeAtClientX(svg, e.touches[0].clientX);
+            const t1 = this._chartTimeAtClientX(svg, e.touches[1].clientX);
+            if (t0 == null || t1 == null) return;
+            pinch = { t0, t1 };
+            this.hideChartTooltip();
+            e.preventDefault();
+        }, { passive: false });
+        svg.addEventListener('touchmove', e => {
+            if (!pinch || e.touches.length !== 2) return;
+            e.preventDefault();
+            const rect = svg.getBoundingClientRect();
+            const { l: pl, r: pr } = CHART_PAD;
+            const cw = Math.max(1, (rect.width || svg.clientWidth) - pl - pr);
+            const x0 = e.touches[0].clientX - rect.left - pl;
+            const x1 = e.touches[1].clientX - rect.left - pl;
+            if (Math.abs(x0 - x1) < 1) return;
+            const span = (pinch.t0 - pinch.t1) * cw / (x0 - x1);
+            if (!isFinite(span) || span <= 0) return;
+            const tMin = pinch.t0 - (x0 / cw) * span;
+            this._setChartZoom(tMin, tMin + span);
+        }, { passive: false });
+        const endPinch = e => { if (e.touches.length < 2) pinch = null; };
+        svg.addEventListener('touchend', endPinch);
+        svg.addEventListener('touchcancel', endPinch);
+
+        // One-finger drag pans along X while zoomed. A predominantly horizontal
+        // move pans (we own it — touch-action:pan-y leaves horizontal to us); a
+        // vertical move falls through to normal page scrolling. A tap still
+        // selects a point (no movement ⇒ no pan, click proceeds).
+        svg.addEventListener('touchstart', e => {
+            pan = (e.touches.length === 1 && this._chartZoom)
+                ? { x: e.touches[0].clientX, y: e.touches[0].clientY, mode: null, moved: false }
+                : null;
+        }, { passive: true });
+        svg.addEventListener('touchmove', e => {
+            if (!pan || e.touches.length !== 1) return;
+            const t = e.touches[0];
+            const dx = t.clientX - pan.x, dy = t.clientY - pan.y;
+            if (pan.mode === null) {
+                if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return;   // wait for a clear direction
+                pan.mode = Math.abs(dx) > Math.abs(dy) ? 'pan' : 'scroll';
+            }
+            if (pan.mode !== 'pan') return;        // vertical ⇒ let the page scroll
+            e.preventDefault();
+            const rect = svg.getBoundingClientRect();
+            const { l: pl, r: pr } = CHART_PAD;
+            const cw = Math.max(1, (rect.width || svg.clientWidth) - pl - pr);
+            const span = this._chartZoom.tMax - this._chartZoom.tMin;
+            this._panChartZoom(-dx / cw * span);   // drag right → reveal earlier times
+            pan.x = t.clientX; pan.y = t.clientY;  // incremental delta
+            pan.moved = true;
+            this.hideChartTooltip();
+        }, { passive: false });
+        const endPan = () => { if (pan && pan.moved) this._suppressClickBriefly(); pan = null; };
+        svg.addEventListener('touchend', endPan);
+        svg.addEventListener('touchcancel', endPan);
+
+        // Double-click anywhere on the chart resets the zoom.
+        svg.addEventListener('dblclick', e => { e.preventDefault(); this._clearChartZoom(); });
     }
 
     _xLabelStepMs(rangeMs, chartWidthPx) {
@@ -3642,14 +4138,35 @@ class MeshCoreApp {
 
         const now = this._chartFrozenAt ?? Date.now();
         const defaultWindow = 5 * 60000;
-        let tMin;
-        if (!hasAnyData) tMin = now - defaultWindow;
-        else if (isFinite(this.HASH_LIFETIME)) tMin = now - this.HASH_LIFETIME;
+        let autoTMin;
+        // The Display window defines the X axis; Auto-remove only caps it when
+        // Display is "All" (nothing older exists then).
+        if (isFinite(this.DISPLAY_LIFETIME)) autoTMin = now - this.DISPLAY_LIFETIME;
+        else if (!hasAnyData) autoTMin = now - defaultWindow;
+        else if (isFinite(this.HASH_LIFETIME)) autoTMin = now - this.HASH_LIFETIME;
         else {
-            tMin = allInPts.length ? this._earliestTime(allInPts) : Infinity;
-            if (allOutPts.length) tMin = Math.min(tMin, this._earliestTime(allOutPts));
-            if (!isFinite(tMin)) tMin = now - defaultWindow;
+            autoTMin = allInPts.length ? this._earliestTime(allInPts) : Infinity;
+            if (allOutPts.length) autoTMin = Math.min(autoTMin, this._earliestTime(allOutPts));
+            if (!isFinite(autoTMin)) autoTMin = now - defaultWindow;
         }
+        // X-axis zoom: both charts share one window so they stay aligned. The full
+        // (un-zoomed) window is [autoTMin, now]; an active zoom narrows it, clamped
+        // to the data extent. While zoomed the data fed in is only the zoom window,
+        // so it can't reveal the true extent — keep the previously measured full
+        // tMin and only let the right edge track live time, so zoom-out still works.
+        if (this._chartZoom && this._chartFullWindow) {
+            this._chartFullWindow = { tMin: this._chartFullWindow.tMin, tMax: now };
+        } else {
+            this._chartFullWindow = { tMin: autoTMin, tMax: now };
+        }
+        const full = this._chartFullWindow;
+        let tMin = full.tMin, tMax = full.tMax;
+        if (this._chartZoom) {
+            tMin = Math.max(full.tMin, this._chartZoom.tMin);
+            tMax = Math.min(full.tMax, this._chartZoom.tMax);
+            if (tMax - tMin < 1) { tMin = full.tMin; tMax = full.tMax; }
+        }
+        this._lastChartWindow = { tMin, tMax };
 
         let yMin, yMax, yStep;
         if (!hasAnyData) {
@@ -3664,7 +4181,7 @@ class MeshCoreApp {
         const minYStep = (yMax - yMin) / maxMajorLines;
         const adaptedStep = niceYSteps.find(s => s >= minYStep);
         if (adaptedStep && adaptedStep > yStep) yStep = adaptedStep;
-        const tRange = Math.max(1, now - tMin);
+        const tRange = Math.max(1, tMax - tMin);
         const yRange = Math.max(1e-9, yMax - yMin);
 
         const xOf = t => (pl + (t - tMin) / tRange * cw).toFixed(1);
@@ -3707,12 +4224,12 @@ class MeshCoreApp {
             : (labelStep < 60000
                 ? { hour: '2-digit', minute: '2-digit', second: '2-digit' }
                 : { hour: '2-digit', minute: '2-digit' });
-        for (let t = Math.ceil(tMin / minorStep) * minorStep; t <= now; t += minorStep) {
+        for (let t = Math.ceil(tMin / minorStep) * minorStep; t <= tMax; t += minorStep) {
             if (t % labelStep === 0) continue;
             const xp = xOf(t);
             parts.push(`<line x1="${xp}" y1="${pt}" x2="${xp}" y2="${pt + ch}" stroke="${gridMinor}" stroke-width="1"/>`);
         }
-        for (let t = Math.ceil(tMin / labelStep) * labelStep; t <= now; t += labelStep) {
+        for (let t = Math.ceil(tMin / labelStep) * labelStep; t <= tMax; t += labelStep) {
             const xp = xOf(t);
             parts.push(`<line x1="${xp}" y1="${pt}" x2="${xp}" y2="${pt + ch}" stroke="${gridMajor}" stroke-width="1"/>`);
             const lbl = new Date(t).toLocaleString('en-GB', fmtOpts).replace(',', '');
@@ -3723,6 +4240,13 @@ class MeshCoreApp {
         parts.push(`<line x1="${pl}" y1="${pt}" x2="${pl}" y2="${pt + ch}" stroke="${gridAxis}" stroke-width="1"/>`);
         parts.push(`<line x1="${pl}" y1="${pt + ch}" x2="${pl + cw}" y2="${pt + ch}" stroke="${gridAxis}" stroke-width="1"/>`);
 
+        // Clip the data layer (noise floor, lines, dots, stars) to the plot rect so
+        // that when zoomed in, points outside the X window don't spill over the
+        // axes/labels. Grid, axes and labels stay outside the clip.
+        const clipId = `chartClip-${type}`;
+        parts.push(`<defs><clipPath id="${clipId}"><rect x="${pl}" y="${pt}" width="${cw}" height="${ch}"/></clipPath></defs>`);
+        parts.push(`<g clip-path="url(#${clipId})">`);
+
         // Noise floor area (RSSI chart only) — drawn behind repeater lines/dots
         if (type === 'rssi' && hasData) {
             const sorted = [...pts].filter(p => p.rssi != null && p.snr != null).sort((a, b) => a.time - b.time);
@@ -3730,10 +4254,10 @@ class MeshCoreApp {
                 const bottom = (pt + ch).toFixed(1);
                 const lastP = sorted[sorted.length - 1];
                 const nfPts = sorted.map(p => `${xOf(p.time)},${yOf(p.rssi - p.snr)}`);
-                nfPts.push(`${xOf(now)},${yOf(lastP.rssi - lastP.snr)}`);
+                nfPts.push(`${xOf(tMax)},${yOf(lastP.rssi - lastP.snr)}`);
                 const topEdge = nfPts.join(' ');
                 const firstX = xOf(sorted[0].time);
-                const lastX  = xOf(now);
+                const lastX  = xOf(tMax);
                 parts.push(
                     `<polygon points="${topEdge} ${lastX},${bottom} ${firstX},${bottom}" ` +
                     `fill="rgba(140,140,140,0.15)"/>`,
@@ -3754,7 +4278,7 @@ class MeshCoreApp {
         const decimGroups = new Map();
         for (const [col, colPts] of groups) {
             colPts.sort((a, b) => a.time - b.time);
-            decimGroups.set(col, this._decimateChartPts(colPts, tMin, now, cw, type));
+            decimGroups.set(col, this._decimateChartPts(colPts, tMin, tMax, cw, type));
         }
 
         for (const [col, dPts] of decimGroups) {
@@ -3813,6 +4337,8 @@ class MeshCoreApp {
             }
         }
 
+        parts.push(`</g>`);   // close the clipped data layer
+
         if (!hasData) {
             const msg = noneSelected ? 'Select Incoming or Outgoing above' : 'Waiting for data…';
             parts.push(`<text x="${(pl + cw / 2).toFixed(1)}" y="${(pt + ch / 2).toFixed(1)}" text-anchor="middle" font-size="11" fill="${labelFill}">${msg}</text>`);
@@ -3839,27 +4365,54 @@ class MeshCoreApp {
     }
 
     _decimateChartPts(colPts, tMin, tMax, pixelWidth, type) {
-        const buckets = Math.max(1, Math.floor(pixelWidth));
-        if (colPts.length <= buckets * 2) return colPts;
-        const span = Math.max(1, tMax - tMin);
-        const bucketMs = span / buckets;
+        // Cluster into one column per ~5 px of chart width. tMin..tMax is the
+        // (possibly zoomed) visible window, so the time each column spans shrinks
+        // automatically as you zoom in — revealing finer detail at the same
+        // on-screen density. Each column keeps its min- and max-value point.
+        //
+        // colPts is sorted by time. When zoomed in, also keep the nearest point
+        // just OUTSIDE each edge so the connecting line is drawn across the plot
+        // border (the SVG clip trims the overshoot) instead of stopping at the
+        // last visible point and leaving a gap at the sides.
+        const CLUSTER_PX = 5;
+        const buckets = Math.max(1, Math.round(pixelWidth / CLUSTER_PX));
         const valOf = p => type === 'rssi' ? p.rssi : p.snr;
-        const bkts = new Array(buckets);
+
+        let leftN = null, rightN = null;
+        const inWin = [];
         for (const p of colPts) {
-            const i = Math.min(buckets - 1, Math.floor((p.time - tMin) / bucketMs));
-            if (!bkts[i]) { bkts[i] = { min: p, max: p }; }
-            else {
-                if (valOf(p) < valOf(bkts[i].min)) bkts[i].min = p;
-                if (valOf(p) > valOf(bkts[i].max)) bkts[i].max = p;
+            if (p.time < tMin) leftN = p;                 // sorted ⇒ last one < tMin
+            else if (p.time > tMax) { rightN = p; break; } // first one > tMax
+            else inWin.push(p);
+        }
+
+        let body = inWin;
+        if (inWin.length > buckets * 2) {
+            const span = Math.max(1, tMax - tMin);
+            const bucketMs = span / buckets;
+            const bkts = new Array(buckets);
+            for (const p of inWin) {
+                const i = Math.min(buckets - 1, Math.max(0, Math.floor((p.time - tMin) / bucketMs)));
+                if (!bkts[i]) { bkts[i] = { min: p, max: p }; }
+                else {
+                    if (valOf(p) < valOf(bkts[i].min)) bkts[i].min = p;
+                    if (valOf(p) > valOf(bkts[i].max)) bkts[i].max = p;
+                }
             }
+            body = [];
+            for (const b of bkts) {
+                if (!b) continue;
+                body.push(b.min);
+                if (b.max !== b.min) body.push(b.max);
+            }
+            body.sort((a, b) => a.time - b.time);
         }
-        const result = [];
-        for (const b of bkts) {
-            if (!b) continue;
-            result.push(b.min);
-            if (b.max !== b.min) result.push(b.max);
-        }
-        return result.sort((a, b) => a.time - b.time);
+        if (!leftN && !rightN) return body;
+        const out = [];
+        if (leftN) out.push(leftN);
+        out.push(...body);
+        if (rightN) out.push(rightN);
+        return out;
     }
 
     showChartTooltip(e, type, pin = false) {
@@ -3882,18 +4435,13 @@ class MeshCoreApp {
         const cw = W - pl - pr;
         const ch = H - pt - pb;
 
+        // Use the exact window the chart was last rendered with, so hit-testing
+        // stays aligned with the dots even when the X axis is zoomed.
         const now = this._chartFrozenAt ?? Date.now();
-        let tMin;
-        if (isFinite(this.HASH_LIFETIME)) tMin = now - this.HASH_LIFETIME;
-        else {
-            const allIn  = type === 'snr' ? this._visibleChartPoints()  : incomingPts;
-            const allOut = type === 'snr' ? this._visibleSentSnrPts()   : [];
-            tMin = allIn.length  ? this._earliestTime(allIn)  : Infinity;
-            if (allOut.length) tMin = Math.min(tMin, this._earliestTime(allOut));
-            if (!isFinite(tMin)) tMin = now - 5 * 60000;
-        }
+        const win = this._lastChartWindow ?? { tMin: now - 5 * 60000, tMax: now };
+        const tMin = win.tMin, tMax = win.tMax;
         const { yMin, yMax } = this._chartYBounds(type);
-        const tRange = Math.max(1, now - tMin);
+        const tRange = Math.max(1, tMax - tMin);
         const yRange = Math.max(1e-9, yMax - yMin);
 
         const xOf = t => pl + (t - tMin) / tRange * cw;
@@ -3973,20 +4521,829 @@ class MeshCoreApp {
         this.cleanupInterval = setInterval(() => this.cleanup(), 10000);
     }
 
+    // --- Durable storage: write-through, startup replay, downsampled views ---
+
+    // How much recent history to keep materialised in RAM. Never more than the
+    // retention bound; otherwise the larger of the display window and the render
+    // budget, so Display changes within the budget need no disk round-trip.
+    _ramWindowMs() {
+        // Until the store finishes opening there is no disk to fall back to,
+        // so keep everything that should be visible in RAM (bounded by
+        // retention, else the display window, else unbounded). Once ready,
+        // RAM is bounded by the render budget.
+        if (!this._storeReady) {
+            if (isFinite(this.HASH_LIFETIME)) return this.HASH_LIFETIME;
+            if (isFinite(this.DISPLAY_LIFETIME)) return this.DISPLAY_LIFETIME;
+            return Infinity;
+        }
+        const ret  = isFinite(this.HASH_LIFETIME) ? this.HASH_LIFETIME : Infinity;
+        const disp = isFinite(this.DISPLAY_LIFETIME) ? this.DISPLAY_LIFETIME : 0;
+        return Math.min(Math.max(disp, this.RENDER_BUDGET_MS), ret);
+    }
+
+    // Decide which database this tab uses. Data is isolated per browser tab so
+    // two tabs capturing different devices never share a store (#5). Whenever
+    // previous captured data would be brought back — a normal launch, a manual
+    // reload, or an Android renderer-crash rebuild — the user is asked whether to
+    // resume it or start fresh; nothing old is ever shown unannounced. Only an
+    // empty session is continued silently (there's nothing to lose).
+    async _chooseSession() {
+        const mk = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        const setTab = id => { try { sessionStorage.setItem('mc_tab', id); } catch (_) {} this._tabId = id; return 'meshcore-capture-' + id; };
+
+        // The session this tab would continue: the just-crashed one on an Android
+        // renderer rebuild (?recover=1, via mc_last_tab), otherwise the within-tab
+        // reload's id (sessionStorage survives a reload).
+        const isRecover = !!new URLSearchParams(location.search).get('recover');
+        let cur = null;
+        if (isRecover) {
+            try {
+                const last = JSON.parse(localStorage.getItem('mc_last_tab') || 'null');
+                if (last && Date.now() - last.beat < 120000) cur = last.id;
+            } catch (_) {}
+        }
+        if (!cur) { try { cur = sessionStorage.getItem('mc_tab'); } catch (_) {} }
+
+        // Never bring back old data without asking — on a manual reload OR a
+        // crash rebuild. If the continued session holds data, ask whether to
+        // resume it or start fresh (declining discards it). An empty session is
+        // resumed silently (nothing to lose).
+        if (cur) {
+            const e = this._readReg()[cur];
+            if (e && e.count > 0) {
+                const when = new Date(e.beat).toLocaleString();
+                if (confirm(`Load previously captured data?\n\n${e.count} packets received, last seen ${when}.`)) {
+                    return setTab(cur);
+                }
+                this._deleteSession(cur);     // declined → discard and start fresh
+                return setTab(mk());
+            }
+            return setTab(cur);   // empty session → just keep it
+        }
+
+        // Normal launch: offer to resume the most recent closed session with data.
+        // On Android there is only ever one WebView, so any other session is
+        // closed; in a browser a recently-beating entry may be a live tab, so
+        // require it to be quiet for a while before treating it as resumable.
+        const isAndroid = !!(window.AndroidFiles || window.AndroidScreen || window.AndroidBle);
+        const LIVE = isAndroid ? 3000 : 60000;
+        const reg = this._readReg();
+        const now = Date.now();
+        const candidates = Object.entries(reg)
+            .filter(([, e]) => e && e.count > 0 && now - e.beat > LIVE)
+            .sort((a, b) => b[1].beat - a[1].beat);
+        if (candidates.length) {
+            const [id, e] = candidates[0];
+            const when = new Date(e.beat).toLocaleString();
+            if (confirm(`Load previously captured data?\n\n${e.count} packets received, last seen ${when}.`)) {
+                for (const [oid] of candidates.slice(1)) this._deleteSession(oid);  // drop the rest
+                return setTab(id);
+            }
+            for (const [oid] of candidates) this._deleteSession(oid);  // declined → discard all
+        }
+        this._gcStaleSessions();
+        return setTab(mk());
+    }
+
+    _readReg() { try { return JSON.parse(localStorage.getItem('mc_db_reg') || '{}'); } catch (_) { return {}; } }
+    _writeReg(reg) { try { localStorage.setItem('mc_db_reg', JSON.stringify(reg)); } catch (_) {} }
+
+    _deleteSession(id) {
+        try { indexedDB.deleteDatabase('meshcore-capture-' + id); } catch (_) {}
+        const reg = this._readReg(); delete reg[id]; this._writeReg(reg);
+    }
+
+    // Mark this session alive and record its packet count, so a later launch can
+    // offer to resume it. Also drops databases left by closed empty sessions.
+    _startDbHeartbeat() {
+        const beat = () => {
+            try {
+                localStorage.setItem('mc_last_tab', JSON.stringify({ id: this._tabId, beat: Date.now() }));
+                const reg = this._readReg();
+                reg[this._tabId] = { beat: Date.now(), count: this.totalRxCount || 0 };
+                this._writeReg(reg);
+            } catch (_) {}
+        };
+        beat();
+        setInterval(beat, 15000);   // runs for the app's lifetime
+    }
+
+    // Garbage-collect databases of closed sessions that hold no data (stale and
+    // empty). Sessions that hold data are handled by the resume prompt instead.
+    _gcStaleSessions() {
+        const reg = this._readReg();
+        const now = Date.now(), STALE = 10 * 60 * 1000;
+        let changed = false;
+        for (const [id, e] of Object.entries(reg)) {
+            if (id === this._tabId) continue;
+            if (!e || (!e.count && now - (e.beat || 0) > STALE)) {
+                try { indexedDB.deleteDatabase('meshcore-capture-' + id); } catch (_) {}
+                delete reg[id]; changed = true;
+            }
+        }
+        if (changed) this._writeReg(reg);
+    }
+
+    async _initStore() {
+        const ok = await this.store.open(await this._chooseSession());
+        if (!ok) {
+            // IndexedDB is a hard requirement (available everywhere, including
+            // private modes) — a failed open means a broken browser profile or
+            // disabled site storage. Say so loudly rather than degrade silently;
+            // _storeReady stays false (the app keeps its pre-storage startup
+            // behaviour) and _storeDead stops the write buffers from growing
+            // unbounded (nothing would ever drain them).
+            this._storeDead = true;
+            this._obsWriteBuf = [];
+            this._sentWriteBuf = [];
+            this._hashWriteBuf = [];
+            alert('Storage error: the browser refused to open IndexedDB, so captured data cannot be saved or paged.\n\n'
+                + (this.store.lastError?.message ?? 'Unknown cause')
+                + '\n\nCheck that site data/storage is not blocked for this site.');
+            return;
+        }
+        this._storeReady = true;
+        this._startDbHeartbeat();
+        this.store.onQuotaExceeded = () => this._onStorageQuota();
+        try {
+            const totals = await this.store.getKV('totals');
+            if (totals && Number.isFinite(totals.totalRxCount)) this.totalRxCount = totals.totalRxCount;
+        } catch (_) {}
+        // Restore persisted contacts (names, GPS, types) so the repeater map
+        // markers and column names survive a reload / renderer-crash rebuild.
+        try {
+            const saved = await this.store.getKV('contacts');
+            if (saved && Array.isArray(saved.entries)) {
+                for (const c of saved.entries) if (c?.pubKeyFullHex) this._contacts.set(c.pubKeyFullHex, c);
+                if (Number.isFinite(saved.lastmod)) this._contactsLastmod = saved.lastmod;
+                this._updateContactsCount();
+            }
+        } catch (_) {}
+        await this._replayWindow();
+        this._scheduleChartRender();
+        this._renderMsgTable();
+        this._renderRepTable();
+        this._updateStats();
+        this._updateMapPins();   // contacts restored above ⇒ show repeater markers
+        this._refreshWideView();
+        // No periodic wide-view tick: charts, map and table page 0 are all kept
+        // current in RAM (bucket/cell upserts + the live row tail); writes flush
+        // themselves via _scheduleWriteFlush. Disk is only read on view changes.
+    }
+
+    // Rebuild the in-RAM render window from disk by replaying the most recent
+    // observations through the normal ingest path, so columns / collision state
+    // reconstruct identically. Used on startup and after a renderer-crash reload.
+    async _replayWindow() {
+        const w = this._ramWindowMs();
+        const from = isFinite(w) ? Date.now() - w : -Infinity;
+        const obsList = [];
+        await this.store.eachObs(from, Infinity, r => { obsList.push(r); });
+        if (obsList.length) {
+            const hashMeta = new Map();
+            for (const h of new Set(obsList.map(o => o.hash))) {
+                const rec = await this.store.getHash(h);
+                if (rec) hashMeta.set(h, rec);
+            }
+            const savedTotal = this.totalRxCount, savedUnsaved = this._unsavedRxCount;
+            for (const o of obsList) {
+                const hm = hashMeta.get(o.hash) ?? {};
+                this._ingestPacket(o.hash, o.rawId, hm.type ?? null, o.rawHex ?? hm.rawHex ?? null,
+                    o.snr ?? null, o.rssi ?? null, hm.meta ?? {}, null,
+                    { importing: true, replaying: true, timestamp: o.time,
+                      lat: o.lat ?? undefined, lon: o.lon ?? undefined, remoteSnr: o.remoteSnr });
+            }
+            // Counters are authoritative from kv, not from the (windowed) replay.
+            this.totalRxCount = savedTotal; this._unsavedRxCount = savedUnsaved;
+        }
+        await this.store.eachSent(from, Infinity, r => {
+            this._sentSnrHistory.push({ time: r.time, snr: r.snr, col: r.rawId, label: r.label, lat: r.lat ?? null, lon: r.lon ?? null });
+        });
+    }
+
+    // Write-through: buffer an observation (and, for a new hash, its
+    // path-invariant payload) and schedule a debounced flush to disk.
+    _ingestToStore(o, isNewHash) {
+        if (this._storeDead) return;
+        this._obsWriteBuf.push({
+            time: o.now, hash: o.hash, rawId: o.repeater, rawHex: o.rawHex ?? null,
+            snr: o.snr ?? null, rssi: o.rssi ?? null,
+            lat: o.loc?.lat ?? null, lon: o.loc?.lon ?? null,
+            ...(o.remoteSnr != null ? { remoteSnr: o.remoteSnr } : {}),
+        });
+        if (isNewHash) {
+            // Buffered like obs (flushed in one batched transaction) — an
+            // immediate per-hash write would cost one transaction per new hash.
+            this._hashWriteBuf.push({ hash: o.hash, firstSeen: o.now, type: o.type ?? null, meta: o.meta ?? null });
+        }
+        this._scheduleWriteFlush();
+    }
+
+    _scheduleWriteFlush() {
+        if (this._writeFlushTimer || this._storeDead) return;
+        this._writeFlushTimer = setTimeout(() => {
+            this._writeFlushTimer = null;
+            if (!this._storeReady) {
+                // DB not open yet (startup): keep buffering and retry. If the
+                // open failed, _initStore sets _storeDead and clears buffers.
+                if (!this._storeDead && (this._obsWriteBuf.length || this._sentWriteBuf.length || this._hashWriteBuf.length)) this._scheduleWriteFlush();
+                return;
+            }
+            const obs  = this._obsWriteBuf;  this._obsWriteBuf  = [];
+            const sent = this._sentWriteBuf; this._sentWriteBuf = [];
+            const hs   = this._hashWriteBuf; this._hashWriteBuf = [];
+            if (hs.length)   this.store.putHashes(hs);   // before obs: readers join obs → hashes
+            if (obs.length)  this.store.putObs(obs);
+            if (sent.length) this.store.putSent(sent);
+            if (obs.length || sent.length || hs.length) this._dataVer++;
+            this.store.setKV('totals', { totalRxCount: this.totalRxCount });
+        }, this.WRITE_FLUSH_MS);
+    }
+
+    _onStorageQuota() {
+        // Disk full: keep the newest history by trimming the oldest on disk down
+        // to the render budget. The session keeps running on its RAM window.
+        if (this._quotaPruning || !this._storeReady) return;
+        this._quotaPruning = true;
+        this.store.pruneOlderThan(Date.now() - this.RENDER_BUDGET_MS)
+            .then(n => this._afterDiskPrune(n))
+            .finally(() => { this._quotaPruning = false; });
+    }
+
+    // Resolve a rawId to an existing column WITHOUT mutating the column model
+    // (used to colour downsampled overlay points; live ingest uses
+    // findOrCreateColumn, which may promote/merge).
+    _resolveColReadonly(rawId) {
+        if (rawId === 'direct' || rawId === 'unknown') return rawId;
+        if (this.repeaterColumns.includes(rawId)) return rawId;
+        for (const col of this.repeaterColumns) {
+            if (col === 'direct' || col === 'unknown') continue;
+            const head = col.split('/')[0];
+            const p = Math.min(this.idPrecision(rawId), this.idPrecision(head));
+            if (this.idSuffix(head, p) === this.idSuffix(rawId, p)) return col;
+        }
+        return rawId;
+    }
+
+    // (Re)build the disk render caches (chart overlay, map grid, paginated table)
+    // for the current Display window. Called on Display-window change. Pre-ready
+    // the caches stay empty and the views render from the RAM tail alone (same
+    // code path, no separate branch).
+    async _refreshWideView() {
+        if (!this._storeReady) return;
+        this._lastMapView = null;       // new window → start from full extent
+        this._wideMapBase = null;       // window changed → recompute the base layer
+        this._wideMapDetail = null;
+        this._wideMapKey = null;
+        this._chartBase = null;         // window changed → rebuild the bucket cache
+        this._chartZoomLayer = null;
+        await this._flushWrites();
+        const boundary = Date.now();    // set _renderCacheAt only after caches land
+        try {
+            await Promise.all([
+                this._refreshWideMap(),       // spatial downsample for the 3D map
+                this._loadTablePage(0, true), // paginate the packet table over disk
+                this._rebuildChartBase(),     // time-bucket cache for the 2D charts
+            ]);
+            this._renderCacheAt = boundary;
+        } catch (e) {
+            console.warn('Wide-view rebuild failed:', e);
+        }
+    }
+
+    // --- 2D-chart bucket cache -------------------------------------------
+    // Same model as the 3D map's cell cache: an in-RAM Map of time buckets
+    // (key `rawId|bIdx`), kept current by folding each live packet into its bucket
+    // (_upsertChartCell). Time buckets expire exactly — a bucket covers a fixed
+    // time range, so once its end leaves a finite Display window it is provably
+    // empty and is dropped. Disk is read only to BUILD a layer:
+    //   - base:  once per Display window (and a growth escape valve for "All"),
+    //   - zoom:  on zoom-in / zoom-window change (finer buckets over the window).
+    // Zooming OUT needs no disk at all — the base stays maintained by upserts.
+
+    async _rebuildChartBase() {
+        if (!this._storeReady) return;
+        const from = isFinite(this.DISPLAY_LIFETIME) ? Date.now() - this.DISPLAY_LIFETIME : -Infinity;
+        try {
+            const { buckets, width, lo } = await this.store.bucketObs(from, Infinity, this.DOWNSAMPLE_BUCKETS);
+            const cells = new Map();
+            for (const b of buckets) cells.set(b.rawId + '|' + b.bIdx, b);
+            this._chartBase = { cells, width, lo };
+            const sent = [];
+            await this.store.eachSent(from, Infinity, r =>
+                sent.push({ time: r.time, snr: r.snr, col: this._resolveColReadonly(r.rawId), label: r.label }));
+            this._wideSentPoints = sent;
+            this._sentChartAt = Date.now();   // live sent points after this are the tail
+            this._rebuildChartArrays();
+            this._restoreRepStatsFromBase();
+        } catch (e) {
+            console.warn('Chart base build failed:', e);
+        }
+    }
+
+    // Restore Seen Repeaters entries from the disk chart layer. The live model
+    // (allRepeaters) exists only in RAM, bounded by the RAM window (~60 min):
+    // when a repeater's points age out of it, cleanup's _rebuildAfterPrune
+    // dissolves the entry. But the Display window can be wider ("All"), where
+    // those repeaters are still in range and live on disk — so re-seed them from
+    // the (incrementally maintained, Display-window) chart cache. Runs both on a
+    // fresh base build (Display change / startup) and after every prune. Live
+    // entries are exact and win; only count/maxes are widened from disk.
+    // Restored entries are bucket aggregates (lastSeen ≈ bucket midpoint, last
+    // SNR/RSSI ≈ newest bucket's average).
+    _restoreRepStatsFromBase() {
+        const base = this._chartBase;
+        if (!base) return;
+        const agg = new Map();
+        for (const b of base.cells.values()) {
+            const col = this._resolveColReadonly(b.rawId);
+            let a = agg.get(col);
+            if (!a) {
+                a = { count: 0, lastSeen: -1, maxSnr: null, maxRssi: null,
+                      lastSnr: null, lastRssi: null, minPrecision: Infinity };
+                agg.set(col, a);
+            }
+            a.count += b.count;
+            if (b.snrMax  != null && (a.maxSnr  == null || b.snrMax  > a.maxSnr))  a.maxSnr  = b.snrMax;
+            if (b.rssiMax != null && (a.maxRssi == null || b.rssiMax > a.maxRssi)) a.maxRssi = b.rssiMax;
+            if (b.time > a.lastSeen) {
+                a.lastSeen = b.time;
+                a.lastSnr  = b.snrN  ? b.snrSum  / b.snrN  : null;
+                a.lastRssi = b.rssiN ? b.rssiSum / b.rssiN : null;
+            }
+            const prec = this.idPrecision(b.rawId);
+            if (prec < a.minPrecision) a.minPrecision = prec;
+        }
+        let changed = false;
+        for (const [col, a] of agg) {
+            const live = this.allRepeaters.get(col);
+            if (live) {
+                // Keep the exact live lastSeen/last values; widen the totals.
+                if (a.count > live.count) { live.count = a.count; changed = true; }
+                if (a.maxSnr  != null && (live.maxSnr  == null || a.maxSnr  > live.maxSnr))  { live.maxSnr  = a.maxSnr;  changed = true; }
+                if (a.maxRssi != null && (live.maxRssi == null || a.maxRssi > live.maxRssi)) { live.maxRssi = a.maxRssi; changed = true; }
+                continue;
+            }
+            if (!Number.isFinite(a.minPrecision)) a.minPrecision = this.idPrecision(col.split('/')[0]);
+            this.allRepeaters.set(col, a);
+            if (!this.repeaterColumns.includes(col)) this.repeaterColumns.push(col);
+            changed = true;
+        }
+        if (changed) {
+            this._sortColumns();
+            this._renderRepTable();
+            this._updateStats();
+        }
+    }
+
+    // Finer buckets over the (padded) zoom window, so zooming in reveals real
+    // detail instead of magnifying the base's coarse buckets. The ±1-span pad
+    // gives _decimateChartPts a neighbour point outside each edge for the
+    // edge-crossing connecting lines (the clip trims the overshoot).
+    async _rebuildChartZoomLayer() {
+        const z = this._chartZoom;
+        if (!z || !this._storeReady) return;
+        const zspan = z.tMax - z.tMin;
+        try {
+            const { buckets, width, lo } = await this.store.bucketObs(z.tMin - zspan, z.tMax + zspan, this.DOWNSAMPLE_BUCKETS);
+            const cells = new Map();
+            for (const b of buckets) cells.set(b.rawId + '|' + b.bIdx, b);
+            this._chartZoomLayer = { cells, width, lo, from: z.tMin - zspan, to: z.tMax + zspan };
+            this._rebuildChartArrays();
+        } catch (e) {
+            console.warn('Chart zoom-layer build failed:', e);
+        }
+    }
+
+    // Fold one live observation into the chart bucket layers (base always, the
+    // zoom layer when the time falls inside it).
+    _upsertChartCell(time, snr, rssi, rawId) {
+        const fold = layer => {
+            const bIdx = Math.floor((time - layer.lo) / layer.width);
+            const key = rawId + '|' + bIdx;
+            let g = layer.cells.get(key);
+            if (!g) {
+                g = { rawId, bIdx, time: layer.lo + bIdx * layer.width + Math.floor(layer.width / 2),
+                      count: 0, snrMin: null, snrMax: null, snrSum: 0, snrN: 0,
+                      rssiMin: null, rssiMax: null, rssiSum: 0, rssiN: 0 };
+                layer.cells.set(key, g);
+            }
+            g.count++;
+            if (snr != null) {
+                g.snrSum += snr; g.snrN++;
+                if (g.snrMin == null || snr < g.snrMin) g.snrMin = snr;
+                if (g.snrMax == null || snr > g.snrMax) g.snrMax = snr;
+            }
+            if (rssi != null) {
+                g.rssiSum += rssi; g.rssiN++;
+                if (g.rssiMin == null || rssi < g.rssiMin) g.rssiMin = rssi;
+                if (g.rssiMax == null || rssi > g.rssiMax) g.rssiMax = rssi;
+            }
+            return bIdx;
+        };
+        const base = this._chartBase;
+        if (!base) return;   // built shortly by _refreshWideView; the point is on disk
+        const bIdx = fold(base);
+        // "All" keeps a fixed bucket width from its build, so a long session can
+        // outgrow the bucket budget — rebuild once with a wider bucket when the
+        // index runs 3x past it. (Finite windows slide: the index grows but the
+        // live bucket count stays ~constant via expiry, so no rebuild is needed.)
+        if (!isFinite(this.DISPLAY_LIFETIME) && bIdx > this.DOWNSAMPLE_BUCKETS * 3) {
+            this._chartBase = null;
+            this._rebuildChartBase();
+            return;
+        }
+        const zl = this._chartZoomLayer;
+        if (zl && time >= zl.from && time <= zl.to) fold(zl);
+        this._scheduleChartArrays();
+    }
+
+    _scheduleChartArrays() {
+        if (this._chartArrTimer) return;
+        this._chartArrTimer = setTimeout(() => { this._chartArrTimer = null; this._rebuildChartArrays(); }, 200);
+    }
+
+    // Derive the render array (_wideChartPoints) from the active bucket layer:
+    // avg point per bucket, plus min/max spread once a bucket holds >1 packet.
+    // Also purges base buckets that expired from a finite Display window (exact —
+    // the bucket's whole time range is past the cutoff).
+    _rebuildChartArrays() {
+        const base = this._chartBase;
+        if (!base) return;
+        const cutoff = this._displayCutoffNow();
+        if (cutoff) {
+            for (const [k, b] of base.cells) {
+                if (base.lo + (b.bIdx + 1) * base.width < cutoff) base.cells.delete(k);
+            }
+        }
+        // Use the zoom layer only while it actually covers the current zoom
+        // window — after a pan/zoom change the stale layer would be missing the
+        // newly exposed range, so fall back to the (complete, coarser) base
+        // until the rebuilt layer lands.
+        const zl = this._chartZoomLayer;
+        const z = this._chartZoom;
+        const layer = (z && zl && zl.from <= z.tMin && zl.to >= z.tMax) ? zl : base;
+        const cps = [];
+        for (const b of layer.cells.values()) {
+            const col = this._resolveColReadonly(b.rawId);
+            const snrAvg  = b.snrN  ? b.snrSum  / b.snrN  : null;
+            const rssiAvg = b.rssiN ? b.rssiSum / b.rssiN : null;
+            cps.push({ time: b.time, snr: snrAvg, rssi: rssiAvg, col, rawId: b.rawId, _bucket: true, count: b.count });
+            if (b.count > 1) {
+                if (b.snrMin != null) cps.push({ time: b.time, snr: b.snrMin, rssi: b.rssiMin, col, rawId: b.rawId, _bucket: true });
+                if (b.snrMax != null) cps.push({ time: b.time, snr: b.snrMax, rssi: b.rssiMax, col, rawId: b.rawId, _bucket: true });
+            }
+        }
+        cps.sort((a, b) => a.time - b.time);
+        this._wideChartPoints = cps;
+        this._scheduleChartRender();
+    }
+
+    // Flush buffered writes to disk immediately (so a following query sees the
+    // newest packets). Used before export and before each live wide-view refresh.
+    async _flushWrites() {
+        if (!this._storeReady) return;
+        if (this._writeFlushTimer) { clearTimeout(this._writeFlushTimer); this._writeFlushTimer = null; }
+        const dirty = this._hashWriteBuf.length || this._obsWriteBuf.length || this._sentWriteBuf.length;
+        if (this._hashWriteBuf.length) { const h = this._hashWriteBuf; this._hashWriteBuf = []; await this.store.putHashes(h); }
+        if (this._obsWriteBuf.length)  { const o = this._obsWriteBuf;  this._obsWriteBuf  = []; await this.store.putObs(o); }
+        if (this._sentWriteBuf.length) { const s = this._sentWriteBuf; this._sentWriteBuf = []; await this.store.putSent(s); }
+        if (dirty) this._dataVer++;
+    }
+
+    // The 3D map renders from an in-RAM cell cache (per-repeater spatial grid).
+    // Disk is read only to BUILD a layer — never periodically:
+    //
+    //  - BASE: a coarse grid over the FULL extent, built once per Display window
+    //    (and when the dot budget overflows). New packets upsert their cell
+    //    directly in RAM (_upsertMapCell), so the map is current without any
+    //    rescan. Because a cell's representative is its MOST RECENT observation,
+    //    expiry is exact too: when the representative leaves a finite Display
+    //    window, the whole cell is provably empty and is dropped (render-side
+    //    the rolling cutoff hides it; _pushMapPoints purges the Map).
+    //  - DETAIL: when zoomed into a sub-region, a finer grid for the visible
+    //    bbox only (cheap — Morton-indexed), rebuilt on view change. Live
+    //    packets inside the bbox upsert this layer too.
+    //
+    // Cell size is estimated up-front from extent area and a target dot budget,
+    // clamped to ~4 screen px at the current zoom; output stays bounded
+    // (≤ ~2× target) regardless of how many packets the span holds.
+
+    // Same cell key math as PacketStore.gridObs, so RAM upserts and disk-built
+    // layers agree on cell identity.
+    _mapCellKey(cellMeters, rawId, lat, lon) {
+        const latCell = cellMeters / 111320;
+        const lonCell = cellMeters / (111320 * Math.cos(lat * Math.PI / 180) || 1);
+        return rawId + '|' + Math.round(lon / lonCell) + '|' + Math.round(lat / latCell);
+    }
+
+    _mapCellsFrom(arr, cellMeters) {
+        const m = new Map();
+        for (const r of arr) m.set(this._mapCellKey(cellMeters, r.rawId, r.lat, r.lon), r);
+        return m;
+    }
+
+    // Fold one live observation into the RAM cell layers. The new point is by
+    // definition the newest in its cell, so it always becomes the representative.
+    _upsertMapCell(o) {
+        const base = this._wideMapBase;
+        if (!base) {   // layers not built yet (startup race) — apply after build
+            (this._pendingMapUpserts ??= []).length < 1000 && this._pendingMapUpserts.push(o);
+            return;
+        }
+        if (!base.cell) base.cell = 5;   // first-ever point: gridObs' minimum cell
+        const bKey = this._mapCellKey(base.cell, o.rawId, o.lat, o.lon);
+        base.cells.set(bKey, { ...o, count: (base.cells.get(bKey)?.count ?? 0) + 1 });
+        const d = this._wideMapDetail;
+        if (d && o.lat >= d.bbox.minLat && o.lat <= d.bbox.maxLat
+              && o.lon >= d.bbox.minLon && o.lon <= d.bbox.maxLon) {
+            const dKey = this._mapCellKey(d.cell, o.rawId, o.lat, o.lon);
+            d.cells.set(dKey, { ...o, count: (d.cells.get(dKey)?.count ?? 0) + 1 });
+        }
+        // Walking into new territory at the 5 m floor can blow the dot budget —
+        // rebuild the base once with a properly sized cell when it does.
+        if (base.cells.size > this.MAP_TARGET_DOTS * 3 && !this._mapRebuildBusy) {
+            this._mapRebuildBusy = true;
+            this._wideMapBase = null;
+            this._refreshWideMap(this._lastMapView?.bbox ?? null, this._lastMapView?.mpp ?? null)
+                .finally(() => { this._mapRebuildBusy = false; });
+            return;
+        }
+        this._scheduleMapPush();
+    }
+
+    // Hand the merged cell layers to the map, coalesced so a packet burst costs
+    // one geometry rebuild. Also purges cells that left a finite Display window
+    // (exact — see header comment).
+    _scheduleMapPush() {
+        if (this._mapPushTimer) return;
+        this._mapPushTimer = setTimeout(() => { this._mapPushTimer = null; this._pushMapPoints(); }, 200);
+    }
+
+    _pushMapPoints() {
+        const base = this._wideMapBase;
+        if (!base) return;
+        const cutoff = this._displayCutoffNow();
+        if (cutoff) {
+            for (const [k, p] of base.cells) if (p.time < cutoff) base.cells.delete(k);
+            const d = this._wideMapDetail;
+            if (d) for (const [k, p] of d.cells) if (p.time < cutoff) d.cells.delete(k);
+        }
+        const d = this._wideMapDetail;
+        let merged;
+        if (d) {
+            const inB = p => p.lat >= d.bbox.minLat && p.lat <= d.bbox.maxLat
+                          && p.lon >= d.bbox.minLon && p.lon <= d.bbox.maxLon;
+            merged = [...base.cells.values()].filter(p => !inB(p)).concat([...d.cells.values()]);
+        } else {
+            merged = [...base.cells.values()];
+        }
+        this.signalMap?.setHistoricalPoints?.(merged.map(r => ({
+            lat: r.lat, lon: r.lon, snr: r.snr, rssi: r.rssi, time: r.time,
+            rawId: r.rawId, col: this._resolveColReadonly(r.rawId), count: r.count,
+        })));
+    }
+
+    async _refreshWideMap(bbox = null, mpp = null) {
+        if (!this._storeReady) return;
+        const from = isFinite(this.DISPLAY_LIFETIME) ? Date.now() - this.DISPLAY_LIFETIME : -Infinity;
+        const TARGET_DOTS = this.MAP_TARGET_DOTS;
+        // sqrt(area / target) spreads ~TARGET_DOTS cells across the extent.
+        const cellFor = (minLat, maxLat, minLon, maxLon) => {
+            const midLat = (minLat + maxLat) / 2;
+            const latM = Math.max(1, (maxLat - minLat) * 111320);
+            const lonM = Math.max(1, (maxLon - minLon) * 111320 * Math.cos(midLat * Math.PI / 180));
+            return Math.max(5, Math.sqrt((latM * lonM) / TARGET_DOTS));
+        };
+        try {
+            // Outgoing (sent) SNR is low-volume and has no spatial index, so load
+            // the whole window when (re)building; live ones arrive via the sent
+            // tail in signal3d.
+            if (this._wideMapSentVer !== this._dataVer) {
+                const sentPts = [];
+                await this.store.eachSent(from, Infinity, r => {
+                    if (r.lat == null || r.lon == null) return;
+                    sentPts.push({ lat: r.lat, lon: r.lon, snr: r.snr, time: r.time,
+                                   rawId: r.rawId, col: this._resolveColReadonly(r.rawId) });
+                });
+                this.signalMap?.setHistoricalSentPoints?.(sentPts);
+                this._wideMapSentVer = this._dataVer;
+            }
+            // Build the base layer only when absent (Display change nulls it).
+            // Freshness and expiry are handled in RAM — no periodic rescan.
+            if (!this._wideMapBase) {
+                await this._flushWrites();   // the disk build must include everything buffered
+                const s = await this.store.regionStats(from, Infinity, null);
+                if (s.count) {
+                    const cell = cellFor(s.minLat, s.maxLat, s.minLon, s.maxLon);
+                    const pts = await this.store.gridObs(from, Infinity, cell, null);
+                    this._wideMapBase = { cells: this._mapCellsFrom(pts, cell), cell, at: Date.now() };
+                } else {
+                    this._wideMapBase = { cells: new Map(), cell: 0, at: Date.now() };
+                }
+                this._wideMapKey = null;
+                // Packets that arrived while there was no base yet (startup race)
+                const pend = this._pendingMapUpserts;
+                this._pendingMapUpserts = null;
+                if (pend) for (const o of pend) this._upsertMapCell(o);
+            }
+            const base = this._wideMapBase;
+            // Detail cell is derived from the view bbox itself (it IS the region
+            // whose dot density matters) — no extra disk scan needed for sizing.
+            let dCell = 0;
+            if (bbox && base.cells.size) {
+                dCell = Math.max(cellFor(bbox.minLat, bbox.maxLat, bbox.minLon, bbox.maxLon), (mpp ?? 0) * 4);
+                if (dCell >= base.cell) dCell = 0;   // would not refine — base alone suffices
+            }
+            // Skip the disk re-query when the same view is already loaded —
+            // panning around an already-loaded region costs nothing.
+            const key = dCell
+                ? `${base.at}|${Math.round(dCell)}|`
+                  + [bbox.minLat, bbox.maxLat, bbox.minLon, bbox.maxLon].map(v => Math.round(v * 1e4)).join(',')
+                : `${base.at}|base`;
+            if (key === this._wideMapKey) return;
+            if (dCell) {
+                await this._flushWrites();   // fine grid must include the freshest packets
+                const fine = await this.store.gridObs(from, Infinity, dCell, bbox);
+                this._wideMapDetail = { cells: this._mapCellsFrom(fine, dCell), cell: dCell, bbox };
+            } else {
+                this._wideMapDetail = null;
+            }
+            this._pushMapPoints();
+            this._wideMapKey = key;
+        } catch (e) {
+            console.warn('Wide-map load failed:', e);
+        }
+    }
+
+    // --- Packet table pagination over disk history (wide / "All" view) ---
+
+    // The current disk page snapshot. Callers fall back to live hashData for
+    // tail rows (packets newer than the snapshot) via `?? this.hashData.get(h)`.
+    _tableSource() {
+        return this._tablePageData;
+    }
+
+    // Build one page of the table from disk: the newest `_tablePageSize` hashes
+    // (by firstSeen) and all their observations, assembled into hashData-shaped
+    // entries so _renderMsgTable can render them unchanged.
+    // The column predicate that narrows which packets the table shows, or null
+    // when it shows everything. A repeater SELECTION (single column) takes
+    // precedence over a filter, since selection always hides rows lacking that
+    // exact repeater — even within an active filter. Drives both the paged hash
+    // index and the page-0 live-tail skip so narrowed pages are never padded
+    // with hidden rows.
+    _tableNarrowFn() {
+        if (this._selectedCol) { const s = this._selectedCol; return c => c === s; }
+        if (this._repFilterTerms.length) return c => this._colMatchesRepFilter(c);
+        return null;
+    }
+    _tableNarrowKey() {
+        if (this._selectedCol) return 's:' + this._selectedCol;
+        if (this._repFilterTerms.length) return 'f:' + this._repFilterTerms.join('\x1f');
+        return '';
+    }
+
+    // Repaginate the table from page 0 when the narrowing (filter or selection)
+    // changed. Called from both the filter and the selection paths.
+    _repaginateIfNarrowChanged() {
+        const key = this._tableNarrowKey();
+        if (key === this._tableNarrowKeyApplied) return;
+        this._tableNarrowKeyApplied = key;
+        if (this._storeReady) this._loadTablePage(0, true);
+        // Pre-ready there is no pager yet, but the live tail still skips
+        // narrowed-out rows — re-render so widening brings them back into the DOM.
+        else this._renderMsgTable();
+    }
+
+    async _loadTablePage(page, reset = false) {
+        if (!this._storeReady) return;
+        await this._flushWrites();   // the page must include still-buffered packets
+        const boundary = Date.now(); // snapshot covers disk up to here (tail base)
+        if (reset) {
+            this._tablePage = 0;
+            // The underlying data may have changed (replay/import/prune/narrow
+            // change) — any narrow index is stale.
+            this._tableNarrowHashes = this._tableNarrowSet = null;
+        }
+        const size = this._tablePageSize;
+        // The table respects the Display window: pages cover only packets first
+        // seen inside it (the firstSeen index makes that a range scan).
+        const winFrom = this._displayCutoffNow() || undefined;
+        // Authoritative count from disk; between loads it is maintained in RAM
+        // (incremented per new hash at ingest) so the pager needs no disk reads.
+        this._tableHashCount = await this.store.countHashes(winFrom);
+        this._tableNarrowKeyApplied = this._tableNarrowKey();
+        const narrowed = this._tableNarrowFn() != null;
+        if (narrowed && !this._tableNarrowHashes) await this._buildTableNarrowIndex();
+        if (!narrowed) this._tableNarrowHashes = this._tableNarrowSet = null;
+        const total = narrowed ? this._tableNarrowHashes.length : this._tableHashCount;
+        this._tablePageCount = Math.max(1, Math.ceil(total / size));
+        this._tablePage = Math.min(Math.max(0, page), this._tablePageCount - 1);
+        const hashes = narrowed
+            ? await this.store.getHashes(this._tableNarrowHashes.slice(this._tablePage * size, (this._tablePage + 1) * size))
+            : await this.store.pageHashes(this._tablePage * size, size, winFrom);
+        const map = new Map();
+        for (const h of hashes) {
+            const obs = await this.store.obsForHash(h.hash);
+            if (!obs.length) continue;
+            const repeaters = new Map();
+            let firstSeen = h.firstSeen ?? Infinity, lastSeen = 0;
+            for (const o of obs) {
+                const col = this._resolveColReadonly(o.rawId);
+                const rep = { snr: o.snr, rssi: o.rssi, rawHex: o.rawHex, rawId: o.rawId,
+                              time: o.time, lat: o.lat, lon: o.lon, remoteSnr: o.remoteSnr, packet: null };
+                // Keep the strongest-RSSI observation per column (matches live merge intent).
+                const prev = repeaters.get(col);
+                if (!prev || (rep.rssi != null && (prev.rssi == null || rep.rssi > prev.rssi))) repeaters.set(col, rep);
+                if (o.time < firstSeen) firstSeen = o.time;
+                if (o.time > lastSeen)  lastSeen  = o.time;
+            }
+            map.set(h.hash, { repeaters, firstSeen, lastSeen, type: h.type, meta: h.meta,
+                              rawHex: obs[0].rawHex, packet: null, _stub: false });
+        }
+        this._tablePageData = map;
+        this._renderCacheAt = boundary;   // rows newer than this are the live tail
+        this._renderMsgTable();
+        this._refreshTablePager();
+    }
+
+    // Build the narrowed hash index: every hash with at least one observation
+    // from a matching repeater, newest-first by the time that repeater first
+    // heard it. One chunked scan over the obs store; the rawId → matches
+    // projection is memoised since rawIds repeat heavily.
+    async _buildTableNarrowIndex() {
+        const narrowFn = this._tableNarrowFn();
+        const matchByRawId = new Map();
+        const firstHeard = new Map();   // hash -> earliest matching obs time
+        // Scan only the Display window — the pager shows nothing older anyway.
+        await this.store.eachObs(this._displayCutoffNow() || -Infinity, Infinity, o => {
+            let ok = matchByRawId.get(o.rawId);
+            if (ok === undefined) {
+                ok = narrowFn(this._resolveColReadonly(o.rawId));
+                matchByRawId.set(o.rawId, ok);
+            }
+            // eachObs iterates ascending time, so the first sighting is the earliest.
+            if (ok && !firstHeard.has(o.hash)) firstHeard.set(o.hash, o.time);
+        });
+        this._tableNarrowHashes = [...firstHeard.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .map(([h]) => h);
+        this._tableNarrowSet = new Set(this._tableNarrowHashes);
+        this._tableNarrowIndexKey = this._tableNarrowKey();
+    }
+
+    // Insert / update / remove the prev-next pager beneath the packet table.
+    _refreshTablePager() {
+        const scroll = this.msgTableHead?.closest('.msg-table-scroll');
+        if (!scroll) return;
+        let pager = document.getElementById('msgTablePager');
+        // Only show the pager when there is more than one page — a single page
+        // (the common live case) reads like the old scrollable table.
+        const showPager = this._tablePageCount > 1;
+        if (!showPager) { pager?.remove(); return; }
+        if (!pager) {
+            pager = document.createElement('div');
+            pager.id = 'msgTablePager';
+            pager.className = 'msg-table-pager';
+            pager.innerHTML = '<button id="msgPagePrev" class="pager-btn">‹ Newer</button>'
+                + '<span id="msgPageInfo" class="pager-info"></span>'
+                + '<button id="msgPageNext" class="pager-btn">Older ›</button>';
+            scroll.parentNode.insertBefore(pager, scroll.nextSibling);
+            pager.querySelector('#msgPagePrev').addEventListener('click', () => this._loadTablePage(this._tablePage - 1));
+            pager.querySelector('#msgPageNext').addEventListener('click', () => this._loadTablePage(this._tablePage + 1));
+        }
+        const narrowTag = this._tableNarrowHashes
+            ? (this._selectedCol ? ' (selected)' : ' (filtered)') : '';
+        pager.querySelector('#msgPageInfo').textContent =
+            `Page ${this._tablePage + 1} / ${this._tablePageCount}${narrowTag}`;
+        pager.querySelector('#msgPagePrev').disabled = this._tablePage <= 0;
+        pager.querySelector('#msgPageNext').disabled = this._tablePage >= this._tablePageCount - 1;
+    }
+
     cleanup() {
         const now = Date.now();
+        // RAM is bounded by the render budget (and never exceeds retention).
+        // Disk keeps full history when Auto-remove is "Never"; when it is finite,
+        // history is truly deleted from disk too.
+        if (isFinite(this.HASH_LIFETIME) && this._storeReady) {
+            this.store.pruneOlderThan(now - this.HASH_LIFETIME)
+                .then(n => this._afterDiskPrune(n));
+        }
+        const lifetime = this._ramWindowMs();
         const toRemove = [];
         for (const [hash, data] of this.hashData.entries()) {
-            if (now - data.lastSeen > this.HASH_LIFETIME) toRemove.push(hash);
+            if (now - data.lastSeen > lifetime) toRemove.push(hash);
         }
 
         if (!toRemove.length) {
-            // No hashData expired, but chartPoints may still need pruning
-            if (isFinite(this.HASH_LIFETIME)) {
-                const cutoff = now - this.HASH_LIFETIME;
+            // No hashData expired, but chartPoints / map points may still need pruning
+            if (isFinite(lifetime)) {
+                const cutoff = now - lifetime;
                 const before = this.chartPoints.length;
                 this.chartPoints = this.chartPoints.filter(p => p.time >= cutoff);
                 this._sentSnrHistory = this._sentSnrHistory.filter(p => p.time >= cutoff);
+                this.signalMap?.purgeOlderThan(cutoff);
                 if (this.chartPoints.length !== before) this._rebuildAfterPrune();
             }
             const prev = this.repeaterColumns.join('|');
@@ -4001,12 +5358,12 @@ class MeshCoreApp {
         }
 
         setTimeout(() => {
-            const cutoff = Date.now() - this.HASH_LIFETIME;
+            const cutoff = Date.now() - lifetime;
             for (const hash of toRemove) {
                 const data = this.hashData.get(hash);
                 if (data && data.lastSeen <= cutoff) this.hashData.delete(hash);
             }
-            if (isFinite(this.HASH_LIFETIME)) {
+            if (isFinite(lifetime)) {
                 this.chartPoints = this.chartPoints.filter(p => p.time >= cutoff);
                 this._sentSnrHistory = this._sentSnrHistory.filter(p => p.time >= cutoff);
             }
@@ -4096,17 +5453,59 @@ class MeshCoreApp {
         for (const col of [...this.repeaterColumns]) {
             this._recomputeRepeaterStats(col);
         }
+
+        // Column keys changed (demotions/dissolves) — re-derive the chart render
+        // array so its cached col fields match the new column model.
+        this._scheduleChartArrays();
+
+        // Step 3 above deleted every repeater whose points aged out of the RAM
+        // window — but with a Display window wider than that window (e.g. "All"),
+        // those repeaters are still in range and live on disk. Re-seed them from
+        // the disk chart cache so Seen Repeaters / the stats count keep showing
+        // the whole Display window, not just the recent RAM tail. (This was the
+        // cause of "only 3 repeaters until I toggled Display": the restore ran
+        // only on a Display change, never after a routine prune.)
+        this._restoreRepStatsFromBase();
     }
 
     _clearAllData() {
         this.hashData.clear();
         this.chartPoints = [];
         this._sentSnrHistory = [];
+        this._wideChartPoints = [];
+        this._wideSentPoints = [];
+        this._chartBase = null;
+        this._chartZoomLayer = null;
+        this._sentChartAt = 0;
+        clearTimeout(this._chartArrTimer); this._chartArrTimer = null;
+        this._tablePageData = new Map();
+        this._tablePage = 0;
+        this._tablePageCount = 1;
+        this._tableNarrowHashes = this._tableNarrowSet = null;
+        this._tableNarrowKeyApplied = this._tableNarrowIndexKey = '';
+        this._renderCacheAt = 0;
+        this._wideMapBase = null;
+        this._wideMapDetail = null;
+        this._wideMapKey = null;
+        this._wideMapSentVer = -1;
+        this._pendingMapUpserts = null;
+        clearTimeout(this._mapPushTimer); this._mapPushTimer = null;
+        this._lastMapView = null;
+        this._obsWriteBuf = [];
+        this._sentWriteBuf = [];
+        this._hashWriteBuf = [];
+        this.totalRxCount = 0;
+        this.store?.clearAll();
         this._dscSeq = 0;
         this.repeaterColumns = [];
         this.allRepeaters.clear();
         this._selectedCol = null;
         this._mapPins.clear();
+        // Contacts are data too — wipe them from RAM now and cancel any pending
+        // persist so it can't re-write them after store.clearAll() empties the DB.
+        this._contacts.clear();
+        this._contactsLastmod = 0;
+        clearTimeout(this._contactsPersistTimer);
         this.signalMap?.selectColumn(null);
         this.signalMap?.clearPoints?.();
         if (this.msgTableBody) this.msgTableBody.innerHTML = '';
@@ -4115,7 +5514,33 @@ class MeshCoreApp {
         this._scheduleChartRender();
         this._renderRepTable();
         this._updateStats();
+        this._updateContactsCount();
+        this._updateMapPins();
         if (this.emptyState) this.emptyState.classList.remove('hidden');
+        // Re-create the (now empty) chart/map cache layers so live upserts have
+        // somewhere to land — nothing else rebuilds them outside Display changes.
+        this._refreshWideView();
+    }
+
+    // A disk prune deleted `deletedHashes` hash records — keep the RAM-maintained
+    // pager count in sync immediately (it is otherwise only incremented at ingest
+    // and recounted on page loads). If the current page fell off the end, load
+    // the new last page so the snapshot matches the pager.
+    _afterDiskPrune(deletedHashes) {
+        if (!deletedHashes) return;
+        if (this._tableNarrowHashes) {
+            // No way to tell how many of the deleted hashes were in the narrow
+            // index — rebuild it (bounded: finite retention keeps the store small).
+            this._loadTablePage(0, true);
+            return;
+        }
+        this._tableHashCount = Math.max(0, this._tableHashCount - deletedHashes);
+        this._tablePageCount = Math.max(1, Math.ceil(Math.max(1, this._tableHashCount) / this._tablePageSize));
+        if (this._tablePage > this._tablePageCount - 1) {
+            this._loadTablePage(this._tablePageCount - 1);
+        } else {
+            this._refreshTablePager();
+        }
     }
 
     _displayCutoffNow() {
@@ -4127,12 +5552,19 @@ class MeshCoreApp {
         if (!hideSelect) return;
         const v = hideSelect.value;
         this.DISPLAY_LIFETIME = (v === 'all' || v === 'Infinity') ? Infinity : +v * 1000;
+        // The displayed time range changed, so any X-zoom window no longer matches.
+        this._chartZoom = null;
+        this._updateZoomResetBtns();
         const cutoff = this._displayCutoffNow();
         this.signalMap?.setDisplayCutoff?.(cutoff);
         this._scheduleChartRender();
         this._renderRepTable();
         this._renderMsgTable();
         this._updateStats();
+        // Load (or drop) the downsampled disk overlay for wide / "All" windows,
+        // and reclaim RAM promptly if the window shrank below the budget.
+        this._refreshWideView();
+        this.cleanup();
     }
 
     _updateHideSelectOptions() {
@@ -4228,6 +5660,11 @@ class MeshCoreApp {
         this._updateMapPins();
         this._scheduleChartRender();
         this._renderRepTable();
+        // Selection narrows the packet table to that repeater — repaginate over
+        // its hashes so we don't page through mostly-hidden rows. The sync
+        // _applyMsgTableSelection below dims/hides the current page for instant
+        // feedback; the async reload then re-renders a full narrowed page.
+        this._repaginateIfNarrowChanged();
         this._applyMsgTableSelection();
         this._updateCornerNotices();
     }
@@ -4239,6 +5676,10 @@ class MeshCoreApp {
         const fSnr = v => v != null && isFinite(v) ? `${v >= 0 ? '+' : ''}${Number.isInteger(v) ? v : Number(v).toFixed(1)}` : '—';
 
         const buildExtra = (col, showMore, noticePrefix) => {
+            // No single resolved repeater (e.g. a filter term matching several) ⇒
+            // there are no per-repeater stats to show, so render nothing rather
+            // than a "Show more" checkbox that reveals nothing.
+            if (!col) return '';
             const stats = col ? this._colStats(col) : null;
             const contacts = col && col !== 'direct' ? this._contactsByPrefix(col) : [];
             const contactsWithName = contacts.filter(c => c.name);
@@ -4303,8 +5744,11 @@ class MeshCoreApp {
             filterNotice.classList.toggle('hidden', !hasFilter);
             if (hasFilter) {
                 document.getElementById('filterNoticeRep').textContent = this._repFilterTerms.join(', ');
-                const matchingCols = this.repeaterColumns.filter(c => this._colMatchesRepFilter(c));
-                const exactCol = matchingCols.length === 1 && !matchingCols[0].includes('/') ? matchingCols[0] : null;
+                const matchingCols = (this._visibleCols ?? this.repeaterColumns).filter(c => this._colMatchesRepFilter(c));
+                // Any single matched column counts (including a merged one) — its
+                // dot, name and "Show more" stats are meaningful; only a multi-
+                // match filter has no single repeater to detail.
+                const exactCol = matchingCols.length === 1 ? matchingCols[0] : null;
                 const dot = document.getElementById('filterNoticeDot');
                 if (dot) {
                     if (exactCol) this._applyDotStyle(dot, exactCol);
@@ -4366,7 +5810,7 @@ class MeshCoreApp {
         document.querySelectorAll('#msgTableBody tr[id^="row-"]').forEach(tr => {
             if (!sel) { tr.style.display = ''; return; }
             const hash = tr.id.slice(4);
-            const data = this.hashData.get(hash);
+            const data = this._tableSource().get(hash) || this.hashData.get(hash);
             tr.style.display = data?.repeaters.has(sel) ? '' : 'none';
         });
         // Keep detail rows in sync with their parent row
@@ -4482,14 +5926,6 @@ class MeshCoreApp {
 
     // --- BLE Device Battery ---
 
-    _updateBleBattery(pct) {
-        if (!this.batteryEl || !this.device) return;
-        if (pct >= 100) return; // BLE Battery Service often reports 100% incorrectly
-        this.batteryEl.innerHTML = `<span class="hstat-label">Device </span><span class="batt-icon">🔋</span>${pct}%`;
-        this.batteryEl.classList.remove('hidden', 'battery-low');
-        if (pct <= 20) this.batteryEl.classList.add('battery-low');
-    }
-
     _updateBleBatteryVoltage(milliVolts) {
         if (!this.batteryEl || !this.device) return;
         // LiPo: 3000 mV = 0%, 4200 mV = 100%
@@ -4519,11 +5955,17 @@ class MeshCoreApp {
     // --- Stats & status ---
 
     _updateStats() {
-        if (this.exportCsvBtn) this.exportCsvBtn.disabled = this.hashData.size === 0;
+        if (this.exportCsvBtn) this.exportCsvBtn.disabled = this.hashData.size === 0 && !this._storeReady;
         const displayCutoff = this._displayCutoffNow();
+        // "Active" = unique packets in the Display window. A finite window is
+        // never wider than the RAM window (max Display = 1 h = the RAM budget),
+        // so the cutoff-filtered RAM set is exact. Display="All" can exceed RAM,
+        // though — fall back to the disk hash count (exact for "All": set from
+        // countHashes() on load, then incremented per new hash) so it doesn't
+        // collapse to just the recent RAM tail after a long capture.
         const visibleHashes = displayCutoff
             ? Array.from(this.hashData.values()).filter(d => d.lastSeen >= displayCutoff).length
-            : this.hashData.size;
+            : (this._storeReady ? this._tableHashCount : this.hashData.size);
         this.activeHashesEl.textContent = visibleHashes;
         this.totalRxEl.textContent = this.totalRxCount;
         const visibleRepeaters = displayCutoff
@@ -4577,21 +6019,41 @@ class MeshCoreApp {
         });
     }
 
+    // Visible points come from the incrementally maintained bucket cache
+    // (_wideChartPoints, see _rebuildChartArrays) — live packets are already
+    // folded in, so there is no separate tail. Pre-ready the cache is empty and
+    // the cutoff-filtered live RAM points serve directly — same path, no branch.
     _visibleChartPoints() {
         const cutoff = this._displayCutoffNow();
-        let pts = cutoff ? this.chartPoints.filter(p => p.time >= cutoff) : this.chartPoints;
-        return this._repFilterTerms.length
-            ? pts.filter(p => this._colMatchesRepFilter(p.col))
-            : pts;
+        let pts = this._wideChartPoints.length ? this._wideChartPoints : this.chartPoints;
+        // The bucket cache is pruned only opportunistically (at array rebuilds),
+        // so enforce the Display cutoff at read time for both sources.
+        if (cutoff) pts = pts.filter(p => p.time >= cutoff);
+        return this._repFilterTerms.length ? pts.filter(p => this._colMatchesRepFilter(p.col)) : pts;
     }
 
     _visibleSentSnrPts() {
+        // Sent points are few, so the disk layer plus a plain live tail (points
+        // newer than the layer) suffices. While zoomed, clamp the tail to the
+        // zoom window so out-of-window stars don't skew the Y bounds.
         const cutoff = this._displayCutoffNow();
-        let pts = cutoff ? this._sentSnrHistory.filter(p => p.time >= cutoff) : this._sentSnrHistory;
+        const z = this._chartZoom;
+        const tail = this._sentSnrHistory.filter(p =>
+            p.time > this._sentChartAt &&
+            (!cutoff || p.time >= cutoff) &&
+            (!z || (p.time >= z.tMin && p.time <= z.tMax)));
+        let pts = tail.length ? this._wideSentPoints.concat(tail) : this._wideSentPoints;
+        if (cutoff) pts = pts.filter(p => p.time >= cutoff);
+        if (z) pts = pts.filter(p => p.time >= z.tMin && p.time <= z.tMax);
         return this._repFilterTerms.length ? pts.filter(p => this._colMatchesRepFilter(p.col)) : pts;
     }
 
     _applyRepFilter() {
+        // Repaginate the packet table when the filter changed: pages are then
+        // drawn from the narrowed hash index, so no pages of entirely hidden
+        // rows. Async — the immediate render below narrows the current page's
+        // rows in the meantime.
+        this._repaginateIfNarrowChanged();
         this._renderRepTable();
         this._renderMsgTable();
         // Filtering changes how many repeater columns are shown, so the table
@@ -4608,8 +6070,12 @@ class MeshCoreApp {
     }
 
     async _exportCsv() {
-        if (this.hashData.size === 0) return;
+        const useDisk = this._storeReady;
+        if (this.hashData.size === 0 && !useDisk) return;
         this._unsavedRxCount = 0;
+
+        // Flush any buffered writes so the export reflects everything captured.
+        if (useDisk) await this._flushWrites();
 
         const msgFilter = this._msgFilter.toLowerCase().trim();
 
@@ -4623,13 +6089,42 @@ class MeshCoreApp {
         const header = ['time', 'type', 'hash', 'repeater', 'snr', 'uplink_snr', 'rssi', 'raw_hex', 'lat', 'lon', 'text', 'sender'];
         const lines = [];
 
-        // One row per (hash, repeater) pair, sorted chronologically
+        // One row per (hash, repeater) observation, sorted chronologically.
+        // Source the full history from disk when available; otherwise the RAM
+        // window. Each row carries its own rawHex (per-path) and the per-hash
+        // type/meta loaded once.
         const allRows = [];
-        for (const [hash, data] of this.hashData) {
-            if (msgFilter && !this._rowMatchesFilter(data, msgFilter)) continue;
-            for (const [col, rep] of data.repeaters) {
+        let sentSource = this._sentSnrHistory;
+        if (useDisk) {
+            const obsAll = [];
+            await this.store.eachObs(-Infinity, Infinity, r => obsAll.push(r));
+            const hashCache = new Map();
+            for (const h of new Set(obsAll.map(o => o.hash))) {
+                const rec = await this.store.getHash(h);
+                if (rec) hashCache.set(h, rec);
+            }
+            for (const o of obsAll) {
+                const col = this._resolveColReadonly(o.rawId);
+                const hm = hashCache.get(o.hash) ?? {};
+                const rep = { rawId: o.rawId, snr: o.snr, rssi: o.rssi, remoteSnr: o.remoteSnr,
+                              rawHex: o.rawHex, lat: o.lat, lon: o.lon, time: o.time };
+                const data = { type: hm.type, meta: hm.meta, firstSeen: hm.firstSeen,
+                               rawHex: o.rawHex, repeaters: new Map([[col, rep]]) };
+                if (msgFilter && !this._rowMatchesFilter(data, msgFilter)) continue;
                 if (this._repFilterTerms.length && !this._colMatchesRepFilter(col)) continue;
-                allRows.push({ hash, data, col, rep });
+                allRows.push({ hash: o.hash, data, col, rep });
+            }
+            const sent = [];
+            await this.store.eachSent(-Infinity, Infinity, r =>
+                sent.push({ time: r.time, snr: r.snr, col: r.rawId, label: r.label, lat: r.lat, lon: r.lon }));
+            sentSource = sent;
+        } else {
+            for (const [hash, data] of this.hashData) {
+                if (msgFilter && !this._rowMatchesFilter(data, msgFilter)) continue;
+                for (const [col, rep] of data.repeaters) {
+                    if (this._repFilterTerms.length && !this._colMatchesRepFilter(col)) continue;
+                    allRows.push({ hash, data, col, rep });
+                }
             }
         }
         allRows.sort((a, b) => (a.rep.time ?? 0) - (b.rep.time ?? 0));
@@ -4666,7 +6161,7 @@ class MeshCoreApp {
         }
 
         // Append sent SNR history rows
-        for (const p of this._sentSnrHistory) {
+        for (const p of sentSource) {
             lines.push([
                 new Date(p.time).toISOString(),
                 'SentSNR',
@@ -4676,7 +6171,8 @@ class MeshCoreApp {
                 p.snr.toFixed(2),
                 '',
                 '',
-                '',
+                p.lat ?? '',
+                p.lon ?? '',
                 p.label || '',
                 '',
             ].map(esc).join(','));
@@ -4763,6 +6259,8 @@ class MeshCoreApp {
             headerLineIdx = i;
             break;
         }
+        this._updateContactsCount();
+        this._scheduleContactsPersist();   // persist any contacts embedded in the CSV
 
         const header = this._parseCsvLine(lines[headerLineIdx]);
         const idx = name => header.indexOf(name);
@@ -4819,7 +6317,13 @@ class MeshCoreApp {
         await new Promise(r => setTimeout(r, 0)); // yield to let the browser repaint
 
         if (this.hashData.size > 0) {
-            if (!confirm(`There are already ${this.hashData.size} packet(s) loaded. Packets from the CSV will be added; existing entries are kept unchanged. Continue?`)) return;
+            if (!confirm(`There are already ${this.hashData.size} packet(s) loaded. Packets from the CSV will be added; existing entries are kept unchanged. Continue?`)) {
+                // Cancelled: restore the button/status that were set above.
+                if (importBtn) { importBtn.textContent = prevBtnText; importBtn.disabled = false; }
+                this.statusEl?.classList.remove('importing');
+                if (this.statusTextEl && prevStatus != null) this.statusTextEl.textContent = prevStatus;
+                return;
+            }
         }
 
         // Ascending time order so firstSeen and prefix resolution are correct
@@ -4841,7 +6345,24 @@ class MeshCoreApp {
             this._applyHideSelect();
         }
 
+        // Dedupe against already-persisted observations so re-importing the same
+        // file is a no-op. The in-RAM merge only knows about the recent window;
+        // older data lives on disk, so we check there too (keyed by hash, the
+        // raw repeater id and the timestamp — the same identity a row exports as).
+        const existingKeys = new Set();
+        const existingSent = new Set();
+        if (this._storeReady) {
+            await this._flushWrites();   // dedupe must also see still-buffered packets
+            for (const h of new Set(rows.map(r => r.hash))) {
+                for (const o of await this.store.obsForHash(h)) existingKeys.add(h + '|' + o.rawId + '|' + o.time);
+            }
+            if (sentSnrRows.length) await this.store.eachSent(-Infinity, Infinity, r => existingSent.add(r.time + '|' + r.rawId));
+        }
+
         for (const row of rows) {
+            const dedupeKey = row.hash + '|' + row.repeater + '|' + row.time;
+            if (existingKeys.has(dedupeKey)) continue;   // already captured/imported
+            existingKeys.add(dedupeKey);
             let packet = null;
             let meta = {};
             if (row.rawHex) {
@@ -4883,13 +6404,27 @@ class MeshCoreApp {
             });
         }
 
-        // Import SentSNR history rows
+        // Import SentSNR history rows (deduped against disk the same way).
+        // The SNR value is exported in the uplink_snr column (the snr column is
+        // left empty for these rows), so read it from there.
         for (const r of sentSnrRows) {
-            this._sentSnrHistory.push({ time: r.time, snr: r.snr, col: r.repeater, label: r.csvText || r.repeater });
+            if (existingSent.has(r.time + '|' + r.repeater)) continue;
+            existingSent.add(r.time + '|' + r.repeater);
+            const snr = r.uplinkSnr ?? r.snr;
+            const lat = r.lat, lon = r.lon;
+            this._sentSnrHistory.push({ time: r.time, snr, col: r.repeater, label: r.csvText || r.repeater });
+            if (!this._storeDead) this._sentWriteBuf.push({ time: r.time, snr, rawId: r.repeater, label: r.csvText || r.repeater, lat, lon });
         }
         if (sentSnrRows.length) {
             this._sentSnrHistory.sort((a, b) => a.time - b.time);
             this._renderChart('snr');
+        }
+
+        // Persist the import to disk and rebuild the downsampled "All" overlay,
+        // so imported (historical) data survives the RAM-window prune and shows.
+        if (this._storeReady) {
+            await this._flushWrites();
+            await this._refreshWideView();
         }
 
         this._sortColumns();
@@ -5059,7 +6594,6 @@ class MeshCoreApp {
         clearTimeout(this._posQueryTimer);
         clearInterval(this._deviceRefreshTimer);
         this._deviceRefreshTimer = null;
-        this._deviceLocPolicy = null;
         this._setDeviceLocation(null, null);
         // Clear any in-flight contact fetch so a fresh connection starts clean
         // (a stuck _contactsReceiving from an interrupted stream would otherwise

@@ -20,6 +20,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
 import android.webkit.GeolocationPermissions
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -55,6 +56,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var jsApi: JsApi
 
+    private val appUrl = "https://appassets.androidplatform.net/assets/www/index.html"
+
     val main = Handler(Looper.getMainLooper())
 
     companion object {
@@ -83,6 +86,18 @@ class MainActivity : AppCompatActivity() {
     private val requestBackgroundLocation = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { /* user decides in settings; capture still works while screen is on */ }
+
+    // The map's "Enable location" button. Separate from requestPerms (the
+    // connect flow) because enabling the map location must NOT start the
+    // foreground service — viewing your own position shouldn't pin a
+    // notification; the service starts when you actually connect to a device.
+    private var _onLocationPermResult: (() -> Unit)? = null
+    private val requestLocationPerm = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        _onLocationPermResult?.invoke()   // runs whether granted or not — location.start() then streams or reports the denial back to JS
+        _onLocationPermResult = null
+    }
 
     // HTML5 fullscreen (the 3D map "fullscreen" button). When the page calls
     // Element.requestFullscreen(), the WebView routes it through
@@ -159,6 +174,18 @@ class MainActivity : AppCompatActivity() {
         wifi = TcpManager(jsApi)
         location = LocationHelper(applicationContext, jsApi)
 
+        configureWebView()
+        webView.loadUrl(appUrl)
+        wireBackHandler()
+
+        // Permissions are requested lazily at BLE connect time.
+    }
+
+    // Build (or rebuild) this WebView's settings, JS bridges and clients.
+    // Extracted from onCreate so the exact same configuration can be reapplied
+    // to a freshly constructed WebView after the renderer process dies — see
+    // onRenderProcessGone and recreateWebView.
+    private fun configureWebView() {
         with(webView.settings) {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -195,6 +222,18 @@ class MainActivity : AppCompatActivity() {
                 } catch (e: Exception) {
                     false
                 }
+            }
+
+            // The renderer process was torn down (almost always the OS reclaiming
+            // memory while the app was in the background, occasionally a real
+            // crash). Returning false here would let the system kill our whole
+            // process; instead we claim the event and rebuild the WebView so the
+            // user gets the app back instead of a frozen blank screen.
+            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                if (view !== webView) return true
+                android.util.Log.w("MeshWeb", "WebView renderer gone (didCrash=${detail.didCrash()}); rebuilding")
+                recreateWebView()
+                return true
             }
         }
 
@@ -287,9 +326,11 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
         }
+    }
 
-        webView.loadUrl("https://appassets.androidplatform.net/assets/www/index.html")
-
+    // Registered once from onCreate. The callback reads the current webView
+    // field each time it fires, so it keeps working after a WebView rebuild.
+    private fun wireBackHandler() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 // Leave HTML5 fullscreen first if the map is maximised. Asking the
@@ -311,8 +352,28 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         })
+    }
 
-        // Permissions are requested lazily at BLE connect time.
+    // Replace a dead WebView with a fresh one and reload the app. Called when
+    // the renderer process is gone (see onRenderProcessGone). The page starts
+    // over — in-memory capture from before the crash is lost — but the UI
+    // recovers instead of staying stuck on a blank screen. The managers keep
+    // their JsApi reference; only its target WebView is rebound.
+    private fun recreateWebView() {
+        (webView.parent as? ViewGroup)?.removeView(webView)
+        webView.destroy()
+        // Drop any lingering HTML5-fullscreen overlay left over from the old page.
+        customView?.let { (window.decorView as FrameLayout).removeView(it) }
+        customView = null
+        customViewCallback = null
+
+        webView = WebView(this)
+        setContentView(webView)
+        jsApi.rebind(webView)
+        configureWebView()
+        // ?recover=1 tells the page this is a crash rebuild (not a fresh launch),
+        // so it resumes the just-crashed session's data instead of starting clean.
+        webView.loadUrl("$appUrl?recover=1")
     }
 
     override fun onDestroy() {
@@ -324,6 +385,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ---- permission gate (called at connect/scan time) ------------------
+
+    fun hasLocationPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED ||
+        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+
+    // Location-only permission request for the map's "Enable location" button.
+    // Deliberately does not start the foreground service (see requestLocationPerm).
+    fun ensureLocationPermission(onResult: () -> Unit) {
+        if (hasLocationPermission()) { onResult(); return }
+        _onLocationPermResult = onResult
+        requestLocationPerm.launch(arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ))
+    }
 
     fun ensureConnectPermissions(includeBluetooth: Boolean = true, onGranted: () -> Unit) {
         val needed = mutableListOf(

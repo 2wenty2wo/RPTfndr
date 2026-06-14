@@ -2,7 +2,8 @@
 // each captured packet is a colored bead floating above its GPS location at a
 // height proportional to RSSI.
 //
-// Two tile sources: Mapy.com (default, requires API key) and OpenStreetMap.
+// Several tile sources: Mapy.com (default, requires API key), OpenStreetMap
+// flavours, CARTO and Esri basemaps, and "none" (a plain floor, no imagery).
 
 import * as THREE from 'three';
 import { MapControls } from './vendor/controls/MapControls.js';
@@ -25,6 +26,12 @@ const CAMERA_REF_DIST = PLANE_SIZE * Math.sqrt(0.4*0.4 + 0.55*0.55 + 0.6*0.6); /
 const MAPYCOM_KEY = '8k8RZ_2rNYvfSzsufejwlKuBnnF0kYmPtfVDhSeBoiE';
 const mapycomUrl = type => (z, x, y) =>
     `https://api.mapy.cz/v1/maptiles/${type}/256/${z}/${x}/${y}?apikey=${MAPYCOM_KEY}`;
+const cartoUrl = style => (z, x, y) =>
+    `https://a.basemaps.cartocdn.com/${style}/${z}/${x}/${y}.png`;
+const CARTO_ATTRIB = '© OpenStreetMap contributors, © CARTO';
+// Esri tile services take {z}/{y}/{x} — y before x, unlike every other source.
+const esriUrl = service => (z, x, y) =>
+    `https://server.arcgisonline.com/ArcGIS/rest/services/${service}/MapServer/tile/${z}/${y}/${x}`;
 const TILE_SOURCES = {
     'mapycom-basic':   { label: 'Mapy.com — Basic',             url: mapycomUrl('basic'),   attrib: '© Mapy.com' },
     'mapycom-outdoor': { label: 'Mapy.com — Outdoor (hiking)',   url: mapycomUrl('outdoor'), attrib: '© Mapy.com' },
@@ -39,7 +46,43 @@ const TILE_SOURCES = {
         label:  'OpenTopoMap',
         url:    (z, x, y) => `https://tile.opentopomap.org/${z}/${x}/${y}.png`,
         attrib: '© OpenTopoMap (CC-BY-SA), © OpenStreetMap contributors',
+        maxZoom: 17,
     },
+    'cyclosm':         {
+        label:  'CyclOSM (cycling)',
+        url:    (z, x, y) => `https://a.tile-cyclosm.openstreetmap.fr/cyclosm/${z}/${x}/${y}.png`,
+        attrib: '© CyclOSM, © OpenStreetMap contributors',
+    },
+    'osm-hot':         {
+        label:  'Humanitarian (HOT)',
+        url:    (z, x, y) => `https://a.tile.openstreetmap.fr/hot/${z}/${x}/${y}.png`,
+        attrib: '© OpenStreetMap contributors, tiles: HOT / OSM France',
+    },
+    'osm-de':          {
+        label:  'OSM German style',
+        url:    (z, x, y) => `https://tile.openstreetmap.de/${z}/${x}/${y}.png`,
+        attrib: '© OpenStreetMap contributors',
+        maxZoom: 18,
+    },
+    'osm-fr':          {
+        label:  'OSM French style',
+        url:    (z, x, y) => `https://a.tile.openstreetmap.fr/osmfr/${z}/${x}/${y}.png`,
+        attrib: '© OpenStreetMap contributors, tiles: OSM France',
+    },
+    // CARTO basemaps (no API key required): dark/light/coloured, each also in a
+    // no-labels variant — a label-free floor keeps the signal beads readable.
+    'cartodark':              { label: 'CARTO Dark Matter',             url: cartoUrl('dark_all'),                      attrib: CARTO_ATTRIB },
+    'cartodark-nolabels':     { label: 'CARTO Dark Matter (no labels)', url: cartoUrl('dark_nolabels'),                 attrib: CARTO_ATTRIB },
+    'cartolight':             { label: 'CARTO Positron (light)',        url: cartoUrl('light_all'),                     attrib: CARTO_ATTRIB },
+    'cartolight-nolabels':    { label: 'CARTO Positron (no labels)',    url: cartoUrl('light_nolabels'),                attrib: CARTO_ATTRIB },
+    'cartovoyager':           { label: 'CARTO Voyager',                 url: cartoUrl('rastertiles/voyager'),           attrib: CARTO_ATTRIB },
+    'cartovoyager-nolabels':  { label: 'CARTO Voyager (no labels)',     url: cartoUrl('rastertiles/voyager_nolabels'), attrib: CARTO_ATTRIB },
+    // Esri basemaps (no key). The Gray Canvas styles only serve tiles up to z16.
+    'esri-darkgray':   { label: 'Esri Dark Gray Canvas',  url: esriUrl('Canvas/World_Dark_Gray_Base'),  attrib: '© Esri', maxZoom: 16 },
+    'esri-lightgray':  { label: 'Esri Light Gray Canvas', url: esriUrl('Canvas/World_Light_Gray_Base'), attrib: '© Esri', maxZoom: 16 },
+    'esri-imagery':    { label: 'Esri World Imagery',     url: esriUrl('World_Imagery'),                attrib: '© Esri, Maxar, Earthstar Geographics' },
+    // No map tiles at all — the floor is rendered as a plain colour (theme-aware).
+    'none':            { label: 'None (no map)', url: null, attrib: '' },
 };
 const DEFAULT_SOURCE = 'mapycom-basic';
 
@@ -64,6 +107,7 @@ export class Signal3DMap {
         this.canvas    = opts.canvas;
         this.statusEl  = opts.statusEl;
         this.btnEl     = opts.btnEl;
+        this.centerBtnEl = opts.centerBtnEl;   // "Center on me" — only useful with a fix
         this.emptyEl   = opts.emptyEl;
         this.colorFor  = opts.colorFor  || (() => '#667eea');
         this.displayId = opts.displayId || (col => col);
@@ -74,6 +118,10 @@ export class Signal3DMap {
         // map. When just viewing an imported dataset this is false, so a far-away
         // current position never drags the tiles away from the data.
         this.isLiveCapture = opts.isLiveCapture || (() => false);
+        // True when the page is in dark mode. Used to paint the map background
+        // (the area around the tiled floor) black, independent of the chosen
+        // tile source — a dark *basemap* and a dark *page* are two separate things.
+        this.isDarkMode = opts.isDarkMode || (() => false);
 
         this._rxPoints       = [];     // { lat, lon, rssi, snr, col, time }
         this._pins     = [];   // { lat, lon, name, color }
@@ -81,6 +129,7 @@ export class Signal3DMap {
         this._userLoc      = null;
         this._watchId      = null;
         this._followUser   = false;  // when true, camera tracks the user's GPS position
+        this._userDragging = false;  // a pointer gesture on the map is in progress
         this.onFollowChange = opts.onFollowChange || null;
         this._tileBounds   = null;   // { x0, y0, nx, ny, zoom }
         this._planeDim     = null;   // { w, h } in world units
@@ -97,12 +146,11 @@ export class Signal3DMap {
         this._mapSource    = (opts.initialSource && TILE_SOURCES[opts.initialSource])
             ? opts.initialSource : DEFAULT_SOURCE;
         this._sphereSize   = (opts.initialSphereSize > 0) ? opts.initialSphereSize : 1.0;
-        this._showLines   = opts.showLines !== false;
-        this._showMarker  = opts.showMarker !== false;
-        this._showDevice  = !!opts.showDevice;   // connected-device marker, default off
+        this._showLines   = true;    // set from persisted prefs via setShowLines() at init
+        this._showMarker  = true;    // … setShowMarker()
+        this._showDevice  = false;   // connected-device marker — setShowDeviceMarker()
         this._deviceLoc   = null;                // { lat, lon } of the device, or null
         this._deviceMarker = null;
-        this._clusterRadius = (opts.initialClusterRadius > 0) ? opts.initialClusterRadius : 0; // metres; 0 = off
         this._selectedCol = null;
         this._perspSize   = opts.initialPerspSize !== false; // default on
         // Points / mesh handles — replaced per _rebuildDots call
@@ -120,8 +168,18 @@ export class Signal3DMap {
         this._ringTexDirect  = this._makeRingTex('#111111', '#ffd400');
         this._ringTexUnknown = this._makeRingTex('#cc0000', '#ffffff');
         this._outgoingPts     = [];   // { lat, lon, snr, col, time } — outgoing SNR points
+        // Downsampled historical points loaded from disk for wide / "All" views.
+        // When non-null these replace _rxPoints as the render source (they are
+        // already spatially gridded, so no further clustering is applied).
+        this._histPoints      = null;
+        this._histOutgoingPts = null;    // disk-loaded outgoing-SNR points (null = use live _outgoingPts)
+        this._histSentAt      = 0;       // time the sent layer reflects; newer live sent points are the tail
+        this._dotsDirty       = false;   // a live packet changed _rxPoints; rebuild is coalesced in the frame loop
+        this._lastDotsBuild   = 0;
+        this._viewChangeTimer = null;
         this.infoEl          = opts.infoEl          || null;
         this.onSelect        = opts.onSelect        || null;
+        this.onViewChange    = opts.onViewChange    || null;  // (bbox, metresPerPixel) on zoom/pan, debounced
         this.onFilter        = opts.onFilter        || null;
         this.onRemoveMarker  = opts.onRemoveMarker  || null;
         this.onPinMarker     = opts.onPinMarker     || null;
@@ -202,7 +260,7 @@ export class Signal3DMap {
         const canvas = this.canvas;
         this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
         this.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
-        this.renderer.setClearColor(0xeef2f7);
+        this.renderer.setClearColor(this._bgColor());
 
         const w = Math.max(1, canvas.clientWidth);
         const h = Math.max(1, canvas.clientHeight);
@@ -227,14 +285,22 @@ export class Signal3DMap {
             this.controls.target.y = 0;
             this._updateHeightScale();
             this._updatePerspUniforms();
+            this._notifyViewChange();
         });
         this.controls.addEventListener('end', () => {
             clearTimeout(this._viewUpdateTimer);
             this._viewUpdateTimer = setTimeout(() => this._updateOverlay(), 700);
         });
-        // User interaction cancels any running camera fly/turn animation and
-        // leaves "follow me" mode — the user has taken manual control.
-        this.controls.addEventListener('start', () => { this._camAnim = null; this.setFollowUser(false); });
+        // User interaction cancels any running camera fly/turn animation.
+        // Follow mode is NOT dropped immediately: small adjustments (pan a bit,
+        // zoom) that leave the user's marker within the central third of the
+        // view keep following active; only a gesture that pushes the marker out
+        // of that dead zone disengages it (checked on gesture end).
+        this.controls.addEventListener('start', () => { this._camAnim = null; this._userDragging = true; });
+        this.controls.addEventListener('end', () => {
+            this._userDragging = false;
+            if (this._followUser && !this._userInDeadZone()) this.setFollowUser(false);
+        });
 
         // Two-finger twist: rotate camera azimuth by the angular change between the
         // two touch points.  rotateLeft() is private in Three.js ≥0.155, so we
@@ -278,7 +344,7 @@ export class Signal3DMap {
 
         // Placeholder floor until tiles arrive
         const phGeo = new THREE.PlaneGeometry(PLANE_SIZE, PLANE_SIZE);
-        const phMat = new THREE.MeshBasicMaterial({ color: 0xdcdcdc });
+        const phMat = new THREE.MeshBasicMaterial({ color: this._floorColor() });
         this._mapMesh = new THREE.Mesh(phGeo, phMat);
         this._mapMesh.rotation.x = -Math.PI / 2;
         this.scene.add(this._mapMesh);
@@ -328,9 +394,10 @@ export class Signal3DMap {
         const tick = () => {
             this._stepCameraAnim();
             this.controls.update();
+            this._maybeRebuildDots();
             this._scaleMarkerToScreen();
             this.renderer.render(this.scene, this.camera);
-            this._rafId = requestAnimationFrame(tick);
+            requestAnimationFrame(tick);   // render loop runs for the map's lifetime
         };
         tick();
     }
@@ -380,8 +447,20 @@ export class Signal3DMap {
         this.btnEl.addEventListener('click', () => this.startWatching());
     }
 
+    // Every status message means "location isn't available (yet)". Show the
+    // message where the "Center on me" button normally sits and hide that button
+    // — it only makes sense once we have a fix. _locationReady() does the inverse.
     _setStatus(text) {
-        if (this.statusEl) this.statusEl.textContent = text;
+        if (this.statusEl) {
+            this.statusEl.textContent = text;
+            this.statusEl.classList.remove('hidden');
+        }
+        if (this.centerBtnEl) this.centerBtnEl.classList.add('hidden');
+    }
+
+    _locationReady() {
+        if (this.statusEl) this.statusEl.classList.add('hidden');
+        if (this.centerBtnEl) this.centerBtnEl.classList.remove('hidden');
     }
 
     startWatching() {
@@ -407,15 +486,17 @@ export class Signal3DMap {
                 if (this.btnEl) this.btnEl.classList.add('hidden');
                 const { latitude, longitude, accuracy } = pos.coords;
                 this._userLoc = { lat: latitude, lon: longitude, accuracy };
-                this._setStatus(`📍 ${latitude.toFixed(5)}, ${longitude.toFixed(5)}  (±${Math.round(accuracy)} m)`);
+                this._locationReady();   // swap the status text for the "Center on me" button
                 if (this.emptyEl && !this._rxPoints.length) {
                     this.emptyEl.textContent = 'Waiting for data…';
                 }
                 this._scheduleMapUpdate();
                 this._updateUserMarker();
-                // In follow mode, keep the user centred as they move (shorter,
-                // smoother glide than the initial fly-to).
-                if (this._followUser) this.flyToUser(450);
+                // In follow mode, glide after the user only once their marker
+                // drifts out of the central-third dead zone — small moves don't
+                // nudge the map. Never recentre mid-gesture (it would fight the
+                // user's drag).
+                if (this._followUser && !this._userDragging && !this._userInDeadZone()) this.flyToUser(450);
             },
             err => {
                 resolved = true;
@@ -595,7 +676,7 @@ export class Signal3DMap {
         // Consider both received (sphere) and sent (star) points so a repeater
         // we've only ever transmitted to still shows a panel when clicked.
         const pts = this._rxPoints.filter(p => p.col === col)
-            .concat(this._outgoingPts.filter(p => p.col === col));
+            .concat((this._histOutgoingPts ?? this._outgoingPts).filter(p => p.col === col));
         if (!pts.length) { this.infoEl.classList.add('hidden'); return; }
         const isPseudo = col === 'direct' || col === 'unknown';
         const dotStyle = isPseudo
@@ -806,6 +887,8 @@ export class Signal3DMap {
     clearPoints() {
         this._rxPoints = [];
         this._outgoingPts = [];
+        this._histPoints = null;
+        this._histOutgoingPts = null;
         this._selectedCol = null;
         this._disposeDots();
         this._removeOverlay();
@@ -861,18 +944,32 @@ export class Signal3DMap {
         this._scheduleMapUpdate();
     }
 
-    setClusterRadius(r) {
-        if (r === this._clusterRadius) return;
-        this._clusterRadius = r;
-        this._rebuildDots();
-    }
-
     setMapSource(source) {
         if (!TILE_SOURCES[source] || source === this._mapSource) return;
         this._mapSource = source;
         this._lastMapKey = null;
         this._removeOverlay();
         this._scheduleMapUpdate();
+    }
+
+    // Map background (clear colour) and plain-floor colour, both theme-aware.
+    // Dark page → black background so the scene reads as dark regardless of the
+    // chosen tile source.
+    _bgColor()    { return this.isDarkMode() ? 0x000000 : 0xeef2f7; }
+    _floorColor() { return this.isDarkMode() ? 0x000000 : 0xdcdcdc; }
+
+    // Called by the host app when the page theme (light/dark) toggles.
+    applyTheme() {
+        this.renderer.setClearColor(this._bgColor());
+        // When no tiles are drawn (placeholder floor, or "none" source) the floor
+        // colour comes from the theme — refresh it. With real tiles the floor is
+        // the imagery itself, so only the background needed updating above.
+        if (!this._tileBounds) {
+            this._mapMesh?.material.color.set(this._floorColor());
+        } else if (this._mapSource === 'none') {
+            this._lastMapKey = null;
+            this._scheduleMapUpdate();
+        }
     }
 
     // ---- Packet ingestion ----
@@ -882,7 +979,11 @@ export class Signal3DMap {
         this._rxPoints.push({ ...opts });
         if (this.emptyEl) this.emptyEl.classList.add('hidden');
         if (opts.col === this._selectedCol) this._updateInfoPanel();
-        this._rebuildDots();
+        // Coalesced rebuild (see _maybeRebuildDots): throttled to ≤1/200ms and
+        // skipped while dragging, so it never starves the frame loop. In a wide
+        // ("All") view this folds the new point into the rendered tail on top of
+        // the disk grid (see _rebuildDots), so it shows without a disk re-scan.
+        this._dotsDirty = true;
         this._scheduleMapUpdate();
     }
 
@@ -890,7 +991,59 @@ export class Signal3DMap {
         if (opts.lat == null || opts.lon == null || opts.snr == null) return;
         this._outgoingPts.push({ ...opts });
         if (this.emptyEl) this.emptyEl.classList.add('hidden');
+        // Rendered immediately: live mode draws _outgoingPts directly; in hist
+        // mode the render adds points newer than the disk layer as a tail.
+        this._dotsDirty = true;
+    }
+
+    // Rebuild dots from a coalesced dirty flag, throttled and never mid-gesture,
+    // so live capture doesn't fight the camera. Called once per frame from tick.
+    _maybeRebuildDots() {
+        if (!this._dotsDirty || this._userDragging) return;
+        const now = performance.now();
+        if (now - this._lastDotsBuild < 200) return;
+        this._dotsDirty = false;
+        this._lastDotsBuild = now;
         this._rebuildDots();
+    }
+
+    // Replace the render source with a pre-gridded set of historical points from
+    // disk (wide / "All" view). Pass null to return to the live in-RAM points.
+    // Each point: { lat, lon, snr, rssi, col, time, rawId, count }.
+    setHistoricalPoints(arr) {
+        this._histPoints = (arr && arr.length) ? arr : (arr ? [] : null);
+        if (this.emptyEl && this._histPoints && this._histPoints.length) this.emptyEl.classList.add('hidden');
+        // Coalesced rebuild (≤1/200 ms, skipped while dragging) — live upserts
+        // push updated point sets frequently during capture.
+        this._dotsDirty = true;
+        this._scheduleMapUpdate();
+    }
+
+    // Disk-loaded outgoing-SNR points for wide / "All" views (parallel to
+    // setHistoricalPoints for incoming). Pass null to use the live _outgoingPts.
+    // Each point: { lat, lon, snr, col, time, rawId }.
+    setHistoricalSentPoints(arr) {
+        this._histOutgoingPts = (arr && arr.length) ? arr : (arr ? [] : null);
+        this._histSentAt = Date.now();   // live sent points after this are the tail
+        this._dotsDirty = true;
+    }
+
+    // Fire onViewChange (debounced) so the host can re-query a finer disk grid
+    // for the now-visible region when the user zooms or pans.
+    _notifyViewChange() {
+        if (!this.onViewChange) return;
+        clearTimeout(this._viewChangeTimer);
+        this._viewChangeTimer = setTimeout(() => {
+            const bb = this._cameraViewBbox();
+            if (bb) this.onViewChange(bb, this._metersPerPixel());
+        }, 350);
+    }
+
+    _metersPerPixel() {
+        const bb = this._cameraViewBbox();
+        if (!bb) return null;
+        const h = this.canvas.clientHeight || 600;
+        return ((bb.maxLat - bb.minLat) * 111320) / h;
     }
 
     // Called by the host app when chart/legend selection changes.
@@ -940,6 +1093,18 @@ export class Signal3DMap {
         ctx.fillStyle = '#dfdfdf';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+        // "None" source: no imagery, just a plain theme-aware floor (no fetches,
+        // no attribution).
+        if (!src.url) {
+            ctx.fillStyle = this.isDarkMode() ? '#000000' : '#eef2f7';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.colorSpace  = THREE.SRGBColorSpace;
+            tex.minFilter   = THREE.LinearFilter;
+            tex.needsUpdate = true;
+            return tex;
+        }
+
         const tasks = [];
         for (let dx = 0; dx < nx; dx++) {
             for (let dy = 0; dy < ny; dy++) {
@@ -973,7 +1138,8 @@ export class Signal3DMap {
 
     _bbox() {
         const cutoff = this._displayCutoff;
-        const locs = this._rxPoints
+        const source = this._histPoints ?? this._rxPoints;
+        const locs = source
             .filter(p => (!cutoff || p.time >= cutoff) && (!this._filterFn || this._filterFn(p.col)))
             .map(p => ({ lat: p.lat, lon: p.lon }));
         // Include the user's own position in the tile bbox when the marker is
@@ -1025,8 +1191,10 @@ export class Signal3DMap {
         // Start from the current zoom so the world scale never changes unless
         // the bbox genuinely can't fit within MAX_TILES_AXIS tiles at that level.
         // Starting from 19 (the old approach) would eagerly drop zoom for any
-        // bbox that the current level can already accommodate.
-        let zoom = this._tileBounds ? this._tileBounds.zoom : 19;
+        // bbox that the current level can already accommodate. Sources that
+        // don't serve tiles all the way to z19 cap the starting level.
+        const srcMaxZoom = TILE_SOURCES[this._mapSource].maxZoom ?? 19;
+        let zoom = Math.min(srcMaxZoom, this._tileBounds ? this._tileBounds.zoom : 19);
         let tl, br;
         while (zoom > 1) {
             tl = lonLatToTile(minLon, maxLat, zoom);
@@ -1180,9 +1348,22 @@ export class Signal3DMap {
         return true;
     }
 
-    // "Center on me" is a toggle: pressing it once centres on the user and
-    // enters follow mode (camera tracks GPS); pressing it again — or any manual
-    // map movement — leaves follow mode.
+    // True while the user's marker projects within the central third of the
+    // canvas (both axes). Follow mode uses this as its dead zone: inside it the
+    // map is left alone and manual gestures don't disengage following.
+    _userInDeadZone() {
+        if (!this._userLoc) return false;
+        const pos = this._latLonToWorld(this._userLoc.lat, this._userLoc.lon);
+        if (!pos) return false;
+        const v = pos.project(this.camera);   // NDC: visible canvas is -1..1
+        return v.z < 1 && Math.abs(v.x) <= 1 / 3 && Math.abs(v.y) <= 1 / 3;
+    }
+
+    // "Center on me" is a toggle: pressing it once centres on the user exactly
+    // and enters follow mode; pressing it again leaves it. While following, the
+    // camera only glides after the user when their marker drifts out of the
+    // central-third dead zone, and manual map movement keeps follow mode active
+    // as long as the marker stays inside that zone.
     toggleFollowUser() {
         if (this._followUser) { this.setFollowUser(false); return; }
         if (this.flyToUser()) this.setFollowUser(true);
@@ -1314,11 +1495,13 @@ export class Signal3DMap {
 
     async _updateOverlay() {
         if (!this._tileBounds || this._overlayBusy) return;
+        if (this._mapSource === 'none') { this._removeOverlay(); return; }  // nothing to detail
         const camBb = this._cameraViewBbox();
         if (!camBb) { this._removeOverlay(); return; }
 
         // Find highest zoom where camera view fits in MAX_TILES_AXIS × MAX_TILES_AXIS
-        let overlayZoom = 19, oTl, oBr;
+        // (capped at the source's own maximum tile level)
+        let overlayZoom = TILE_SOURCES[this._mapSource].maxZoom ?? 19, oTl, oBr;
         while (overlayZoom > 1) {
             oTl = lonLatToTile(camBb.minLon, camBb.maxLat, overlayZoom);
             oBr = lonLatToTile(camBb.maxLon, camBb.minLat, overlayZoom);
@@ -1414,43 +1597,16 @@ export class Signal3DMap {
 
         const sel     = this._selectedCol;
         const cutoff  = this._displayCutoff;
-        let visible = this._rxPoints.filter(p =>
+        // In wide / "All" mode the source is the pre-gridded historical set; it
+        // is already spatially downsampled, so the per-repeater merge is skipped.
+        // In histMode the host maintains the cell cache incrementally (live
+        // packets upsert their cell), so _histPoints is always current — no tail.
+        const histMode = this._histPoints != null;
+        let visible = (histMode ? this._histPoints : this._rxPoints).filter(p =>
             (!this._filterFn || this._filterFn(p.col)) &&
             (!cutoff || p.time >= cutoff)
         );
         if (!visible.length) return;
-
-        // Clustering: for each repeater, merge points within _clusterRadius metres
-        if (this._clusterRadius > 0) {
-            // 1° latitude ≈ 111 320 m; 1° longitude ≈ 111 320 * cos(lat) m
-            const latDeg = this._clusterRadius / 111320;
-            const byCols = new Map();
-            for (const p of visible) {
-                if (!byCols.has(p.col)) byCols.set(p.col, []);
-                byCols.get(p.col).push(p);
-            }
-            const clustered = [];
-            for (const pts of byCols.values()) {
-                const used = new Uint8Array(pts.length);
-                const refLat = pts[0].lat;
-                const lonDeg = this._clusterRadius / (111320 * Math.cos(refLat * Math.PI / 180) || 1);
-                for (let i = 0; i < pts.length; i++) {
-                    if (used[i]) continue;
-                    let best = pts[i];
-                    used[i] = 1;
-                    for (let j = i + 1; j < pts.length; j++) {
-                        if (used[j]) continue;
-                        if (Math.abs(pts[j].lat - pts[i].lat) < latDeg &&
-                            Math.abs(pts[j].lon - pts[i].lon) < lonDeg) {
-                            used[j] = 1;
-                            if (pts[j].rssi > best.rssi) best = pts[j];
-                        }
-                    }
-                    clustered.push(best);
-                }
-            }
-            visible = clustered;
-        }
 
         const litPts = sel ? visible.filter(p => p.col === sel) : visible;
         const dimPts = sel ? visible.filter(p => p.col !== sel) : [];
@@ -1592,9 +1748,14 @@ export class Signal3DMap {
             this._lineSegs.geometry.setAttribute('color', new THREE.BufferAttribute(litCol, 3));
         this._lineSegsDim = makeLines(dimPts, dimMat);
 
-        // Sent SNR squares — outgoing signal quality (how well the repeater heard us)
+        // Sent SNR stars — outgoing signal quality (how well the repeater heard
+        // us). Disk-loaded historical points when present, plus a live tail
+        // (sent points are few, so they're drawn individually — no gridding).
         const sentCutoff = this._displayCutoff;
-        const sentAll = this._outgoingPts.filter(p =>
+        const sentSrc = this._histOutgoingPts
+            ? this._histOutgoingPts.concat(this._outgoingPts.filter(p => p.time > this._histSentAt))
+            : this._outgoingPts;
+        const sentAll = sentSrc.filter(p =>
             (!this._filterFn || this._filterFn(p.col)) &&
             (!sentCutoff || p.time >= sentCutoff)
         );
@@ -1626,6 +1787,25 @@ export class Signal3DMap {
         }
     }
 
+    // Marker meshes have faces lying on (or a hair above) the map plane — the
+    // translucent ground disc, and the cone/mast base caps at y≈0. The per-frame
+    // screen-space rescale walks those near-coplanar faces through the depth
+    // buffer's precision, which showed as flicker. polygonOffset biases their
+    // depth slightly toward the camera so the GPU resolves them above the plane
+    // deterministically, while keeping normal depth behaviour — the marker is
+    // still a regular 3D object that nearby dots can overlap, not an
+    // always-on-top overlay.
+    _markerNoZFight(group) {
+        group.traverse(o => {
+            if (!o.isMesh) return;
+            const m = o.material;
+            m.polygonOffset = true;
+            m.polygonOffsetFactor = -2;
+            m.polygonOffsetUnits = -2;
+            if (m.transparent) m.depthWrite = false;   // translucent disc: don't occlude the blend
+        });
+    }
+
     _updateUserMarker() {
         if (!this._userLoc || !this._tileBounds) return;
         const pos = this._latLonToWorld(this._userLoc.lat, this._userLoc.lon);
@@ -1645,6 +1825,7 @@ export class Signal3DMap {
             base.rotation.x = -Math.PI / 2;
             base.position.y = 0.05;
             group.add(base);
+            this._markerNoZFight(group);
             this._userMarker = group;
             this._userMarker.visible = this._showMarker;
             this.scene.add(this._userMarker);
@@ -1681,6 +1862,7 @@ export class Signal3DMap {
             base.rotation.x = -Math.PI / 2;
             base.position.y = 0.05;
             group.add(base);
+            this._markerNoZFight(group);
             this._deviceMarker = group;
             this.scene.add(this._deviceMarker);
         }
