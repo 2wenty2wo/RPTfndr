@@ -1,9 +1,9 @@
 # MeshCore Signal Tester
 
-Web application for real-time monitoring of LoRa mesh traffic from a MeshCore **companion radio** (Bluetooth, USB, or — in the Android app — WiFi) or a MeshCore **repeater** (USB serial CLI). The connected device type is auto-detected.
+Web application for real-time monitoring of mesh traffic from a MeshCore **companion radio** (Bluetooth, USB, or — in the Android app — WiFi) or a MeshCore **repeater** (USB serial CLI). The connected device type is auto-detected.
 
 ### Live app: [meshcore.kyblsoft.cz/signal-tester](https://meshcore.kyblsoft.cz/signal-tester)
-#### Android app available in [repo releases](https://github.com/kybl/meshcore-signal-tester/releases).</sub>
+#### Android app available in [repo releases](https://github.com/kybl/meshcore-signal-tester/releases).
 
 ## Features
 
@@ -12,26 +12,26 @@ Web application for real-time monitoring of LoRa mesh traffic from a MeshCore **
 - **Packet grouping** — groups every reception by message, so you can see at a glance which repeaters forwarded the same packet and compare their signal side by side. Packets are decoded with `@michaelhart/meshcore-decoder` (type, path, last-hop repeater IDs, RSSI, SNR, payload fields) to drive the grouping and labelling
 - **Seen repeaters table** — per-repeater statistics (RX count, max/last RSSI, max/last SNR, last seen); sortable columns
 - **SNR & RSSI history charts** — scrolling time-series per repeater with noise floor estimate; click a chart dot to highlight one repeater across all views; **zoom and pan the time axis** (mouse wheel, drag across a region, or pinch — both charts share one time window; double-click or **Reset zoom** to restore)
-- **Signal 3D map** — places each received packet as a dot at your GPS position; height encodes SNR (taller = higher SNR); click a dot to select a repeater, turn the camera toward a repeater whose position is known, keep repeaters pinned on the map, or follow your own location as you move (**Center on me** toggles follow mode — any manual pan/rotate leaves it); while capturing live, the map keeps tiles loaded around your current position so you don't move off the map even when no packets are arriving (an imported dataset from elsewhere is left in place); map tile sources: Mapy.com (basic/outdoor/aerial/winter), OpenStreetMap and variants (OpenTopoMap, CyclOSM, Humanitarian, German, French), CARTO (Dark Matter / Positron / Voyager, each also without labels), Esri (Dark/Light Gray Canvas and World Imagery satellite), or **None** for a plain floor; in dark mode the area around the map is black
+- **Signal 3D map** — places each received packet as a dot at your GPS position; height encodes SNR (taller = higher SNR); click a dot to select a repeater, turn the camera toward a repeater whose position is known, keep repeaters pinned on the map, or follow your own location as you move (**Center on me** toggles follow mode — any manual pan/rotate leaves it); while capturing live, the map keeps tiles loaded around your current position so you don't move off the map even when no packets are arriving (an imported dataset from elsewhere is left in place); map tile sources: Mapy.com (basic/outdoor/aerial/winter), OpenStreetMap and variants (OpenTopoMap, CyclOSM, Humanitarian, German, French), CARTO (Dark Matter / Positron / Voyager, each also without labels), Esri (Dark/Light Gray Canvas and World Imagery satellite), or **None** for a plain floor
 - **Discover nodes** — sends an active discovery request; nearby nodes (firmware ≥ v1.10) reply with their public key, name, GPS position, and the SNR they measured for your uplink
 - **Location capture** — every packet is geotagged with your GPS position for the 3D map. In the Android app this starts automatically once you grant the location permission while connecting (and keeps running in the background); one-off GPS outliers are filtered out so your position marker doesn't jump
 - **Received packets table** — one row per unique packet hash, one column pair (RSSI/SNR) per repeater; click a cell to expand full packet detail with ms-precision reception time and raw hex; filterable
-- **CSV import / export** — export the captured packets to a CSV file and re-import them later to review offline; contact metadata is embedded so repeater names and positions survive the round-trip; export covers the full on-disk history, not just what is in memory
+- **CSV import / export** — export the captured packets to a CSV file and re-import them later to review offline (several files can be selected and imported at once, merged into one session); contact metadata is embedded so repeater names and positions survive the round-trip; export covers the full on-disk history, not just what is in memory
 - **Persistent capture** — the session is written to on-disk storage (IndexedDB) as it is captured, so it survives a page reload or app restart (you're asked whether to resume the previous session on launch), and *Auto-remove: Never* keeps the whole history without growing memory without bound. Storage is isolated per browser tab
 - **Repeater ID prefix resolution** — path IDs can arrive as 1–3-byte prefixes of full 4-byte node IDs; the app progressively promotes shorter labels to longer ones, and splits columns into collision labels (e.g. `1234/1289`) when an ID turns out to be ambiguous
 - **Pause / Resume** — suspend data collection without disconnecting; collection pauses automatically on disconnect and resumes on reconnect
-- **Sound** — optional two-note bell/chime on each new packet (off / **disconnect only** / short / medium / long); first note is a fixed 700 Hz tone, second note pitch scales with SNR (0 dB = base, ±10 dB = ±1 octave); *disconnect only* stays silent per-packet but still sounds the disconnect alarm, and any non-off setting sounds it too; when a repeater filter is active, only the filtered repeater(s) trigger sound; setting persisted in localStorage
-- **Auto-remove** — permanently deletes captured data older than a chosen window (30 s … 12 h, or **Never** — the default); packets, signal history, Seen Repeaters and 3D-map points all expire together, and collision labels are recalculated as their evidence ages out. Setting persisted in localStorage
-- **Display window** — separate from Auto-remove: controls how far back each view (table, charts, 3D map) shows, *without* deleting anything (30 s … 12 h, or **All**); defaults to 15 min and can be set no longer than Auto-remove. Persisted in localStorage
+- **Sound** — optional two-note bell/chime on each new packet (off / **disconnect only** / short / medium / long); first note is a fixed 700 Hz tone, second note pitch scales with SNR (0 dB = base, ±10 dB = ±1 octave); *disconnect only* stays silent per-packet but still sounds the disconnect alarm, and any non-off setting sounds it too; when a repeater filter is active, only the filtered repeater(s) trigger sound
+- **Auto-remove** — permanently deletes captured data older than a chosen window (30 s … 12 h, or **Never** — the default); packets, signal history, Seen Repeaters and 3D-map points all expire together, and collision labels are recalculated as their evidence ages out
+- **Display window** — separate from Auto-remove: controls how far back each view (table, charts, 3D map) shows, *without* deleting anything (30 s … 12 h, or **All**); defaults to 15 min and can be set no longer than Auto-remove
 - **Repeater filter** — comma-separated prefix filter that applies to all sections simultaneously (table, charts, map)
-- **Keep screen on** — optional toggle (default on) that prevents the screen from sleeping while collecting data; persisted in localStorage
-- **Device battery** — displays the connected device's battery level, derived from the voltage it reports (MeshCore battery event, opcode `0x0c`) — more reliable than the BLE Battery Service, which some devices misreport as a flat 100%
+- **Keep screen on** — optional toggle (default on) that prevents the screen from sleeping while collecting data
+- **Device battery** — displays the connected device's battery level, derived from the voltage it reports (MeshCore battery event) — more reliable than the BLE Battery Service, which some devices misreport as a flat 100%
 - **Disconnect alarm** — a full-screen warning (and an audible alarm when Sound is enabled) when an established connection drops unexpectedly (cable unplugged, device reset, out of range); a deliberate disconnect doesn't trigger it
-- **Auto-reconnect** — optional toggle (next to the connect buttons) that, after an unexpected drop, silently retries the last device a few times before the disconnect alarm fires; shown only where a silent reconnect is possible — the Android app, or desktop Chrome/Edge, but **not** Bluetooth in a mobile browser, where every connection needs a manual device-picker confirmation; persisted in localStorage
-- **Light / dark theme** — toggle in the header; preference is persisted in localStorage
-- **Text size** — UI scale selector (Small → Larger) for small or high-DPI screens; persisted in localStorage
+- **Auto-reconnect** — optional toggle (next to the connect buttons) that, after an unexpected drop, silently retries the last device a few times before the disconnect alarm fires; shown only where a silent reconnect is possible — the Android app, or desktop Chrome/Edge, but **not** Bluetooth in a mobile browser, where every connection needs a manual device-picker confirmation
+- **Light / dark theme** — toggle in the header
+- **Text size** — UI scale selector (Small → Larger) for small or high-DPI screens
 - **Adjustable dot size** — independent controls for the 2D chart dots (header slider) and the 3D map dots (⚙ menu)
-- **Device location on the 3D map** — optionally shows the connected device's own position as a blue antenna marker (3D map ⚙ menu, off by default). A companion reports its current position via the `SELF_INFO` reply — its live onboard-GPS fix if it has one, otherwise its configured advertised position; a repeater reports it via `get lat` / `get lon` over the CLI. While the marker is shown, a connected companion's position is re-read about once a second (so a device with live GPS tracks your movement); a repeater's position is static and read once on connect. Hidden when the device has no position set
+- **Device location on the 3D map** — optionally shows the connected device's own position as a blue antenna marker (3D map ⚙ menu, off by default). A companion reports its current position — a live onboard-GPS fix if it has one, otherwise its configured advert position; a repeater reports its static configured position. Hidden when the device has no position set
 
 ## Screenshots
 
@@ -57,7 +57,7 @@ Web application for real-time monitoring of LoRa mesh traffic from a MeshCore **
 
 1. Serve the directory over HTTPS or open `index.html` via `localhost`
 2. Click **Connect Bluetooth** (wireless) or **Connect USB** (wired serial) — or, in the Android app, **Connect WiFi** (raw TCP to a WiFi companion) — and select your MeshCore device — a companion radio, or (over USB) a repeater; the type is auto-detected (see [Device detection](#device-detection))
-3. Packet data appears automatically as the device receives LoRa traffic
+3. Packet data appears automatically as the device receives mesh traffic
 
 ## Android app
 

@@ -20,8 +20,9 @@ const TILE_PX        = 256;
 // city-block view. minDistance is derived from it per map scale (see _applyZoomLimits).
 const ZOOM_MIN_VIEW_M = 30;
 // Markers (my-location cone, device, repeater pins) are sized to this fraction of
-// the view height (clamped to a sensible pixel range), so they don't look tiny
-// when the map is enlarged/fullscreen the way a fixed pixel size did.
+// the smaller viewport dimension (clamped to a sensible pixel range), so they
+// don't look tiny on a small map nor balloon when the map is made much taller
+// (e.g. fullscreen on a phone, where only the height grows).
 const MARKER_VIEW_FRAC = 0.10;
 // Reference camera distance: distance from origin when camera is at the initial
 // fit position (0.4r, 0.55r, 0.6r) with r = PLANE_SIZE.  Derived once so that
@@ -342,6 +343,11 @@ export class Signal3DMap {
             this._updateHeightScale();
             this._updatePerspUniforms();
             this._notifyViewChange();
+            // Refresh detail tiles for the new view — fires for programmatic camera
+            // moves too (e.g. "Center on me" following the user), not just drags, so
+            // the map doesn't wait for a manual nudge to fetch tiles. Debounced and
+            // gated by visibility inside _updateOverlay.
+            this._scheduleOverlayUpdate();
         });
         this.controls.addEventListener('end', () => {
             clearTimeout(this._viewUpdateTimer);
@@ -357,6 +363,28 @@ export class Signal3DMap {
             this._userDragging = false;
             if (this._followUser && !this._followTargetInDeadZone()) this.setFollowUser(false);
         });
+
+        // Tile traffic saver: only fetch detail tiles while the map is actually
+        // on-screen — the app in the foreground AND the canvas in the viewport
+        // (it can be scrolled away or its section collapsed). While hidden we just
+        // remember a refresh is due (_overlayPending) and run it once the map is
+        // visible again, so following the user with the screen off / map off-screen
+        // never hits the network.
+        this._mapInView = true;
+        this._overlayPending = false;
+        this._mapPending = false;
+        const onMaybeVisible = () => {
+            if (!this._isMapVisible()) return;
+            if (this._mapPending) this._scheduleMapUpdate();        // base floor first
+            if (this._overlayPending) this._scheduleOverlayUpdate(150);
+        };
+        document.addEventListener('visibilitychange', onMaybeVisible);
+        if (typeof IntersectionObserver !== 'undefined') {
+            new IntersectionObserver((entries) => {
+                this._mapInView = entries.some(e => e.isIntersecting);
+                onMaybeVisible();
+            }, { threshold: 0 }).observe(canvas);
+        }
 
         this._initTwistGesture(canvas);
 
@@ -925,7 +953,14 @@ export class Signal3DMap {
         ctx.textBaseline = 'middle';
         ctx.fillText(emoji, S / 2, S / 2 + 4);
         const tex = new THREE.CanvasTexture(c);
-        const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, depthTest: false });
+        // depthTest: true so the icon is occluded by spheres standing in front of
+        // it — it should sit in the 3D scene, not float permanently on top. Lit
+        // dots write depth (see _makeDotPoints), so the billboard is hidden behind
+        // any ball nearer the camera than the icon's anchor. depthWrite stays false:
+        // the emoji's antialiased edges shouldn't stamp a hard depth halo. The
+        // renderOrder (10, after the dots at 2) ensures the dots have written their
+        // depth before the icon is tested against it.
+        const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, depthTest: true });
         const sprite = new THREE.Sprite(mat);
         sprite.renderOrder = 10;
         sprite.scale.set(3.0, 3.0, 1);
@@ -998,6 +1033,9 @@ export class Signal3DMap {
         }
 
         const tex = new THREE.CanvasTexture(c);
+        // depthTest: false so the text label always stays on top and readable, even
+        // when a sphere is in front of it. (The repeater icon itself is depth-tested
+        // and does hide behind nearer balls — only the label floats above.)
         const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, depthTest: false });
         const sprite = new THREE.Sprite(mat);
         sprite.renderOrder = 10;
@@ -1116,9 +1154,16 @@ export class Signal3DMap {
     }
 
     // Map background (clear colour) and plain-floor colour, both theme-aware.
-    // Dark page → black background so the scene reads as dark regardless of the
-    // chosen tile source.
-    _bgColor()    { return this.isDarkMode() ? 0x000000 : 0xeef2f7; }
+    // The background matches the app's content/table background (the --bg-content
+    // var, e.g. behind "Seen repeaters") so the map sky — and the placeholder
+    // shown mid-resize — blends with the rest of the UI instead of a flat black.
+    _bgColor() {
+        try {
+            const c = getComputedStyle(document.documentElement).getPropertyValue('--bg-content').trim();
+            if (c) return new THREE.Color(c);
+        } catch (_) {}
+        return new THREE.Color(this.isDarkMode() ? 0x091525 : 0xeef2f7);
+    }
     _floorColor() { return this.isDarkMode() ? 0x000000 : 0xdcdcdc; }
 
     // Called by the host app when the page theme (light/dark) toggles.
@@ -1200,6 +1245,19 @@ export class Signal3DMap {
             const bb = this._cameraViewBbox();
             if (bb) this.onViewChange(bb, this._metersPerPixel());
         }, 350);
+    }
+
+    // True when the map can be seen right now: app foreground and the canvas in
+    // the viewport. Gates detail-tile fetches so off-screen following is silent.
+    _isMapVisible() {
+        return !document.hidden && this._mapInView !== false;
+    }
+
+    // Debounced detail-tile refresh. Coalesces the stream of camera-change events
+    // (drag, zoom, follow animation) into one _updateOverlay once movement settles.
+    _scheduleOverlayUpdate(delay = 700) {
+        clearTimeout(this._overlayTimer);
+        this._overlayTimer = setTimeout(() => this._updateOverlay(), delay);
     }
 
     _metersPerPixel() {
@@ -1366,6 +1424,13 @@ export class Signal3DMap {
 
     async _updateMap() {
         if (this._mapBusy) { this._scheduleMapUpdate(); return; }
+        // Traffic saver: don't fetch the base floor while the map is off-screen;
+        // remember it's due and rebuild once visible. When it does run it fits the
+        // *current* data extent into a bounded tile grid (≤ MAX_TILES_AXIS²) — so
+        // even after travelling 100 km it's a handful of tiles for where you are
+        // now, never the whole path.
+        if (!this._isMapVisible()) { this._mapPending = true; return; }
+        this._mapPending = false;
         const bb = this._bbox();
         if (!bb) return;
 
@@ -1745,6 +1810,10 @@ export class Signal3DMap {
 
     async _updateOverlay() {
         if (!this._tileBounds || this._overlayBusy) return;
+        // Traffic saver: if the map isn't on-screen, don't fetch — just mark that a
+        // refresh is due and let it run when the map becomes visible again.
+        if (!this._isMapVisible()) { this._overlayPending = true; return; }
+        this._overlayPending = false;
         if (this._mapSource === 'none') { this._removeOverlay(); return; }  // nothing to detail
         const camBb = this._cameraViewBbox();
         if (!camBb) { this._removeOverlay(); return; }
@@ -2019,11 +2088,14 @@ export class Signal3DMap {
 
     _scaleMarkerToScreen() {
         const screenH = this.canvas.clientHeight || 1;
+        const screenW = this.canvas.clientWidth || 1;
         const ff = fovFactor(this.camera);
-        // Target a fraction of the view height (clamped), not a fixed pixel count,
-        // so markers stay proportional on a small map and don't shrink to nothing
-        // when the map is enlarged / fullscreen.
-        const targetPx = Math.max(30, Math.min(140, MARKER_VIEW_FRAC * screenH));
+        // Target a fraction of the SMALLER viewport dimension (clamped), not a
+        // fixed pixel count — so markers stay proportional on a small map yet
+        // don't blow up when the map is made much taller (e.g. fullscreen on a
+        // phone, where only the height grows). screenH stays in scaleFor below
+        // because that is the px↔world conversion via the camera's vertical FOV.
+        const targetPx = Math.max(30, Math.min(140, MARKER_VIEW_FRAC * Math.min(screenW, screenH)));
         const scaleFor = (group, localH) => {
             const d = this.camera.position.distanceTo(group.position);
             group.scale.setScalar(targetPx * d * ff / (localH * screenH));

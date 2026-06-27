@@ -1,4 +1,4 @@
-package cz.kyblsoft.meshcore
+package cz.kyblsoft.meshcore.signaltester
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -54,6 +54,11 @@ class MainActivity : AppCompatActivity() {
         private set
 
     private lateinit var webView: WebView
+    // Holds the WebView and carries the system-bar / cutout insets as padding
+    // (padding a WebView directly is unreliable — it leaves content under the
+    // bars and can make the page wider than the viewport). The WebView fills
+    // this container, so insetting the container resizes the WebView itself.
+    private lateinit var rootContainer: FrameLayout
     private lateinit var jsApi: JsApi
 
     private val appUrl = "https://appassets.androidplatform.net/assets/www/index.html"
@@ -118,6 +123,18 @@ class MainActivity : AppCompatActivity() {
         cb?.onReceiveValue(if (uri != null) arrayOf(uri) else null)
     }
 
+    // Multi-file variant, used when the page's <input> has the `multiple`
+    // attribute (FileChooserParams.MODE_OPEN_MULTIPLE). The single-file launcher
+    // above ignores that mode, so without this the CSV import could only ever
+    // receive one file regardless of the HTML.
+    private val openMultipleFilesLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris: List<Uri> ->
+        val cb = fileChooserCallback
+        fileChooserCallback = null
+        cb?.onReceiveValue(if (uris.isNotEmpty()) uris.toTypedArray() else null)
+    }
+
     // File picker for CSV export — shows "Save as" dialog via SAF
     private var pendingCsvContent: String? = null
     private var pendingCsvName: String? = null
@@ -137,9 +154,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Hide/show the system bars while an HTML element is in fullscreen.
+    // Hide/show the system bars while an HTML element is in fullscreen. The
+    // window stays edge-to-edge (decorFitsSystemWindows = false, set once in
+    // onCreate); hiding the bars makes the WebView's system-bar insets collapse
+    // to zero, so its padding goes away and it fills the whole screen.
     private fun setImmersiveFullscreen(on: Boolean) {
-        WindowCompat.setDecorFitsSystemWindows(window, !on)
         val controller = WindowInsetsControllerCompat(window, window.decorView)
         if (on) {
             controller.hide(WindowInsetsCompat.Type.systemBars())
@@ -169,7 +188,28 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         webView = WebView(this)
-        setContentView(webView)
+        // True edge-to-edge: the WebView fills the whole window, including behind
+        // the (transparent) status and navigation bars. We deliberately do NOT pad
+        // the container with the system-bar insets — instead the web app pads its
+        // own content with CSS env(safe-area-inset-*) (the page sets
+        // viewport-fit=cover). Not consuming the insets here is exactly what makes
+        // those CSS insets non-zero, so the page background bleeds under the bars
+        // while its content (header, footer) stays clear of them. Status-bar icon
+        // colour is driven from the web theme via ScreenBridge.setLightSystemBars.
+        rootContainer = FrameLayout(this)
+        rootContainer.addView(
+            webView,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        // Transparent bars so the page shows through them instead of the dark
+        // window background (on Android 15 these are ignored — bars are already
+        // transparent in edge-to-edge — but this keeps older versions consistent).
+        window.statusBarColor = android.graphics.Color.TRANSPARENT
+        window.navigationBarColor = android.graphics.Color.TRANSPARENT
+        setContentView(rootContainer)
 
         jsApi = JsApi(webView)
         ble = BleManager(applicationContext, jsApi)
@@ -325,7 +365,12 @@ class MainActivity : AppCompatActivity() {
                 // Cancel any previous pending callback to avoid leaking it.
                 fileChooserCallback?.onReceiveValue(null)
                 fileChooserCallback = filePathCallback
-                openFileLauncher.launch(arrayOf("text/csv", "text/comma-separated-values", "text/*"))
+                val mimeTypes = arrayOf("text/csv", "text/comma-separated-values", "text/*")
+                if (fileChooserParams.mode == FileChooserParams.MODE_OPEN_MULTIPLE) {
+                    openMultipleFilesLauncher.launch(mimeTypes)
+                } else {
+                    openFileLauncher.launch(mimeTypes)
+                }
                 return true
             }
         }
@@ -371,7 +416,14 @@ class MainActivity : AppCompatActivity() {
         customViewCallback = null
 
         webView = WebView(this)
-        setContentView(webView)
+        // Re-insert into the edge-to-edge container (fills the window; the web app
+        // handles safe-area insets in CSS).
+        rootContainer.addView(
+            webView,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
         jsApi.rebind(webView)
         configureWebView()
         // ?recover=1 tells the page this is a crash rebuild (not a fresh launch),
@@ -616,9 +668,12 @@ class MainActivity : AppCompatActivity() {
             AlertDialog.Builder(this)
                 .setTitle("Allow location all the time")
                 .setMessage(
-                    "To record your GPS position while the screen is off, " +
-                    "this app needs the \"Allow all the time\" location permission.\n\n" +
-                    "Tap \"Grant Permission\" and choose \"Allow all the time\" in the next screen."
+                    "MeshCore Signal Tester collects location (GPS) data to tag received " +
+                    "packets with where they were received and to show them on the map — " +
+                    "including in the background, even when the app is closed or not in use, " +
+                    "so capture keeps working with the screen off. This data stays on your " +
+                    "device.\n\n" +
+                    "Tap \"Grant Permission\" and choose \"Allow all the time\" on the next screen."
                 )
                 .setPositiveButton("Grant Permission") { _, _ ->
                     requestBackgroundLocation.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)

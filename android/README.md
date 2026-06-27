@@ -15,7 +15,9 @@ just show the page. Instead:
 - **Native USB serial** (`SerialManager.kt`) owns the USB host connection via
   the [`usb-serial-for-android`](https://github.com/mik3y/usb-serial-for-android)
   library (CDC-ACM, CP21xx, CH34x, FTDI, Prolific), so a companion plugged in
-  over USB-C works just like a Bluetooth one.
+  over USB-C works just like a Bluetooth one. The library is **vendored** as a
+  source module in [`usbSerialForAndroid/`](usbSerialForAndroid/README.md) and
+  built from source (no JitPack), so the whole app builds purely from source.
 - **Native GPS** (`LocationHelper.kt`) streams fixes from the framework
   `LocationManager` (no Google Play Services needed).
 - A **foreground service** (`MeshcoreService.kt`) holds a partial wake lock and
@@ -48,8 +50,46 @@ Or just open the `android/` folder in Android Studio and press Run. The web
 assets are copied from the repo root automatically on every build, so edit the
 web app at the root and rebuild.
 
-> The Gradle wrapper targets Gradle 8.7 / AGP 8.5.2 / Kotlin 1.9.24,
-> `compileSdk`/`targetSdk` 34, `minSdk` 26.
+> The Gradle wrapper targets Gradle 8.7 / AGP 8.6.1 / Kotlin 1.9.24,
+> `compileSdk`/`targetSdk` 35, `build-tools` 35.0.0, `minSdk` 26.
+
+## Reproducible builds
+
+The build is pinned and verified from source so the same inputs produce the
+same output, and so the whole app builds from source (no JitPack — the
+`usb-serial-for-android` library is vendored, see
+[`usbSerialForAndroid/`](usbSerialForAndroid/README.md)).
+
+What is pinned:
+
+* **Gradle distribution** — `distributionSha256Sum` in
+  `gradle/wrapper/gradle-wrapper.properties`; the wrapper refuses to run a
+  distribution that doesn't match.
+* **Build tooling** — AGP, Kotlin and `buildToolsVersion '35.0.0'` are fixed
+  versions (no dynamic/`+` versions anywhere).
+* **Every dependency and Gradle plugin** — `gradle/verification-metadata.xml`
+  holds an SHA-256 checksum for each artifact. Gradle refuses to build if a
+  downloaded artifact's checksum doesn't match, which blocks a tampered or
+  swapped dependency.
+
+Verified: two clean `assembleRelease` builds produce APKs whose every code,
+resource and asset entry is byte-for-byte identical; only the cryptographic
+signature block differs (expected — it is excluded when comparing reproducible
+builds).
+
+### Regenerating the dependency checksums
+
+After changing or bumping a dependency, plugin, or the Android Gradle plugin,
+refresh the verification metadata:
+
+```bash
+cd android
+./gradlew --write-verification-metadata sha256 --refresh-dependencies \
+  assembleDebug assembleRelease lintDebug
+```
+
+Review the diff to `gradle/verification-metadata.xml` before committing, so a
+checksum only changes when you intended to change the corresponding artifact.
 
 ## One-time phone setup (important)
 
@@ -75,7 +115,10 @@ capture with the screen off works over USB too — the foreground service's
 
 ## Package
 
-`cz.kyblsoft.meshcore`
+`cz.kyblsoft.meshcore.signaltester`
+
+(The Kotlin source package and the Android `applicationId` share this name. The
+`cz.kyblsoft.meshcore` prefix is reserved as a namespace for other MeshCore apps.)
 
 ## Author
 

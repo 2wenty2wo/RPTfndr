@@ -1,4 +1,4 @@
-package cz.kyblsoft.meshcore
+package cz.kyblsoft.meshcore.signaltester
 
 import android.webkit.WebView
 import org.json.JSONObject
@@ -47,6 +47,12 @@ class JsApi(webView: WebView) {
     /** Report that a device's GATT connection dropped. */
     fun bleDisconnected(deviceId: String) {
         eval("window.__mcBleDisconnected(${q(deviceId)})")
+    }
+
+    /** Report that the Bluetooth adapter was turned back on (e.g. airplane mode
+     *  off), so the page can restart auto-reconnect. */
+    fun bleAdapterOn() {
+        eval("window.__mcBleAdapterOn && window.__mcBleAdapterOn()")
     }
 
     /** Push a geolocation fix. */

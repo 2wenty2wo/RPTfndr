@@ -1,5 +1,39 @@
 # Changelog
 
+## [1.2.2] - 2026-06-27
+
+### Added
+
+- **Import multiple CSV files at once** — select several files and they're
+  merged in a single import.
+- **3D map keeps loading tiles while "Center on me" follows you** — only while
+  the map is on-screen and the app is in the foreground, to save data.
+- **Auto-reconnect after Bluetooth returns** (for example after leaving
+  airplane mode).
+
+### Changed
+
+- **Android 15 support with true edge-to-edge** — the dark border around the UI
+  is gone; content runs to the screen edges and stays scrollable to the very top.
+- **Android app package renamed** to `cz.kyblsoft.meshcore.signaltester`. It
+  installs as a new app — the previous build is not replaced.
+
+### Fixed
+
+- **"Connected but no packets" after airplane mode** — Bluetooth turning off is
+  now detected as a disconnect instead of leaving the app stuck "connected".
+- **Tables no longer go blank after long runs** — Seen Repeaters and Received
+  Packets are restored from disk once old data ages out of memory.
+- 3D map repeater icons are now correctly hidden behind signal balls in front of
+  them, plus various other UI and chart fixes and polish.
+
+### Internal
+
+- The `usb-serial-for-android` library is vendored and built from source (no
+  JitPack); the build is reproducible with pinned tooling and dependency
+  checksum verification, and a CI workflow builds and lints the app on every
+  change.
+
 ## [1.2.1] - 2026-06-22
 
 ### Added

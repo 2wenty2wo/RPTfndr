@@ -42,6 +42,29 @@
         }, true);
     }
 
+    // ---- native version ---------------------------------------------------
+    // Show the actually-installed APK version (with its versionCode) in the
+    // header. Runs on `load` so it lands after app.js's own init has set the web
+    // version; guarded so a DOM change can never break the app. (The bundled
+    // library's MIT licence stays with its source in the vendored module, so no
+    // in-app licence note is shown.)
+    if (window.AndroidScreen && window.AndroidScreen.appVersion) {
+        window.addEventListener('load', function () {
+            try {
+                var info = {};
+                try { info = JSON.parse(window.AndroidScreen.appVersion() || '{}'); } catch (_) {}
+                if (info && info.name) {
+                    var verEl = document.getElementById('appVersion');
+                    if (verEl) {
+                        verEl.textContent = 'v' + info.name;
+                        verEl.title = 'Version ' + info.name +
+                            (info.code != null ? ' (build ' + info.code + ')' : '');
+                    }
+                }
+            } catch (_) {}
+        });
+    }
+
     // ---- helpers ---------------------------------------------------------
 
     function norm(u) {
@@ -268,6 +291,13 @@
         var d = _devices[devId];
         if (!d) return;
         d._dispatch('gattserverdisconnected', { target: d });
+    };
+
+    // Native host calls this when the Bluetooth adapter is turned back on (e.g.
+    // airplane mode off). Relay it to the app as a window event so it can restart
+    // auto-reconnect even though there is no device proxy to dispatch on.
+    window.__mcBleAdapterOn = function () {
+        try { window.dispatchEvent(new Event('mc-ble-adapter-on')); } catch (_) {}
     };
 
     // ---- navigator.bluetooth polyfill -----------------------------------

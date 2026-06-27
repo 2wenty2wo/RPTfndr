@@ -3,16 +3,28 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+// Version is overridable from the command line / CI so a release build can
+// stamp a strictly-increasing versionCode (Google Play and IzzyOnDroid both
+// reject an upload whose versionCode is not higher than the previous one) and
+// a versionName taken from the git tag. Pass -PappVersionCode=… / -PappVersionName=…
+// or the matching ORG_GRADLE_PROJECT_appVersionCode / …Name env vars. The
+// fallbacks below are used for normal local/debug builds.
+def appVersionCode = (project.findProperty("appVersionCode")?.toString()?.trim()) ?: ""
+def appVersionName = (project.findProperty("appVersionName")?.toString()?.trim()) ?: ""
+
 android {
-    namespace 'cz.kyblsoft.meshcore'
-    compileSdk 34
+    namespace 'cz.kyblsoft.meshcore.signaltester'
+    compileSdk 35
+    // Pin the build-tools version explicitly (reproducible builds) instead of
+    // letting AGP pick its default.
+    buildToolsVersion '35.0.0'
 
     defaultConfig {
-        applicationId "cz.kyblsoft.meshcore"
+        applicationId "cz.kyblsoft.meshcore.signaltester"
         minSdk 26
-        targetSdk 34
-        versionCode 4
-        versionName "1.2.1"
+        targetSdk 35
+        versionCode appVersionCode ? appVersionCode.toInteger() : 5
+        versionName appVersionName ?: "1.2.2"
     }
 
     signingConfigs {
@@ -83,5 +95,7 @@ dependencies {
     implementation 'androidx.webkit:webkit:1.11.0'
     // USB host serial driver (CDC-ACM, CP21xx, CH34x, FTDI, Prolific) — backs
     // the navigator.serial polyfill so the web app's USB connection works.
-    implementation 'com.github.mik3y:usb-serial-for-android:3.10.0'
+    // Vendored and built from source (see ../usbSerialForAndroid) instead of
+    // the former JitPack artifact, so the whole app builds purely from source.
+    implementation project(':usbSerialForAndroid')
 }

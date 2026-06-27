@@ -1,6 +1,6 @@
 // MeshCore Signal Tester Application
 import { MeshCoreDecoder, Utils } from './vendor/meshcore-decoder.js?v=1';
-import { Signal3DMap } from './signal3d.js?v=138';
+import { Signal3DMap } from './signal3d.js?v=145';
 import { PacketStore } from './packet-store.js?v=17';
 import { buildCsv, parseCsv } from './csv.js?v=1';
 import { Store } from './storage.js?v=1';
@@ -9,7 +9,7 @@ import { Store } from './storage.js?v=1';
 // forwarded to the Android wrapper). Bump this on a release alongside the
 // CHANGELOG and the Android versionName. Distinct from the per-asset ?v= cache
 // busters, which change on every edit.
-const APP_VERSION = '1.2.1';
+const APP_VERSION = '1.2.2';
 
 // Contact-sync resilience. The companion streams its whole contact list as a
 // burst of frames after one CMD_GET_CONTACTS; over BLE that burst can overflow
@@ -42,6 +42,7 @@ class MeshCoreApp {
         // or 'serial' (Web Serial, length-prefixed frames). null = disconnected.
         this.transportKind = null;
         this._serialBtnKind = 'serial';    // which connect button acts as Cancel/Disconnect: 'serial' (USB) or 'wifi'
+        this._lastDropWasSurprise = false; // last disconnect was an unexpected drop (vs. user-initiated); gates Bluetooth-back-on auto-reconnect
         this.serialPort = null;
         this.serialReader = null;
         this._serialReadBuffer = new Uint8Array(0);
@@ -107,6 +108,7 @@ class MeshCoreApp {
         this._keepScreenOn = Store.bool('keepScreenOn', true);
         this._unsavedRxCount = 0; // packets received since last CSV export
         this._chartFrozenAt = Date.now();
+        this._lastDataTime = 0;          // newest observation time seen (live or restored); used to freeze the chart at the last point when not collecting
         this._chartZoom = null;          // {tMin,tMax} X-axis zoom window (null = auto/live)
         this._lastChartWindow = null;    // [tMin,tMax] the charts were last drawn with
         this._chartFullWindow = null;    // [tMin,tMax] un-zoomed extent (for clamping)
@@ -183,7 +185,10 @@ class MeshCoreApp {
         } else {
             btn.textContent = '▶ Resume';
             btn.classList.remove('collecting');
-            if (!this._chartFrozenAt) this._chartFrozenAt = Date.now();
+            // Not collecting → freeze the chart at the last point (so it sits at
+            // the right edge with breathing room), not at the wall clock, which
+            // could leave a gap if the last packet arrived a while ago.
+            if (!this._chartFrozenAt) this._chartFrozenAt = (this._lastDataTime || Date.now()) + 1000;
         }
         // While connected, the frame is green when collecting and yellow when
         // paused (Stopped). When disconnected, leave the frame colour alone —
@@ -201,6 +206,15 @@ class MeshCoreApp {
     _syncWakeLock() {
         if (this._collecting && this._keepScreenOn) this.acquireWakeLock();
         else this.releaseWakeLock();
+    }
+
+    // Single source of truth for the empty-state overlay: shown only when there
+    // is no data to display — neither live (RAM) nor restored/imported (on disk).
+    // The <p> text itself is set elsewhere (connect handlers) to reflect status.
+    _updateEmptyState() {
+        if (!this.emptyState) return;
+        const hasData = this.hashData.size > 0 || (this._tableHashCount || 0) > 0;
+        this.emptyState.classList.toggle('hidden', hasData);
     }
 
     initUI() {
@@ -331,6 +345,10 @@ class MeshCoreApp {
                 this._checkTableOverflow(true);
             }, 150);
         });
+
+        // Native host fires this when the Bluetooth adapter is turned back on
+        // (e.g. airplane mode off). See native-bridge.js / BleManager.
+        window.addEventListener('mc-ble-adapter-on', () => this._onBleAdapterOn());
 
         const bindChartTooltip = (svg, type) => {
             if (!svg) return;
@@ -513,6 +531,9 @@ class MeshCoreApp {
             const applyTheme = light => {
                 document.documentElement.classList.toggle('light-theme', light);
                 themeBtn.textContent = light ? '🌙' : '☀️';
+                // Edge-to-edge: match the Android status/nav-bar icon colour to the
+                // theme (light theme → dark icons, and vice versa). No-op on web.
+                try { window.AndroidScreen?.setLightSystemBars?.(light); } catch (_) {}
             };
             let isLight = Store.get('theme') === 'light';
             applyTheme(isLight);
@@ -608,8 +629,8 @@ class MeshCoreApp {
         const importCsvInput = document.getElementById('importCsvInput');
         document.getElementById('importCsvBtn')?.addEventListener('click', () => importCsvInput?.click());
         importCsvInput?.addEventListener('change', () => {
-            const file = importCsvInput.files?.[0];
-            if (file) { this._importCsv(file).catch(e => console.error('CSV import failed:', e)); importCsvInput.value = ''; }
+            const files = importCsvInput.files;
+            if (files && files.length) { this._importCsvFiles(files).catch(e => console.error('CSV import failed:', e)); importCsvInput.value = ''; }
         });
 
         const fsBtn = document.getElementById('mapFullscreenBtn');
@@ -1054,7 +1075,7 @@ class MeshCoreApp {
             'discover':
                 'Sends an active DISCOVER_REQ broadcast — this is not passive listening, it injects traffic into the mesh. Nearby nodes with firmware ≥ v1.10 reply with their public key, name, GPS position, and the SNR they measured for your signal (uplink). Please don\'t press it more than once a minute.',
             'auto-reconnect':
-                'When the connection to the device drops unexpectedly (out of range, device reset, cable unplugged), automatically retry the last device a few times before raising the disconnect alarm. This option only appears where a silent reconnect is possible: the Android app (Bluetooth, USB or WiFi) or desktop Chrome/Edge. It is hidden for Bluetooth in a mobile browser, because there the browser forces a manual device-picker confirmation on every connection for privacy reasons — so it can never reconnect on its own.',
+                'When the connection to the device drops unexpectedly (out of range, device reset, cable unplugged), automatically retry the last device a few times before raising the disconnect alarm. In the Android app it also retries the moment you switch Bluetooth back on — for example after leaving airplane mode. This option only appears where a silent reconnect is possible: the Android app (Bluetooth, USB or WiFi) or desktop Chrome/Edge. It is hidden for Bluetooth in a mobile browser, because there the browser forces a manual device-picker confirmation on every connection for privacy reasons — so it can never reconnect on its own.',
         };
 
         const tipEl = document.getElementById('helpTip');
@@ -1427,6 +1448,7 @@ class MeshCoreApp {
         // A fully-established connection: from here a drop we didn't initiate is
         // a surprise disconnect and should raise the alarm.
         this._wasConnected = true;
+        this._lastDropWasSurprise = false;   // a fresh connection clears any pending reconnect intent
         this._intentionalDisconnect = false;
         this._updatePauseBtn();
         if (this.emptyState) {
@@ -1671,6 +1693,7 @@ class MeshCoreApp {
         // A fully-established connection: from here a drop we didn't initiate is
         // a surprise disconnect and should raise the alarm.
         this._wasConnected = true;
+        this._lastDropWasSurprise = false;   // a fresh connection clears any pending reconnect intent
         this._intentionalDisconnect = false;
         this._updatePauseBtn();
         if (this.emptyState) {
@@ -1710,6 +1733,7 @@ class MeshCoreApp {
         // A fully-established connection: from here a drop we didn't initiate is
         // a surprise disconnect and should raise the alarm.
         this._wasConnected = true;
+        this._lastDropWasSurprise = false;   // a fresh connection clears any pending reconnect intent
         this._intentionalDisconnect = false;
         this._updatePauseBtn();
         if (this.emptyState) {
@@ -3171,6 +3195,7 @@ class MeshCoreApp {
         this.totalRxCount++;
         if (!opts.importing) this._unsavedRxCount++;
         const now = opts.timestamp ?? Date.now();
+        if (now > this._lastDataTime) this._lastDataTime = now;
         if (!opts.importing) this._rxTimestamps.push(now);
         const isNewHash = !this.hashData.has(hash);
         const prevColCount = this.repeaterColumns.length;
@@ -3269,7 +3294,7 @@ class MeshCoreApp {
         const filterText = this._msgFilter.toLowerCase().trim();
         const matchesMsgFilter = !filterText || this._rowMatchesFilter(data, filterText);
         if (matchesMsgFilter && matchesRepFilter) this._playRxSound(snr);
-        this.emptyState?.classList.add('hidden');
+        this._updateEmptyState();
     }
 
     // Coalesce the per-packet table/stats render to ~7×/s. Rebuilding both
@@ -3890,7 +3915,9 @@ class MeshCoreApp {
         const { yMin, yMax } = this._chartYBounds(type);
         const tRange = Math.max(1, tMax - tMin);
         const yRange = Math.max(1e-9, yMax - yMin);
-        const xOf = t => pl + (t - tMin) / tRange * cw;
+        const padX = this._dotSize * 3.5 + 2;          // match _renderChart's data inset
+        const innerW = Math.max(1, cw - 2 * padX);
+        const xOf = t => pl + padX + (t - tMin) / tRange * innerW;
         const yOf = v => pt + (1 - (v - yMin) / yRange) * ch;
         let nearest = null, minDist = Infinity;
         for (const p of pts) {
@@ -4247,7 +4274,11 @@ class MeshCoreApp {
         const tRange = Math.max(1, tMax - tMin);
         const yRange = Math.max(1e-9, yMax - yMin);
 
-        const xOf = t => (pl + (t - tMin) / tRange * cw).toFixed(1);
+        // Inset the data area horizontally so points at the very start/end of the
+        // window aren't drawn half-off the edge (and stay comfortably clickable).
+        const padX = this._dotSize * 3.5 + 2;          // ≈ dot radius + margin
+        const innerW = Math.max(1, cw - 2 * padX);
+        const xOf = t => (pl + padX + (t - tMin) / tRange * innerW).toFixed(1);
         const yOf = v => (pt + (1 - (v - yMin) / yRange) * ch).toFixed(1);
         const valOf = p => type === 'rssi' ? p.rssi : p.snr;
 
@@ -4527,7 +4558,9 @@ class MeshCoreApp {
         const tRange = Math.max(1, tMax - tMin);
         const yRange = Math.max(1e-9, yMax - yMin);
 
-        const xOf = t => pl + (t - tMin) / tRange * cw;
+        const padX = this._dotSize * 3.5 + 2;          // match _renderChart's data inset
+        const innerW = Math.max(1, cw - 2 * padX);
+        const xOf = t => pl + padX + (t - tMin) / tRange * innerW;
         const yOf = v => pt + (1 - (v - yMin) / yRange) * ch;
 
         let nearest = null, minDist = Infinity;
@@ -4638,19 +4671,24 @@ class MeshCoreApp {
         // renderer rebuild (?recover=1, via mc_last_tab), otherwise the within-tab
         // reload's id (sessionStorage survives a reload).
         const isRecover = !!new URLSearchParams(location.search).get('recover');
-        let cur = null;
         if (isRecover) {
+            // Crash rebuild (Android WebView reloads with ?recover=1): silently
+            // re-adopt the just-crashed session. Strip the flag from the URL first
+            // so a later *manual* reload of this page does NOT also resume
+            // silently — a user-initiated reload must always go through the prompt.
+            try { history.replaceState(null, '', location.pathname + location.hash); } catch (_) {}
             try {
                 const last = JSON.parse(localStorage.getItem('mc_last_tab') || 'null');
-                if (last && Date.now() - last.beat < 120000) cur = last.id;
+                if (last && Date.now() - last.beat < 120000) return setTab(last.id);
             } catch (_) {}
         }
-        if (!cur) { try { cur = sessionStorage.getItem('mc_tab'); } catch (_) {} }
 
-        // Never bring back old data without asking — on a manual reload OR a
-        // crash rebuild. If the continued session holds data, ask whether to
-        // resume it or start fresh (declining discards it). An empty session is
-        // resumed silently (nothing to lose).
+        // Manual reload: sessionStorage survives it, so this is the same tab's
+        // session. Never bring its data back without asking — if it holds data,
+        // prompt to resume or start fresh (declining discards it). An empty
+        // session is continued silently (nothing to lose).
+        let cur = null;
+        try { cur = sessionStorage.getItem('mc_tab'); } catch (_) {}
         if (cur) {
             const e = this._readReg()[cur];
             if (e && e.count > 0) {
@@ -4698,17 +4736,21 @@ class MeshCoreApp {
 
     // Mark this session alive and record its packet count, so a later launch can
     // offer to resume it. Also drops databases left by closed empty sessions.
+    // The recorded count is what the resume prompt keys off, so callers update it
+    // right after the count changes (e.g. after a CSV import) rather than waiting
+    // for the next tick.
+    _dbHeartbeat() {
+        try {
+            localStorage.setItem('mc_last_tab', JSON.stringify({ id: this._tabId, beat: Date.now() }));
+            const reg = this._readReg();
+            reg[this._tabId] = { beat: Date.now(), count: this.totalRxCount || 0 };
+            this._writeReg(reg);
+        } catch (_) {}
+    }
+
     _startDbHeartbeat() {
-        const beat = () => {
-            try {
-                localStorage.setItem('mc_last_tab', JSON.stringify({ id: this._tabId, beat: Date.now() }));
-                const reg = this._readReg();
-                reg[this._tabId] = { beat: Date.now(), count: this.totalRxCount || 0 };
-                this._writeReg(reg);
-            } catch (_) {}
-        };
-        beat();
-        setInterval(beat, 15000);   // runs for the app's lifetime
+        this._dbHeartbeat();
+        setInterval(() => this._dbHeartbeat(), 15000);   // runs for the app's lifetime
     }
 
     // Garbage-collect databases of closed sessions that hold no data (stale and
@@ -4746,12 +4788,15 @@ class MeshCoreApp {
             return;
         }
         this._storeReady = true;
-        this._startDbHeartbeat();
         this.store.onQuotaExceeded = () => this._onStorageQuota();
         try {
             const totals = await this.store.getKV('totals');
             if (totals && Number.isFinite(totals.totalRxCount)) this.totalRxCount = totals.totalRxCount;
         } catch (_) {}
+        // Start the heartbeat only after counters are restored, so its first write
+        // records the real packet count — not a transient 0 that would make a
+        // quick reload resume silently (the resume prompt keys off this count).
+        this._startDbHeartbeat();
         // Restore persisted contacts (names, GPS, types) so the repeater map
         // markers and column names survive a reload / renderer-crash rebuild.
         try {
@@ -4763,12 +4808,25 @@ class MeshCoreApp {
             }
         } catch (_) {}
         await this._replayWindow();
+        // Not collecting on startup: freeze the chart at the newest stored point
+        // (+1 s) so restored history fills the view instead of being squashed
+        // against the left edge while the right edge tracks the wall clock. Use the
+        // newest time on DISK — _lastDataTime only reflects the recent RAM replay
+        // window, and restored data can be far older than that. Set before the
+        // first render and the wide-view rebuild so both use this window.
+        if (!this._collecting) {
+            try {
+                const span = await this.store._obsSpan(-Infinity, Infinity);
+                if (span) this._chartFrozenAt = span.max + 1000;
+            } catch (_) {}
+        }
         this._scheduleChartRender();
         this._renderMsgTable();
         this._renderRepTable();
         this._updateStats();
         this._updateMapPins();   // contacts restored above ⇒ show repeater markers
         this._refreshWideView();
+        this._updateEmptyState();
         // No periodic wide-view tick: charts, map and table page 0 are all kept
         // current in RAM (bucket/cell upserts + the live row tail); writes flush
         // themselves via _scheduleWriteFlush. Disk is only read on view changes.
@@ -4889,6 +4947,10 @@ class MeshCoreApp {
                 this._rebuildChartBase(),     // time-bucket cache for the 2D charts
             ]);
             this._renderCacheAt = boundary;
+            // _tableHashCount is now authoritative for on-disk data, so the empty
+            // state can resolve correctly even when nothing is in the RAM window
+            // (e.g. imported/restored history older than it).
+            this._updateEmptyState();
         } catch (e) {
             console.warn('Wide-view rebuild failed:', e);
         }
@@ -4928,15 +4990,25 @@ class MeshCoreApp {
         // a newer build owns the base, so discard this (possibly different-window)
         // result rather than clobbering it.
         const lifetime = this.DISPLAY_LIFETIME;
-        const from = isFinite(lifetime) ? Date.now() - lifetime : -Infinity;
+        // Bucket over the same window the charts actually render: [from, nowRef].
+        // nowRef is the frozen chart clock (import / paused) or live now. Bounding
+        // the upper edge matters because bucketObs derives the bucket width from
+        // the queried span: with an unbounded `to`, any obs newer than nowRef
+        // (e.g. leftover live captures, or rows newer than an imported-and-frozen
+        // session) would stretch the width, collapsing all in-view points into a
+        // couple of buckets — they'd render as one vertical column until a zoom
+        // (whose layer is window-bounded) rebuilt a finer grid. Using nowRef for
+        // `from` too keeps the window consistent with the frozen clock.
+        const nowRef = this._chartFrozenAt ?? Date.now();
+        const from = isFinite(lifetime) ? nowRef - lifetime : -Infinity;
         try {
-            const { buckets, width, lo } = await this.store.bucketObs(from, Infinity, this.DOWNSAMPLE_BUCKETS);
+            const { buckets, width, lo } = await this.store.bucketObs(from, nowRef, this.DOWNSAMPLE_BUCKETS);
             if (this.DISPLAY_LIFETIME !== lifetime) return;
             const cells = new Map();
             for (const b of buckets) cells.set(b.rawId + '|' + b.bIdx, b);
             this._chartBase = { cells, width, lo };
             const sent = [];
-            await this.store.eachSent(from, Infinity, r =>
+            await this.store.eachSent(from, nowRef, r =>
                 sent.push({ time: r.time, snr: r.snr, col: this._resolveColReadonly(r.rawId), label: r.label }));
             this._wideSentPoints = sent;
             this._sentChartAt = Date.now();   // live sent points after this are the tail
@@ -4960,7 +5032,10 @@ class MeshCoreApp {
     // (≈ the newest bucket's midpoint).
     _restoreRepStatsFromBase() {
         const base = this._chartBase;
-        if (!base) return;
+        // No base yet (e.g. it was dropped and not rebuilt): kick a rebuild so the
+        // Seen Repeaters table can be re-seeded from disk once it lands, instead of
+        // silently staying empty after the RAM tail ages out.
+        if (!base) { if (this._storeReady) this._ensureChartBase(); return; }
         const agg = new Map();
         for (const b of base.cells.values()) {
             const col = this._resolveColReadonly(b.rawId);
@@ -5490,7 +5565,7 @@ class MeshCoreApp {
             this._renderMsgTable();
             this._renderRepTable();
             this._updateStats();
-            if (this.hashData.size === 0 && this.emptyState) this.emptyState.classList.remove('hidden');
+            this._updateEmptyState();
         }, 400);
     }
 
@@ -5583,6 +5658,12 @@ class MeshCoreApp {
         // cause of "only 3 repeaters until I toggled Display": the restore ran
         // only on a Display change, never after a routine prune.)
         this._restoreRepStatsFromBase();
+        // Likewise refresh the Received Packets table from disk. Its page-0
+        // snapshot is otherwise only reloaded on a Display change, so once the
+        // live RAM tail ages out (long session with Auto-remove "Never" / a wide
+        // Display window) the table would go empty even though the history is
+        // still on disk — unlike the charts/map, which read disk-backed caches.
+        if (this._storeReady) this._loadTablePage(this._tablePage);
     }
 
     _clearAllData() {
@@ -5612,6 +5693,7 @@ class MeshCoreApp {
         this._sentWriteBuf = [];
         this._hashWriteBuf = [];
         this.totalRxCount = 0;
+        this._lastDataTime = 0;
         this.store?.clearAll();
         this._dscSeq = 0;
         this.repeaterColumns = [];
@@ -5633,7 +5715,8 @@ class MeshCoreApp {
         this._updateStats();
         this._updateContactsCount();
         this._updateMapPins();
-        if (this.emptyState) this.emptyState.classList.remove('hidden');
+        this._updateEmptyState();
+        this._dbHeartbeat();   // record the now-empty count so a reload won't offer to resume
         // Re-create the (now empty) chart/map cache layers so live upserts have
         // somewhere to land — nothing else rebuilds them outside Display changes.
         this._refreshWideView();
@@ -6086,6 +6169,18 @@ class MeshCoreApp {
     // with backoff (reusing quickConnect, which handles every transport). Falls
     // back to the disconnect alarm if it can't get back. Only the zero-friction
     // paths (BLE getDevices / saved serial / WiFi) work without a user gesture.
+    // Bluetooth came back (e.g. airplane mode off). If we'd dropped unexpectedly
+    // and want back, restart auto-reconnect — the earlier cycle may have given up
+    // while the adapter was down. Guards: only with auto-reconnect on, only after
+    // a surprise drop (not a manual disconnect), and not while already connected
+    // or mid-reconnect.
+    _onBleAdapterOn() {
+        if (!this._autoReconnect || !this._lastDropWasSurprise) return;
+        if (this.device || this.serialPort || this._reconnecting) return;
+        if (!this._lastConnectedId) return;
+        this._startAutoReconnect();
+    }
+
     _startAutoReconnect() {
         if (this._reconnecting) return;
         this._reconnecting = true;
@@ -6388,47 +6483,77 @@ class MeshCoreApp {
         URL.revokeObjectURL(url);
     }
 
-    async _importCsv(file) {
-        let text;
-        try { text = await file.text(); } catch { alert('Could not read file.'); return; }
+    // Back-compat single-file entry point.
+    _importCsv(file) { return this._importCsvFiles([file]); }
 
-        const parsed = parseCsv(text);
-        if (parsed.error === 'empty') return;
+    // Import one or more CSV files as a single batch. Every file is read and
+    // parsed first, then all their rows are merged, deduped and ingested
+    // together — so the user is prompted once and the expensive finalize (disk
+    // flush, wide-view rebuild, re-render, camera fit) runs once for the whole
+    // selection rather than once per file.
+    async _importCsvFiles(files) {
+        files = Array.from(files || []).filter(Boolean);
+        if (!files.length) return;
 
-        // Merge any contacts embedded in the CSV (new keys only, keep existing).
-        // Done before the header check so a malformed body still imports contacts.
-        for (const c of parsed.contacts) {
-            if (!this._contacts.has(c.pubKeyFullHex)) {
-                this._contacts.set(c.pubKeyFullHex,
-                    { name: c.name, type: null, lat: c.lat, lon: c.lon, lastAdvert: 0, lastmod: 0, pubKeyFullHex: c.pubKeyFullHex });
+        // Read + parse every file up front. Contacts embedded in any file are
+        // merged immediately (new keys only, keep existing) — done even for a
+        // malformed body, so contacts still import. Files that fail the header
+        // check are collected and reported once at the end.
+        const parsedFiles = [];
+        const badFormat = [];
+        for (const file of files) {
+            let text;
+            try { text = await file.text(); }
+            catch { console.warn('Could not read file:', file.name); badFormat.push(`${file.name} (unreadable)`); continue; }
+
+            const parsed = parseCsv(text);
+            if (parsed.error === 'empty') continue;
+
+            for (const c of parsed.contacts) {
+                if (!this._contacts.has(c.pubKeyFullHex)) {
+                    this._contacts.set(c.pubKeyFullHex,
+                        { name: c.name, type: null, lat: c.lat, lon: c.lon, lastAdvert: 0, lastmod: 0, pubKeyFullHex: c.pubKeyFullHex });
+                }
             }
+
+            if (!parsed.ok) { if (parsed.error === 'format') badFormat.push(file.name); continue; }
+            parsedFiles.push({ rows: parsed.rows, sentRows: parsed.sentRows });
         }
+
         this._updateContactsCount();
-        this._scheduleContactsPersist();   // persist any contacts embedded in the CSV
+        this._scheduleContactsPersist();   // persist any contacts embedded in the CSVs
 
-        if (!parsed.ok) {
-            if (parsed.error === 'format')
-                alert('Unrecognised CSV format — expected columns: time, hash, repeater.');
-            return;
-        }
+        if (badFormat.length)
+            alert(`Unrecognised CSV format — expected columns: time, hash, repeater.\nSkipped: ${badFormat.join(', ')}`);
 
-        const rows = parsed.rows;
-        const sentSnrRows = parsed.sentRows;
+        // Merge rows from all files into one batch.
+        const rows = parsedFiles.flatMap(f => f.rows);
+        const sentSnrRows = parsedFiles.flatMap(f => f.sentRows);
         if (rows.length === 0 && sentSnrRows.length === 0) return;
 
         const importBtn = document.getElementById('importCsvBtn');
         const prevBtnText = importBtn?.textContent;
         if (importBtn) { importBtn.textContent = 'Importing…'; importBtn.disabled = true; }
         const prevStatus = this.statusTextEl?.textContent;
-        if (this.statusTextEl) this.statusTextEl.textContent = 'Importing CSV…';
+        if (this.statusTextEl) this.statusTextEl.textContent = files.length > 1 ? `Importing ${files.length} CSV files…` : 'Importing CSV…';
         // Overlay the yellow "importing" tint without dropping the current
         // connection-state class (which governs child visibility).
         this.statusEl?.classList.add('importing');
 
         await new Promise(r => setTimeout(r, 0)); // yield to let the browser repaint
 
-        if (this.hashData.size > 0) {
-            if (!confirm(`There are already ${this.hashData.size} packet(s) loaded. Packets from the CSV will be added; existing entries are kept unchanged. Continue?`)) {
+        // Count what's actually stored, not just the small RAM window. hashData
+        // only holds the recent in-memory window (often a few dozen hashes), while
+        // the disk may hold many thousands — so reporting hashData.size here showed
+        // a confusingly tiny number. Use the on-disk distinct-hash total when the
+        // store is ready (this also warns correctly after a reload, when the RAM
+        // window can be empty even though the disk is full).
+        let existingCount = this.hashData.size;
+        if (this._storeReady) {
+            try { existingCount = await this.store.countHashes(); } catch (_) {}
+        }
+        if (existingCount > 0) {
+            if (!confirm(`There are already ${existingCount} packet(s) loaded. Packets from the CSV will be added; existing entries are kept unchanged. Continue?`)) {
                 // Cancelled: restore the button/status that were set above.
                 if (importBtn) { importBtn.textContent = prevBtnText; importBtn.disabled = false; }
                 this.statusEl?.classList.remove('importing');
@@ -6531,6 +6656,14 @@ class MeshCoreApp {
             this._renderChart('snr');
         }
 
+        // Freeze the chart clock at the last imported packet's time (+1 s) so all
+        // imported data stays in view. This must happen BEFORE the wide-view
+        // rebuild below: _rebuildChartBase buckets over [from, frozen-now], so if
+        // the freeze still held an older value the most recent imported points
+        // would be truncated from the base layer and only reappear on a zoom.
+        const lastTime = rows.length ? rows.reduce((m, r) => Math.max(m, r.time), 0) : 0;
+        if (!this._collecting && lastTime) this._chartFrozenAt = lastTime + 1_000;
+
         // Persist the import to disk and rebuild the downsampled "All" overlay,
         // so imported (historical) data survives the RAM-window prune and shows.
         if (this._storeReady) {
@@ -6541,16 +6674,17 @@ class MeshCoreApp {
         this._sortColumns();
         // Move the 3D map camera to show all imported points regardless of current GPS location
         this.signalMap?.fitCamera?.();
-        // Freeze chart at last packet time + 1 min so all imported data is in view
-        const lastTime = rows.length ? rows[rows.length - 1].time : 0;
-        if (!this._collecting && lastTime) this._chartFrozenAt = lastTime + 1_000;
         this._renderMsgTable();
         this._renderRepTable();
         this._scheduleChartRender();
         this._updateStats();
         this._updateMapPins();
         this._updateShowAllBtn();
-        this.emptyState?.classList.add('hidden');
+        this._updateEmptyState();
+        // Record the post-import packet count immediately so a reload right after
+        // an import still prompts to resume (the prompt keys off this count, and
+        // the periodic heartbeat might not have run yet).
+        this._dbHeartbeat();
         requestAnimationFrame(() => this._checkTableOverflow(true));
 
         if (importBtn) { importBtn.textContent = prevBtnText; importBtn.disabled = false; }
@@ -6733,6 +6867,10 @@ class MeshCoreApp {
         const surprise = this._wasConnected && !this._intentionalDisconnect;
         this._wasConnected = false;
         this._intentionalDisconnect = false;
+        // Remember whether we'd want to come back: a surprise drop yes, a manual
+        // disconnect no. Bluetooth turning back on (e.g. after airplane mode) uses
+        // this to decide whether to restart auto-reconnect after it gave up.
+        this._lastDropWasSurprise = surprise;
         if (this._reconnecting) return;   // a reconnect cycle already owns the recovery
         if (surprise) {
             this._playDisconnectAlarm();   // audible cue on every unexpected drop (if sound on)
