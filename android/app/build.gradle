@@ -23,8 +23,15 @@ android {
         applicationId "cz.kyblsoft.meshcore.signaltester"
         minSdk 26
         targetSdk 35
-        versionCode appVersionCode ? appVersionCode.toInteger() : 5
-        versionName appVersionName ?: "1.2.2"
+        // The version number lives in several places — keep them in sync when
+        // bumping (see the full list in app.js next to APP_VERSION):
+        //   • app.js APP_VERSION (must match this versionName)
+        //   • CHANGELOG.md (new dated entry)
+        //   • fastlane/metadata/android/en-US/changelogs/<versionCode>.txt (new file)
+        // versionCode is a separate monotonic integer (Play/IzzyOnDroid reject a
+        // non-increasing one) and also names the fastlane changelog file above.
+        versionCode appVersionCode ? appVersionCode.toInteger() : 6
+        versionName appVersionName ?: "1.2.3"   // keep == app.js APP_VERSION
     }
 
     signingConfigs {
@@ -44,6 +51,32 @@ android {
         }
     }
 
+    buildFeatures {
+        buildConfig true
+    }
+
+    // Two distribution flavors that differ ONLY in the battery-optimization nudge:
+    //  - play   : Google Play build. Opens the general battery-optimization
+    //             settings list (no special permission) — Play restricts the
+    //             one-tap exemption dialog.
+    //  - direct : GitHub / F-Droid / sideload build. Adds the
+    //             REQUEST_IGNORE_BATTERY_OPTIMIZATIONS permission (see
+    //             src/direct/AndroidManifest.xml) and uses the one-tap system
+    //             exemption dialog — friendlier, and fine off-Play.
+    // Same applicationId for both (same app, different channels). DIRECT_BATTERY_PROMPT
+    // drives the runtime branch in MainActivity.checkBatteryOptimization().
+    flavorDimensions = ['distribution']
+    productFlavors {
+        play {
+            dimension 'distribution'
+            buildConfigField 'boolean', 'DIRECT_BATTERY_PROMPT', 'false'
+        }
+        direct {
+            dimension 'distribution'
+            buildConfigField 'boolean', 'DIRECT_BATTERY_PROMPT', 'true'
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
@@ -54,7 +87,7 @@ android {
 
     applicationVariants.all { variant ->
         variant.outputs.all { output ->
-            outputFileName = "meshcore-signal-tester-${variant.buildType.name}.apk"
+            outputFileName = "meshcore-signal-tester-${variant.flavorName}-${variant.buildType.name}.apk"
         }
     }
 }
@@ -74,6 +107,11 @@ tasks.register('copyWebApp', Copy) {
         include 'storage.js'
         include 'signal3d.js'
         include 'packet-store.js'
+        include 'column-key.js'
+        include 'frame.js'
+        include 'geo.js'
+        include 'maplod.js'
+        include 'chart-zoom.js'
         include 'style.css'
         include 'native-bridge.js'
         include 'logo.svg'

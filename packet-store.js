@@ -39,7 +39,9 @@ const PS_DB_VERSION = 3;
 // to the box's neighbourhood rather than all of history.
 const PS_QBITS = 16, PS_QMAX = (1 << PS_QBITS) - 1;
 
-function ps_part1by1(n) {
+// Exported (alongside ps_qx/ps_qy/ps_morton/ps_bigmin) for unit testing the
+// spatial index in isolation — see test/spatial.test.js.
+export function ps_part1by1(n) {
     n &= 0xffff;
     n = (n | (n << 8)) & 0x00ff00ff;
     n = (n | (n << 4)) & 0x0f0f0f0f;
@@ -48,10 +50,11 @@ function ps_part1by1(n) {
     return n >>> 0;
 }
 
-function ps_qx(lon) { return Math.max(0, Math.min(PS_QMAX, Math.round((lon + 180) / 360 * PS_QMAX))); }
-function ps_qy(lat) { return Math.max(0, Math.min(PS_QMAX, Math.round((lat + 90)  / 180 * PS_QMAX))); }
+export const PS_QUANT_MAX = PS_QMAX;
+export function ps_qx(lon) { return Math.max(0, Math.min(PS_QMAX, Math.round((lon + 180) / 360 * PS_QMAX))); }
+export function ps_qy(lat) { return Math.max(0, Math.min(PS_QMAX, Math.round((lat + 90)  / 180 * PS_QMAX))); }
 
-function ps_morton(lat, lon) {
+export function ps_morton(lat, lon) {
     return (ps_part1by1(ps_qx(lon)) | (ps_part1by1(ps_qy(lat)) << 1)) >>> 0;
 }
 
@@ -76,7 +79,7 @@ function ps_loadDim(value, p, set) {
 // Smallest Morton code >= zcur that lies within the box [zmin, zmax]
 // (zmin = morton(SW corner), zmax = morton(NE corner)); -1 if there is none.
 // Tropf & Herzog's BIGMIN, walking bits MSB→LSB.
-function ps_bigmin(zcur, zmin, zmax) {
+export function ps_bigmin(zcur, zmin, zmax) {
     let bm = -1, dmin = zmin >>> 0, dmax = zmax >>> 0;
     for (let p = 31; p >= 0; p--) {
         const bit = (1 << p) >>> 0;
@@ -262,6 +265,31 @@ export class PacketStore {
         await this._write('hashes', os => { for (const r of records) os.put(r); });
     }
 
+    /** Like putHashes but never regresses a hash already on disk: keeps the
+     *  earliest firstSeen and preserves an already-stored type/meta instead of
+     *  overwriting it. Used by the live write-flush, where "new hash" is judged
+     *  against the RAM window and so can be true for a hash still on disk (aged
+     *  out of RAM) — a plain put() there would reset its firstSeen (jumping the
+     *  packet to the top of the time-sorted table) and null out its type/meta. */
+    async putHashesMerge(records) {
+        if (!records || !records.length) return;
+        await this._write('hashes', os => {
+            for (const r of records) {
+                const g = os.get(r.hash);
+                g.onsuccess = () => {
+                    const ex = g.result;
+                    if (!ex) { os.put(r); return; }
+                    os.put({
+                        hash: r.hash,
+                        firstSeen: Math.min(ex.firstSeen ?? Infinity, r.firstSeen ?? Infinity),
+                        type: ex.type ?? r.type ?? null,
+                        meta: ex.meta ?? r.meta ?? null,
+                    });
+                };
+            }
+        });
+    }
+
     async getHash(hash) {
         return this._read('hashes', os => os.get(hash), null, r => r ?? null);
     }
@@ -359,8 +387,8 @@ export class PacketStore {
                         step();
                         return;
                     }
-                    tailPks.add(cur.value[pk]);
                     const go = deliver(cur.value);
+                    tailPks.add(cur.value[pk]);
                     if (go === null) return;
                     if (!go) { resolve(); return; }
                     cur.continue();
@@ -478,7 +506,10 @@ export class PacketStore {
                       snrMin: Infinity, snrMax: -Infinity, snrSum: 0, snrN: 0,
                       rssiMin: Infinity, rssiMax: -Infinity, rssiSum: 0, rssiN: 0,
                       lastSnrT: -Infinity, lastSnr: null, lastRssiT: -Infinity, lastRssi: null,
-                      lat: null, lon: null, lastTime: 0 };
+                      lat: null, lon: null, lastTime: 0,
+                      // First obs's exact time + hash, surfaced only for count===1
+                      // buckets so the chart tooltip can show ms + look up the type.
+                      firstTime: r.time, hash: r.hash };
                 groups.set(key, g);
             }
             g.count++;
@@ -510,6 +541,9 @@ export class PacketStore {
                 lastSnr: g.lastSnr, lastSnrT: g.lastSnrT,
                 lastRssi: g.lastRssi, lastRssiT: g.lastRssiT,
                 lat: g.lat, lon: g.lon,
+                // Single-reception bucket = one packet: expose its exact time and
+                // hash so the tooltip shows ms and can resolve the packet type.
+                ...(g.count === 1 ? { exactTime: g.firstTime, hash: g.hash } : {}),
             });
         }
         out.sort((a, b) => a.time - b.time);
@@ -566,14 +600,14 @@ export class PacketStore {
      *  cells, grouped by rawId. Keeps one representative per (rawId, cell): the
      *  strongest-RSSI observation, plus a count. Optionally clipped to bbox.
      *  Output is bounded by (#cells × #rawIds), independent of input size. */
-    async gridObs(fromTime, toTime, cellMeters, bbox = null) {
-        if (!this.db || !(cellMeters > 0)) return [];
-        const latCell = cellMeters / 111320;
+    // Aggregate positioned obs into per-repeater grid cells. `cellFn(lat, lon)`
+    // returns the cell indices {gx, gy}; the caller (app.js) supplies the map
+    // LOD binning (maplod.cellIndices) so cell definition lives in one place.
+    async gridObs(fromTime, toTime, cellFn, bbox = null) {
+        if (!this.db || typeof cellFn !== 'function') return [];
         const groups = new Map(); // `${rawId}|${gx}|${gy}` -> representative
         await this._eachPositioned(fromTime, toTime, bbox, r => {
-            const lonCell = cellMeters / (111320 * Math.cos(r.lat * Math.PI / 180) || 1);
-            const gy = Math.round(r.lat / latCell);
-            const gx = Math.round(r.lon / lonCell);
+            const { gx, gy } = cellFn(r.lat, r.lon);
             const key = r.rawId + '|' + gx + '|' + gy;
             let g = groups.get(key);
             if (!g) { g = { rawId: r.rawId, lat: r.lat, lon: r.lon, snr: r.snr, rssi: r.rssi, time: r.time, count: 0 }; groups.set(key, g); }
@@ -698,7 +732,7 @@ export class PacketStore {
                         if (probe.result === undefined) { cur.delete(); deletedHashes++; }
                         cur.continue();
                     };
-                    probe.onerror = () => cur.continue();
+                    probe.onerror = (e) => { e.preventDefault(); cur.continue(); };
                 };
                 tx.oncomplete = () => resolve();
                 tx.onerror = () => reject(tx.error);

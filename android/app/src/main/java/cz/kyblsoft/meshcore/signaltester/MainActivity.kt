@@ -33,6 +33,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -41,6 +42,19 @@ import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Locale
+
+// Human-readable byte size in SI (decimal, base-1000) units — B, kB, MB, GB —
+// as requested for the "file saved" toast (not binary KiB/MiB). One decimal
+// place from kB up; whole bytes below 1 kB.
+internal fun formatBytesSI(bytes: Int): String {
+    if (bytes < 1000) return "$bytes B"
+    val units = arrayOf("kB", "MB", "GB", "TB")
+    var value = bytes.toDouble() / 1000.0
+    var i = 0
+    while (value >= 1000.0 && i < units.size - 1) { value /= 1000.0; i++ }
+    return String.format(Locale.US, "%.1f %s", value, units[i])
+}
 
 class MainActivity : AppCompatActivity() {
 
@@ -59,7 +73,8 @@ class MainActivity : AppCompatActivity() {
     // bars and can make the page wider than the viewport). The WebView fills
     // this container, so insetting the container resizes the WebView itself.
     private lateinit var rootContainer: FrameLayout
-    private lateinit var jsApi: JsApi
+    lateinit var jsApi: JsApi
+        private set
 
     private val appUrl = "https://appassets.androidplatform.net/assets/www/index.html"
 
@@ -68,32 +83,46 @@ class MainActivity : AppCompatActivity() {
     companion object {
         // Each warning is shown at most once per process lifetime.
         private var batteryCheckShown = false
-        private var bgLocationCheckShown = false
+
+        // Keys for persisting a pending CSV export across process death while the
+        // SAF "Save as" dialog is open (see onSaveInstanceState).
+        private const val KEY_PENDING_CSV = "pendingCsvContent"
+        private const val KEY_PENDING_CSV_NAME = "pendingCsvName"
+        // A Bundle isn't meant for many-MB payloads; skip persisting very large
+        // exports (accept the rare edge over risking a TransactionTooLarge).
+        private const val MAX_SAVED_CSV_CHARS = 256 * 1024
     }
 
     // ---- scanning state (one picker at a time) ----
     private var scanCallback: ScanCallback? = null
+    // The 20 s "stop scanning to save battery" timer. Held so it can be
+    // cancelled when the picker resolves/cancels early — otherwise it would
+    // later stop a subsequent scan.
+    private var scanTimeoutRunnable: Runnable? = null
     private var pickerDialog: AlertDialog? = null
     private var pickerResolved = false
     private val foundAddrs = ArrayList<String>()
     private val foundNames = ArrayList<String>()
 
-    private var _onPermsGranted: (() -> Unit)? = null
+    private var _onPermsResult: ((Boolean) -> Unit)? = null
 
     private val requestPerms = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) {
-        MeshcoreService.start(this)
-        // Connect-flow grant doubles as the trigger to start GPS capture, so the
-        // map geotags packets from connect time without a separate button tap.
-        if (hasLocationPermission()) jsApi.locationPermissionGranted()
-        _onPermsGranted?.invoke()
-        _onPermsGranted = null
+    ) { result ->
+        // Empty map (system dismissed the request without a decision) ⇒ denied.
+        val granted = result.isNotEmpty() && result.values.all { it }
+        // Start the foreground service only when we actually hold location (its
+        // declared FGS type); starting it with everything denied can crash on
+        // Android 14+ (ForegroundServiceDidNotStartInTime).
+        if (hasLocationPermission()) {
+            MeshcoreService.start(this)
+            // Connect-flow grant doubles as the trigger to start GPS capture, so
+            // the map geotags packets from connect time without a separate tap.
+            jsApi.locationPermissionGranted()
+        }
+        _onPermsResult?.invoke(granted)
+        _onPermsResult = null
     }
-
-    private val requestBackgroundLocation = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { /* user decides in settings; capture still works while screen is on */ }
 
     // The map's "Enable location" button. Separate from requestPerms (the
     // connect flow) because enabling the map location must NOT start the
@@ -147,8 +176,10 @@ class MainActivity : AppCompatActivity() {
         pendingCsvName = null
         if (uri == null) return@registerForActivityResult   // user cancelled the dialog
         try {
-            contentResolver.openOutputStream(uri)?.use { it.write(content.toByteArray(Charsets.UTF_8)) }
-            Toast.makeText(this, "File ${displayNameOf(uri) ?: suggested} saved.", Toast.LENGTH_LONG).show()
+            // Encode once and reuse for both the write and the reported size.
+            val bytes = content.toByteArray(Charsets.UTF_8)
+            contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+            Toast.makeText(this, "File ${displayNameOf(uri) ?: suggested} saved (${formatBytesSI(bytes.size)}).", Toast.LENGTH_LONG).show()
         } catch (e: Exception) {
             Toast.makeText(this, "Save failed: ${e.message}", Toast.LENGTH_LONG).show()
         }
@@ -221,7 +252,27 @@ class MainActivity : AppCompatActivity() {
         webView.loadUrl(appUrl)
         wireBackHandler()
 
+        // Restore a pending CSV export if the process was killed while the SAF
+        // "Save as" dialog was open — otherwise the callback writes a 0-byte file.
+        if (savedInstanceState != null) {
+            pendingCsvContent = savedInstanceState.getString(KEY_PENDING_CSV)
+            pendingCsvName = savedInstanceState.getString(KEY_PENDING_CSV_NAME)
+        }
+
         // Permissions are requested lazily at BLE connect time.
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // Persist the in-flight CSV content so a process death while the SAF
+        // picker is up doesn't leave the CreateDocument callback with nothing to
+        // write. Size-guarded to stay well under the Binder transaction limit.
+        pendingCsvContent?.let {
+            if (it.length <= MAX_SAVED_CSV_CHARS) {
+                outState.putString(KEY_PENDING_CSV, it)
+                outState.putString(KEY_PENDING_CSV_NAME, pendingCsvName)
+            }
+        }
     }
 
     // Build (or rebuild) this WebView's settings, JS bridges and clients.
@@ -435,6 +486,13 @@ class MainActivity : AppCompatActivity() {
         stopScan()
         location.stop()
         MeshcoreService.stop(this)
+        // Close the live radio connections and unregister the managers' receivers
+        // before tearing down the WebView, so a destroyed activity doesn't leak
+        // the GATT / serial port / TCP socket or the adapter/USB receivers. Each
+        // is guarded so one failure doesn't skip the rest.
+        try { ble.close() } catch (_: Exception) {}
+        try { serial.cleanup() } catch (_: Exception) {}
+        try { wifi.close() } catch (_: Exception) {}
         webView.destroy()
         super.onDestroy()
     }
@@ -454,7 +512,11 @@ class MainActivity : AppCompatActivity() {
         ))
     }
 
-    fun ensureConnectPermissions(includeBluetooth: Boolean = true, onGranted: () -> Unit) {
+    fun ensureConnectPermissions(
+        includeBluetooth: Boolean = true,
+        onDenied: (() -> Unit)? = null,
+        onGranted: () -> Unit
+    ) {
         val missing = Permissions.connectPermissions(includeBluetooth).filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
@@ -464,16 +526,54 @@ class MainActivity : AppCompatActivity() {
             jsApi.locationPermissionGranted()
             onGranted()
         } else {
-            _onPermsGranted = onGranted
+            _onPermsResult = { granted ->
+                if (granted) {
+                    MeshcoreService.start(this)
+                    if (hasLocationPermission()) jsApi.locationPermissionGranted()
+                    onGranted()
+                } else {
+                    // Guide the user to Settings if the perms are permanently
+                    // denied (no prompt will appear again), then reject the call.
+                    maybePromptAppSettings(missing)
+                    onDenied?.invoke()
+                }
+            }
             requestPerms.launch(missing.toTypedArray())
         }
+    }
+
+    // After a denial, if every still-missing permission is permanently denied
+    // (the system will no longer show a prompt), surface a Toast and open the
+    // app's settings screen so the user isn't stuck. Best-effort and defensive.
+    private fun maybePromptAppSettings(perms: List<String>) {
+        val stillMissing = perms.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (stillMissing.isEmpty()) return
+        val permanentlyDenied = stillMissing.all {
+            !ActivityCompat.shouldShowRequestPermissionRationale(this, it)
+        }
+        if (!permanentlyDenied) return
+        Toast.makeText(this, "Permission required — enable it in Settings", Toast.LENGTH_LONG).show()
+        try {
+            startActivity(Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:$packageName")
+            ))
+        } catch (_: Exception) {}
     }
 
     // ---- device picker (called from BleBridge) --------------------------
 
     fun requestDevice(reqId: String, filtersJson: String) {
         val prefixes = parsePrefixes(filtersJson)
-        main.post { ensureConnectPermissions { startScanDialog(reqId, prefixes) } }
+        main.post {
+            ensureConnectPermissions(
+                onDenied = {
+                    jsApi.resolve(reqId, false, errJson(BridgeError.SECURITY, "Bluetooth permission not granted"))
+                }
+            ) { startScanDialog(reqId, prefixes) }
+        }
     }
 
     // ---- USB serial picker (called from SerialBridge) -------------------
@@ -559,8 +659,12 @@ class MainActivity : AppCompatActivity() {
             ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(),
             callback
         )
-        // Stop scanning after 20 s to save battery; the dialog stays open.
-        main.postDelayed({ stopScan() }, 20_000)
+        // Stop scanning after 20 s to save battery; the dialog stays open. Held
+        // so an early resolve/cancel can cancel it (see stopScan).
+        scanTimeoutRunnable?.let { main.removeCallbacks(it) }
+        val timeout = Runnable { stopScan() }
+        scanTimeoutRunnable = timeout
+        main.postDelayed(timeout, 20_000)
 
         pickerDialog = AlertDialog.Builder(this)
             .setTitle("Select MeshCore device")
@@ -597,6 +701,10 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("MissingPermission")
     private fun stopScan() {
+        // Cancel the 20 s battery timer so it can't stop a later scan. Runs even
+        // when there's no active scan (resolvePicker/cancelPicker both call here).
+        scanTimeoutRunnable?.let { main.removeCallbacks(it) }
+        scanTimeoutRunnable = null
         val cb = scanCallback ?: return
         scanCallback = null
         try {
@@ -633,50 +741,45 @@ class MainActivity : AppCompatActivity() {
             val pm = getSystemService(POWER_SERVICE) as PowerManager
             if (pm.isIgnoringBatteryOptimizations(packageName)) return@post
             batteryCheckShown = true
+            val common = "Battery optimization is active for this app. Android may suspend " +
+                "signal capture when the screen turns off — which defeats the main purpose " +
+                "of the app.\n\n"
+            // The 'direct' flavor can pop the one-tap system exemption dialog; the
+            // 'play' flavor sends the user to the settings list to do it manually
+            // (Google Play restricts the one-tap permission). See build.gradle.
+            val message = common + if (BuildConfig.DIRECT_BATTERY_PROMPT)
+                "Tap \"Open Settings\" and allow it to run unrestricted in the background."
+            else
+                "Tap \"Open Settings\", find MeshCore Signal Tester in the list, and set it " +
+                "to unrestricted (not optimized)."
             AlertDialog.Builder(this)
                 .setTitle("Allow unrestricted background use")
-                .setMessage(
-                    "Battery optimization is active for this app. " +
-                    "Android may suspend signal capture when the screen turns off — " +
-                    "which defeats the main purpose of the app.\n\n" +
-                    "Tap \"Open Settings\" and allow the app to run unrestricted in the background."
-                )
+                .setMessage(message)
                 .setPositiveButton("Open Settings") { _, _ ->
-                    try {
-                        startActivity(Intent(
-                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                            Uri.parse("package:$packageName")
-                        ))
-                    } catch (_: Exception) {
-                        startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                    // Direct build: try the one-tap exemption dialog first. Play build
+                    // (or any failure): fall back to the general settings list, then to
+                    // the app-details screen.
+                    var opened = false
+                    if (BuildConfig.DIRECT_BATTERY_PROMPT) {
+                        opened = try {
+                            startActivity(Intent(
+                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:$packageName")
+                            )); true
+                        } catch (_: Exception) { false }
                     }
-                }
-                .setNegativeButton("Later", null)
-                .show()
-        }
-    }
-
-    fun checkBackgroundLocation() {
-        if (Build.VERSION.SDK_INT < 29) return
-        main.post {
-            if (bgLocationCheckShown) return@post
-            val bgGranted = ContextCompat.checkSelfPermission(
-                this, Manifest.permission.ACCESS_BACKGROUND_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
-            if (bgGranted) return@post
-            bgLocationCheckShown = true
-            AlertDialog.Builder(this)
-                .setTitle("Allow location all the time")
-                .setMessage(
-                    "MeshCore Signal Tester collects location (GPS) data to tag received " +
-                    "packets with where they were received and to show them on the map — " +
-                    "including in the background, even when the app is closed or not in use, " +
-                    "so capture keeps working with the screen off. This data stays on your " +
-                    "device.\n\n" +
-                    "Tap \"Grant Permission\" and choose \"Allow all the time\" on the next screen."
-                )
-                .setPositiveButton("Grant Permission") { _, _ ->
-                    requestBackgroundLocation.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                    if (!opened) {
+                        try {
+                            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                        } catch (_: Exception) {
+                            try {
+                                startActivity(Intent(
+                                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                    Uri.parse("package:$packageName")
+                                ))
+                            } catch (_: Exception) {}
+                        }
+                    }
                 }
                 .setNegativeButton("Later", null)
                 .show()

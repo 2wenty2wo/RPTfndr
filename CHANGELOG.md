@@ -1,5 +1,71 @@
 # Changelog
 
+<!-- On a release, the version number must be bumped in several places (see the
+     full list in app.js next to APP_VERSION):
+       - app.js APP_VERSION
+       - android/app/build.gradle versionName (== APP_VERSION) and versionCode
+       - a new dated entry below
+       - fastlane/metadata/android/en-US/changelogs/<versionCode>.txt -->
+
+## [1.2.3] - 2026-07-10
+
+### Added
+
+- **Tap a point in a 2D chart to open that packet** in the Received Packets
+  table.
+
+### Changed
+
+- **2D charts now follow live data while zoomed in** — during measurement a
+  zoomed SNR/RSSI chart keeps up with new packets at the right edge and stays
+  within the recorded time range, instead of drifting onto old or empty time.
+- **The 2D-chart tooltip shows the time down to the millisecond and the packet
+  type**, plus how many receptions a clustered point stands for.
+- **Smoother, steadier 3D-map clustering** — points no longer flicker or shuffle
+  as you move or zoom the camera, more individual points are shown when you zoom
+  into a sparse area, and points appear right after zooming in.
+- **Received Packets columns are ordered by recent activity** — the most active
+  repeaters lead, and columns with nothing in the newest packets no longer jump
+  to the front (noticeable right after loading saved data).
+- **CSV export shows the saved file's size**, and the notification's speaker
+  icon appears as "(🔊)" when sound is set to "Disconnect only".
+
+### Fixed
+
+- **The 3D-map show/hide (eye) button now works for repeaters that share an ID
+  prefix** (collision columns).
+- **No more duplicate rows for the same repeater** when it is seen at different
+  ID lengths over a long run.
+- **The Received Packets table no longer clears** when you open certain repeater
+  columns.
+- **Seen Repeaters no longer scrolls on its own** — it jumps to a repeater only
+  when you select it.
+- **The "Load previously captured data?" prompt reliably appears** when you
+  reopen the app with saved data.
+- **"Show all repeaters" now works for loaded or long-running sessions** — it
+  places every known repeater that has a position, not only the ones that sent a
+  packet in the recent in-memory window (previously it could do nothing even
+  though each repeater still appeared when clicked individually).
+- **No more burst of queued beeps** when you return to the app after it was in
+  the background — per-packet sounds keep playing while the phone still allows
+  audio, but once it suspends audio in the background they're skipped instead of
+  piling up and all playing at once on return.
+
+### Internal
+
+- **Unit test suite** (`node --test`, 84 tests) covering CSV round-trips, the
+  spatial index, tile/geo math, serial framing, repeater ID collision handling,
+  the 3D-map LOD pyramid, and the chart zoom window — run automatically by a new
+  GitHub Actions workflow on every push.
+- Several self-contained pieces of logic were **extracted from `app.js` into
+  pure, tested modules**: `column-key.js` (repeater ID prefix/collision
+  semantics), `frame.js` (serial frame extraction), `geo.js` (map tile math),
+  `maplod.js` (3D-map level-of-detail pyramid), and `chart-zoom.js` (live-follow
+  zoom window).
+- **Headless-browser regression harness** (`tools/browser-check`) that drives
+  the real page in Chromium — imports a CSV and asserts the stats, column order,
+  and "Show all repeaters" behave; used before every build.
+
 ## [1.2.2] - 2026-06-27
 
 ### Added
