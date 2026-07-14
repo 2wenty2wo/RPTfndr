@@ -1,0 +1,20 @@
+MeshCore Finder
+
+This project is a fork and substantial TypeScript rework of
+kybl/meshcore-signal-tester by Aleš Janda:
+https://github.com/kybl/meshcore-signal-tester
+
+The upstream MIT licence and copyright notice are retained in LICENSE.
+Ported concepts include the MeshCore companion BLE exchange, GPS kinematic
+filter, spatial/indexing patterns, CSV handling, Web Audio cues, wake-lock
+behaviour, and browser test patterns. Git history retains the original files.
+
+Packet decoding uses @michaelhart/meshcore-decoder, version 0.3.x, distributed
+under its own MIT licence:
+https://www.npmjs.com/package/@michaelhart/meshcore-decoder
+
+Bundled third-party components and their required copyright/licence notices are
+listed in public/THIRD_PARTY_NOTICES.txt. That file is copied into every
+production build.
+
+Map tiles are requested from OpenStreetMap and attributed in the map UI.
