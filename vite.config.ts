@@ -10,8 +10,14 @@ function commit(): string {
   }
 }
 
+function deploymentBasePath(value: string | undefined): string {
+  const trimmed = value?.trim();
+  if (!trimmed) return './';
+  return trimmed.endsWith('/') ? trimmed : `${trimmed}/`;
+}
+
 export default defineConfig({
-  base: process.env.BASE_PATH ?? './',
+  base: deploymentBasePath(process.env.BASE_PATH),
   define: {
     __APP_VERSION__: JSON.stringify(process.env.npm_package_version ?? '1.0.0'),
     __COMMIT__: JSON.stringify(commit()),
@@ -23,10 +29,11 @@ export default defineConfig({
       manifest: {
         name: 'MeshCore Finder',
         short_name: 'MC Finder',
-        description: 'Local-first relative-signal search tool for a MeshCore repeater.',
+        description: 'Hosted relative-signal search PWA with device-local data for a MeshCore repeater.',
         theme_color: '#07130f',
         background_color: '#07130f',
         display: 'standalone',
+        id: './',
         start_url: './',
         scope: './',
         icons: [

@@ -1,6 +1,6 @@
 export const WORDING = {
   estimateTitle: 'Strongest confirmed search area',
-  estimateBasis: 'Based on relative signal strength from provably direct target transmissions. This is not an exact position.',
+  estimateBasis: 'Based on relative signal strength from provably direct target transmissions. This is an approximate search area, not a transmitter coordinate.',
   morePasses: 'More passes are needed before a search area can be estimated.',
   moreCells: 'Collect confirmed receptions from more places and directions.',
   noConfirmed: 'No provably direct target transmissions have been heard yet.',

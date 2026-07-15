@@ -18,6 +18,19 @@ export interface TargetIdentity {
   name?: string;
 }
 
+/**
+ * Coordinates supplied by a repeater advert or contact record. MeshCore
+ * administrators enter these values manually, so they are display-only and
+ * must never be treated as a measured target position.
+ */
+export interface AdvertisedReferencePosition {
+  lat: number;
+  lon: number;
+  source: 'advert' | 'contact';
+  observedAt: number;
+  trust: 'untrusted-admin';
+}
+
 export interface TargetProfile {
   id: string;
   label: string;
@@ -25,7 +38,7 @@ export interface TargetProfile {
   source: 'manual' | 'contacts' | 'observed';
   pinnedFrom?: string;
   notes?: string;
-  lastKnown?: { lat: number; lon: number; label: string };
+  advertisedReference?: AdvertisedReferencePosition;
   photoBlobId?: string;
   createdAt: number;
   updatedAt: number;

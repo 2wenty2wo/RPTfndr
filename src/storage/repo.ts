@@ -349,8 +349,13 @@ export class FinderRepository {
     });
     const importedEvents = events.map((source) => {
       const record = structuredClone(source);
+      const oldConfirmedReceptionId = record.type === 'bearing'
+        && typeof record.data.confirmedReceptionId === 'number'
+        ? record.data.confirmedReceptionId
+        : undefined;
       delete record.id;
-      return record;
+      if (oldConfirmedReceptionId !== undefined) delete record.data.confirmedReceptionId;
+      return { record, oldConfirmedReceptionId };
     });
     const oldFixIds = uniqueArchiveIds(importedFixes, 'fix');
     const oldReceptionIds = uniqueArchiveIds(importedReceptions, 'reception');
@@ -361,6 +366,21 @@ export class FinderRepository {
       if (reception.oldDupOf !== undefined && !oldReceptionIds.has(reception.oldDupOf)) {
         throw new Error(`Reception references missing archived reception ${reception.oldDupOf}`);
       }
+    }
+    for (const event of importedEvents) {
+      if (event.oldConfirmedReceptionId === undefined) continue;
+      const linked = importedReceptions.find(({ oldId }) => oldId === event.oldConfirmedReceptionId);
+      if (!linked) {
+        throw new Error(`Bearing references missing archived reception ${event.oldConfirmedReceptionId}`);
+      }
+      if (!linked.record.cls.confirmed || linked.record.conf !== 1) {
+        throw new Error(`Bearing references non-confirmed archived reception ${event.oldConfirmedReceptionId}`);
+      }
+      const confirmedReceptionAgeMs = event.record.t - linked.record.t;
+      if (confirmedReceptionAgeMs < 0) {
+        throw new Error(`Bearing references a later archived reception ${event.oldConfirmedReceptionId}`);
+      }
+      event.record.data.confirmedReceptionAgeMs = confirmedReceptionAgeMs;
     }
     let importedSession = reconcileImportedSession(
       structuredClone(session),
@@ -402,6 +422,7 @@ export class FinderRepository {
       trackRequestError(sessionStore.add(structuredClone(importedSession)));
       const receptionStore = transaction.objectStore(STORES.receptions);
       const fixStore = transaction.objectStore(STORES.fixes);
+      const eventStore = transaction.objectStore(STORES.events);
       const persistRemappedReceptionLinks = (): void => {
         pendingIdAssignments -= 1;
         if (pendingIdAssignments !== 0) return;
@@ -421,6 +442,16 @@ export class FinderRepository {
               imported.record.dupOf = dupOf;
             }
             trackRequestError(receptionStore.put(structuredClone(imported.record)));
+          }
+          for (const imported of importedEvents) {
+            if (imported.oldConfirmedReceptionId !== undefined) {
+              const confirmedReceptionId = receptionIdMap.get(imported.oldConfirmedReceptionId);
+              if (confirmedReceptionId === undefined) {
+                throw new Error(`Unable to remap archived reception ${imported.oldConfirmedReceptionId}`);
+              }
+              imported.record.data.confirmedReceptionId = confirmedReceptionId;
+            }
+            trackRequestError(eventStore.add(structuredClone(imported.record)));
           }
           importedSession = reconcileImportedSession(
             importedSession,
@@ -458,9 +489,10 @@ export class FinderRepository {
           }
         });
       }
-
-      const eventStore = transaction.objectStore(STORES.events);
-      for (const event of importedEvents) trackRequestError(eventStore.add(event));
+      if (pendingIdAssignments === 0) {
+        pendingIdAssignments = 1;
+        persistRemappedReceptionLinks();
+      }
     } catch (error) {
       abortImport(error);
     }

@@ -1,6 +1,21 @@
 import L, { type Map as LeafletMap } from 'leaflet';
+import type { BearingConsensus, FinalApproachEstimate } from '../location';
 import type { AreaEstimate, Reception, SessionEvent, TargetProfile } from '../types';
-import { createFinderLayers, drawBearings, drawEstimate, drawReceptions, drawTargetReference, type FinderLayers } from './layers';
+import { createFinderLayers, drawApproachZones, drawBearings, drawEstimate, drawReceptions, drawTargetReference, type FinderLayers } from './layers';
+
+/**
+ * Only measured reception positions may frame the operational map. The target
+ * argument makes the trust boundary explicit: its admin-configured reference
+ * is deliberately ignored even when the display layer is enabled.
+ */
+export function finderViewportPoints(
+  receptions: readonly Reception[],
+  _target?: TargetProfile,
+): Array<[number, number]> {
+  return receptions
+    .filter((item) => item.gps.lat != null && item.gps.lon != null)
+    .map((item) => [item.gps.lat!, item.gps.lon!] as [number, number]);
+}
 
 export class FinderMap {
   #map?: LeafletMap;
@@ -10,18 +25,25 @@ export class FinderMap {
     return this.#map !== undefined;
   }
 
-  mount(element: HTMLElement, receptions: Reception[], estimate?: AreaEstimate, events: SessionEvent[] = [], target?: TargetProfile): void {
+  mount(
+    element: HTMLElement,
+    receptions: Reception[],
+    estimate?: AreaEstimate,
+    events: SessionEvent[] = [],
+    target?: TargetProfile,
+    showUntrustedAdminPosition = false,
+    bearingConsensus?: BearingConsensus,
+    finalApproach?: FinalApproachEstimate,
+  ): void {
     this.destroy();
     this.#map = L.map(element, { zoomControl: true, preferCanvas: true, attributionControl: true });
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
     }).addTo(this.#map);
-    this.#layers = createFinderLayers(this.#map);
-    this.update(receptions, estimate, events, target);
-    const located = receptions.filter((item) => item.gps.lat != null && item.gps.lon != null);
-    const points = located.map((item) => [item.gps.lat!, item.gps.lon!] as [number, number]);
-    if (points.length === 0 && target?.lastKnown) points.push([target.lastKnown.lat, target.lastKnown.lon]);
+    this.#layers = createFinderLayers(this.#map, showUntrustedAdminPosition);
+    this.update(receptions, estimate, events, target, bearingConsensus, finalApproach);
+    const points = finderViewportPoints(receptions, target);
     if (points.length) {
       const bounds = L.latLngBounds(points);
       this.#map.fitBounds(bounds.pad(0.2), { maxZoom: 17 });
@@ -31,11 +53,19 @@ export class FinderMap {
     setTimeout(() => this.#map?.invalidateSize(), 0);
   }
 
-  update(receptions: Reception[], estimate?: AreaEstimate, events: SessionEvent[] = [], target?: TargetProfile): void {
+  update(
+    receptions: Reception[],
+    estimate?: AreaEstimate,
+    events: SessionEvent[] = [],
+    target?: TargetProfile,
+    bearingConsensus?: BearingConsensus,
+    finalApproach?: FinalApproachEstimate,
+  ): void {
     if (!this.#layers) return;
     drawReceptions(receptions, this.#layers);
     drawEstimate(estimate, this.#layers);
     drawBearings(events, this.#layers);
+    drawApproachZones(bearingConsensus, finalApproach, this.#layers);
     drawTargetReference(target, this.#layers);
   }
 

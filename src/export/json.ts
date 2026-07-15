@@ -7,14 +7,19 @@ import type {
   SearchSession,
   SessionEvent,
 } from '../types';
+import type { BearingConsensus, FinalApproachEstimate } from '../location';
+import {
+  normalizeSearchSessionRecord,
+  normalizeSessionEventRecord,
+} from '../normalize';
 import { sha256Hex } from './hash';
 
 export const ARCHIVE_FORMAT = 'meshcore-finder-session' as const;
-export const ARCHIVE_VERSION = 1 as const;
+export const ARCHIVE_VERSION = 2 as const;
 export const JSON_ARCHIVE_MIME = 'application/vnd.meshcore-finder.session+json';
 export const DEFAULT_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
 
-export interface SessionArchiveV1 {
+export interface SessionArchiveV2 {
   format: typeof ARCHIVE_FORMAT;
   version: typeof ARCHIVE_VERSION;
   exportedAt: string;
@@ -26,8 +31,14 @@ export interface SessionArchiveV1 {
   derived?: {
     cells?: CellAggregate[];
     estimate?: AreaEstimate;
+    bearingConsensus?: BearingConsensus;
+    finalApproach?: FinalApproachEstimate;
   };
 }
+
+export type SessionArchive = SessionArchiveV2;
+/** @deprecated Use SessionArchive; retained as a source-compatible alias. */
+export type SessionArchiveV1 = SessionArchiveV2;
 
 export interface SessionArchiveInput {
   session: SearchSession;
@@ -36,11 +47,13 @@ export interface SessionArchiveInput {
   events: SessionEvent[];
   cells?: CellAggregate[];
   estimate?: AreaEstimate;
+  bearingConsensus?: BearingConsensus;
+  finalApproach?: FinalApproachEstimate;
   exportedAt?: Date | string;
 }
 
 export interface JsonArchiveExport {
-  archive: SessionArchiveV1;
+  archive: SessionArchive;
   json: string;
   sha256: string;
   filename: string;
@@ -53,7 +66,7 @@ export interface ArchiveValidationIssue {
 }
 
 export type ArchiveValidationResult =
-  | { ok: true; archive: SessionArchiveV1 }
+  | { ok: true; archive: SessionArchive }
   | { ok: false; issues: ArchiveValidationIssue[] };
 
 export interface ArchiveParseOptions {
@@ -70,11 +83,11 @@ export class ArchiveValidationError extends Error {
   }
 }
 
-export function createSessionArchive(input: SessionArchiveInput): SessionArchiveV1 {
+export function createSessionArchive(input: SessionArchiveInput): SessionArchive {
   const exportedAt = input.exportedAt instanceof Date
     ? input.exportedAt.toISOString()
     : input.exportedAt ?? new Date().toISOString();
-  const archive: SessionArchiveV1 = {
+  const archive: SessionArchive = {
     format: ARCHIVE_FORMAT,
     version: ARCHIVE_VERSION,
     exportedAt,
@@ -84,19 +97,21 @@ export function createSessionArchive(input: SessionArchiveInput): SessionArchive
     fixes: input.fixes,
     events: input.events,
   };
-  if (input.cells || input.estimate) {
+  if (input.cells || input.estimate || input.bearingConsensus || input.finalApproach) {
     archive.derived = {
       ...(input.cells ? { cells: input.cells } : {}),
       ...(input.estimate ? { estimate: input.estimate } : {}),
+      ...(input.bearingConsensus ? { bearingConsensus: input.bearingConsensus } : {}),
+      ...(input.finalApproach ? { finalApproach: input.finalApproach } : {}),
     };
   }
   // Clone through JSON so the exported snapshot cannot be mutated by live
   // session state and cannot contain unsupported values such as BigInt/cycles.
-  return cloneJson(archive);
+  return normalizeArchive(cloneJson(archive)) as SessionArchive;
 }
 
 export function serializeSessionArchive(
-  archive: SessionArchiveV1,
+  archive: SessionArchive,
   options: { pretty?: boolean; canonical?: boolean } = {},
 ): string {
   const value = options.canonical === false ? archive : sortObjectKeys(archive);
@@ -123,7 +138,7 @@ export async function createJsonArchiveExport(
 export function parseSessionArchive(
   text: string,
   options: ArchiveParseOptions = {},
-): SessionArchiveV1 {
+): SessionArchive {
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_ARCHIVE_BYTES;
   if (new TextEncoder().encode(text).byteLength > maxBytes) {
     throw new ArchiveValidationError([{ path: '$', message: `archive exceeds ${maxBytes} bytes` }]);
@@ -144,10 +159,41 @@ export function parseSessionArchive(
 
 export const importSessionArchive = parseSessionArchive;
 
+/**
+ * Upgrade legacy archive records in memory before validation. Imports always
+ * return the canonical v2 shape, so re-exporting never perpetuates legacy
+ * coordinate trust semantics or bearing field names.
+ */
+function normalizeArchive(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  let changed = false;
+  const next: Record<string, unknown> = { ...value };
+  if (value.version === 1) {
+    next.version = ARCHIVE_VERSION;
+    changed = true;
+  }
+
+  const session = normalizeSearchSessionRecord(value.session);
+  if (session.changed) {
+    next.session = session.value;
+    changed = true;
+  }
+
+  if (Array.isArray(value.events)) {
+    const events = value.events.map((event) => normalizeSessionEventRecord(event));
+    if (events.some((event) => event.changed)) {
+      next.events = events.map((event) => event.value);
+      changed = true;
+    }
+  }
+  return changed ? next : value;
+}
+
 export function validateSessionArchive(
   value: unknown,
   options: ArchiveParseOptions = {},
 ): ArchiveValidationResult {
+  value = normalizeArchive(value);
   const issues: ArchiveValidationIssue[] = [];
   const issue = (path: string, message: string): void => { issues.push({ path, message }); };
   if (!isRecord(value)) return { ok: false, issues: [{ path: '$', message: 'must be an object' }] };
@@ -181,13 +227,52 @@ export function validateSessionArchive(
     if (value.derived.estimate !== undefined && !isRecord(value.derived.estimate)) {
       issue('$.derived.estimate', 'must be an object');
     }
+    if (value.derived.bearingConsensus !== undefined && !isRecord(value.derived.bearingConsensus)) {
+      issue('$.derived.bearingConsensus', 'must be an object');
+    } else if (isRecord(value.derived.bearingConsensus)) {
+      validateApproximateZone(value.derived.bearingConsensus, '$.derived.bearingConsensus', issue, false);
+    }
+    if (value.derived.finalApproach !== undefined && !isRecord(value.derived.finalApproach)) {
+      issue('$.derived.finalApproach', 'must be an object');
+    } else if (isRecord(value.derived.finalApproach)) {
+      validateApproximateZone(value.derived.finalApproach, '$.derived.finalApproach', issue, true);
+    }
   }
 
   if (issues.length > 0) return { ok: false, issues };
-  return { ok: true, archive: cloneJson(value) as unknown as SessionArchiveV1 };
+  return { ok: true, archive: cloneJson(value) as unknown as SessionArchive };
 }
 
-export function archiveFilename(archive: Pick<SessionArchiveV1, 'session'>): string {
+function validateApproximateZone(
+  value: Record<string, unknown>,
+  path: string,
+  issue: (path: string, message: string) => void,
+  requireReady: boolean,
+): void {
+  if (value.approximate !== true) issue(`${path}.approximate`, 'must be true');
+  if (!['low', 'medium', 'high'].includes(String(value.confidence))) {
+    issue(`${path}.confidence`, 'must be low, medium, or high');
+  }
+  if (requireReady && typeof value.ready !== 'boolean') issue(`${path}.ready`, 'must be a boolean');
+  if (value.polygon !== undefined) {
+    if (!Array.isArray(value.polygon) || value.polygon.length < 3) {
+      issue(`${path}.polygon`, 'must contain at least three coordinate pairs');
+    } else {
+      value.polygon.forEach((coordinate, index) => {
+        if (!Array.isArray(coordinate) || coordinate.length !== 2) {
+          issue(`${path}.polygon[${index}]`, 'must be a [latitude, longitude] pair');
+          return;
+        }
+        validateCoordinates(coordinate[0], coordinate[1], `${path}.polygon[${index}]`, issue);
+      });
+    }
+  }
+  if (!Array.isArray(value.contributingObservationIds)) {
+    issue(`${path}.contributingObservationIds`, 'must be an array');
+  }
+}
+
+export function archiveFilename(archive: Pick<SessionArchive, 'session'>): string {
   const date = new Date(archive.session.startedAt).toISOString().slice(0, 10);
   const title = archive.session.title
     .normalize('NFKD')
@@ -289,14 +374,26 @@ function validateTarget(value: unknown, issue: (path: string, message: string) =
   } else if (value.identity.name === undefined) {
     issue(`${path}.identity.name`, 'must be a non-empty name');
   }
-  if (value.lastKnown !== undefined) {
-    if (!isRecord(value.lastKnown)) issue(`${path}.lastKnown`, 'must be an object');
+  if (value.advertisedReference !== undefined) {
+    if (!isRecord(value.advertisedReference)) {
+      issue(`${path}.advertisedReference`, 'must be an object');
+    }
     else {
-      validateCoordinates(value.lastKnown.lat, value.lastKnown.lon, `${path}.lastKnown`, issue);
-      if (!isNonEmptyString(value.lastKnown.label, 500)) {
-        issue(`${path}.lastKnown.label`, 'must be a non-empty label');
+      const reference = value.advertisedReference;
+      validateCoordinates(reference.lat, reference.lon, `${path}.advertisedReference`, issue);
+      if (!['advert', 'contact'].includes(String(reference.source))) {
+        issue(`${path}.advertisedReference.source`, 'must be advert or contact');
+      }
+      if (!isTimestamp(reference.observedAt)) {
+        issue(`${path}.advertisedReference.observedAt`, 'must be a valid timestamp');
+      }
+      if (reference.trust !== 'untrusted-admin') {
+        issue(`${path}.advertisedReference.trust`, 'must identify untrusted admin metadata');
       }
     }
+  }
+  if (value.lastKnown !== undefined) {
+    issue(`${path}.lastKnown`, 'could not be migrated to an advertised reference position');
   }
 }
 
@@ -505,7 +602,41 @@ function validateEvent(
   if (value.sessionId !== sessionId) issue(`${path}.sessionId`, 'must match the archive session');
   if (!isTimestamp(value.t)) issue(`${path}.t`, 'must be a valid timestamp');
   if (!['note', 'mark', 'bearing', 'discovery-cmd', 'lifecycle', 'identity-change', 'suspension-gap'].includes(String(value.type))) issue(`${path}.type`, 'is invalid');
-  if (!isRecord(value.data)) issue(`${path}.data`, 'must be an object');
+  if (!isRecord(value.data)) {
+    issue(`${path}.data`, 'must be an object');
+  } else if (value.type === 'bearing') {
+    validateCoordinates(value.data.lat, value.data.lon, `${path}.data`, issue);
+    if (!isFiniteNumber(value.data.bearingDeg)
+        || value.data.bearingDeg < 0
+        || value.data.bearingDeg >= 360) {
+      issue(`${path}.data.bearingDeg`, 'must be between 0 and less than 360');
+    }
+    if (value.data.accuracyDeg !== undefined
+        && (!isFiniteNumber(value.data.accuracyDeg)
+          || value.data.accuracyDeg <= 0
+          || value.data.accuracyDeg > 180)) {
+      issue(`${path}.data.accuracyDeg`, 'must be greater than 0 and at most 180');
+    }
+    if (value.data.gpsAccuracyM !== undefined
+        && (!isFiniteNumber(value.data.gpsAccuracyM)
+          || value.data.gpsAccuracyM < 0
+          || value.data.gpsAccuracyM > 100_000)) {
+      issue(`${path}.data.gpsAccuracyM`, 'must be between 0 and 100000');
+    }
+    for (const field of ['gpsAgeMs', 'confirmedReceptionAgeMs'] as const) {
+      const age = value.data[field];
+      if (age !== undefined && (!isFiniteNumber(age) || age < 0)) {
+        issue(`${path}.data.${field}`, 'must be a non-negative number');
+      }
+    }
+    if (value.data.confirmedReceptionId !== undefined
+        && !isPositiveInteger(value.data.confirmedReceptionId)) {
+      issue(`${path}.data.confirmedReceptionId`, 'must be a positive integer');
+    }
+    if (value.data.note !== undefined && typeof value.data.note !== 'string') {
+      issue(`${path}.data.note`, 'must be text');
+    }
+  }
 }
 
 function validateCoordinates(

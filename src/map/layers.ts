@@ -1,4 +1,10 @@
 import L, { type LayerGroup, type Map as LeafletMap } from 'leaflet';
+import {
+  bearingLine,
+  observationFromBearingEvent,
+  type BearingConsensus,
+  type FinalApproachEstimate,
+} from '../location';
 import type { AreaEstimate, Reception, SessionEvent, TargetProfile } from '../types';
 
 export interface FinderLayers {
@@ -8,10 +14,12 @@ export interface FinderLayers {
   other: LayerGroup;
   estimate: LayerGroup;
   bearings: LayerGroup;
+  bearingZone: LayerGroup;
+  finalApproach: LayerGroup;
   reference: LayerGroup;
 }
 
-export function createFinderLayers(map: LeafletMap): FinderLayers {
+export function createFinderLayers(map: LeafletMap, showUntrustedAdminPosition = false): FinderLayers {
   const layers: FinderLayers = {
     confirmed: L.layerGroup().addTo(map),
     forwarded: L.layerGroup().addTo(map),
@@ -19,8 +27,11 @@ export function createFinderLayers(map: LeafletMap): FinderLayers {
     other: L.layerGroup().addTo(map),
     estimate: L.layerGroup().addTo(map),
     bearings: L.layerGroup().addTo(map),
-    reference: L.layerGroup().addTo(map),
+    bearingZone: L.layerGroup().addTo(map),
+    finalApproach: L.layerGroup().addTo(map),
+    reference: L.layerGroup(),
   };
+  if (showUntrustedAdminPosition) layers.reference.addTo(map);
   L.control.layers({}, {
     'Confirmed direct': layers.confirmed,
     'Forwarded target-origin': layers.forwarded,
@@ -28,7 +39,9 @@ export function createFinderLayers(map: LeafletMap): FinderLayers {
     'Other receptions': layers.other,
     'Search area estimate': layers.estimate,
     'Bearing notes': layers.bearings,
-    'Last self-reported target position': layers.reference,
+    'Approximate bearing zone': layers.bearingZone,
+    'Approximate final-approach zone': layers.finalApproach,
+    'Admin-configured position — unverified': layers.reference,
   }, { collapsed: true }).addTo(map);
   return layers;
 }
@@ -68,32 +81,58 @@ export function drawEstimate(estimate: AreaEstimate | undefined, layers: FinderL
     fillOpacity: 0.12,
     weight: 2,
     dashArray: '6 6',
-  }).bindTooltip('Strongest confirmed search area — not an exact position').addTo(layers.estimate);
+  }).bindTooltip('Approximate strongest confirmed search area').addTo(layers.estimate);
 }
 
 export function drawBearings(events: SessionEvent[], layers: FinderLayers): void {
   layers.bearings.clearLayers();
   for (const event of events) {
-    if (event.type !== 'bearing') continue;
-    const { lat, lon, degrees, uncertainty } = event.data;
-    if (![lat, lon, degrees].every((value) => typeof value === 'number')) continue;
-    const start: [number, number] = [lat as number, lon as number];
-    const radians = ((degrees as number) * Math.PI) / 180;
-    const distanceM = 150;
-    const dLat = (Math.cos(radians) * distanceM) / 111_320;
-    const dLon = (Math.sin(radians) * distanceM) / (111_320 * Math.cos(((lat as number) * Math.PI) / 180));
-    L.polyline([start, [start[0] + dLat, start[1] + dLon]], { color: '#ffcf66', weight: 2 })
-      .bindTooltip(`Observed bearing ${degrees}° ±${String(uncertainty ?? '?')}°`)
+    const observation = observationFromBearingEvent(event);
+    if (!observation) continue;
+    const line = bearingLine(observation, 150);
+    L.polyline(line.map(({ lat, lon }) => [lat, lon] as [number, number]), { color: '#ffcf66', weight: 2 })
+      .bindTooltip(`Observed bearing ${observation.bearingDeg}° ±${String(observation.accuracyDeg ?? '?')}°`)
       .addTo(layers.bearings);
+  }
+}
+
+export function drawApproachZones(
+  consensus: BearingConsensus | undefined,
+  finalApproach: FinalApproachEstimate | undefined,
+  layers: FinderLayers,
+): void {
+  layers.bearingZone.clearLayers();
+  layers.finalApproach.clearLayers();
+  if (consensus?.polygon.length) {
+    L.polygon(consensus.polygon, {
+      color: '#ffcf66',
+      fillColor: '#ffcf66',
+      fillOpacity: 0.12,
+      weight: 2,
+      dashArray: '4 6',
+    }).bindTooltip(
+      `Approximate bearing zone · ${consensus.confidence} confidence · ${Math.round(consensus.radiusM)} m uncertainty radius`,
+    ).addTo(layers.bearingZone);
+  }
+  if (finalApproach?.ready && finalApproach.polygon?.length) {
+    L.polygon(finalApproach.polygon, {
+      color: '#40e0c2',
+      fillColor: '#40e0c2',
+      fillOpacity: 0.24,
+      weight: 3,
+    }).bindTooltip(
+      `Approximate final-approach zone · ${finalApproach.confidence} confidence`,
+    ).addTo(layers.finalApproach);
   }
 }
 
 export function drawTargetReference(target: TargetProfile | undefined, layers: FinderLayers): void {
   layers.reference.clearLayers();
-  if (!target?.lastKnown) return;
+  if (!target?.advertisedReference) return;
+  const reference = target.advertisedReference;
   const tooltip = document.createElement('span');
-  tooltip.textContent = `${target.lastKnown.label} — self-reported reference, not a current or exact position`;
-  L.circleMarker([target.lastKnown.lat, target.lastKnown.lon], {
+  tooltip.textContent = `Admin-configured ${reference.source} position — unverified and display-only`;
+  L.circleMarker([reference.lat, reference.lon], {
     radius: 8,
     color: '#62b6ff',
     fillColor: '#62b6ff',

@@ -14,6 +14,8 @@ export function buildTechnicalSummary(archive: SessionArchiveV1): string {
   const acceptedFixes = archive.fixes.filter((fix) => fix.accepted).length;
   const rejectedFixes = archive.fixes.length - acceptedFixes;
   const estimate = archive.derived?.estimate;
+  const bearingConsensus = archive.derived?.bearingConsensus;
+  const finalApproach = archive.derived?.finalApproach;
 
   const lines = [
     'MeshCore Finder technical search log',
@@ -63,11 +65,40 @@ export function buildTechnicalSummary(archive: SessionArchiveV1): string {
   } else {
     lines.push(`- Not ready: ${estimate?.reason ?? 'No derived estimate was included in this archive.'}`);
   }
+  lines.push('', 'Directional-bearing zone');
+  if (bearingConsensus) {
+    lines.push(
+      '- Approximate: yes',
+      `- Confidence / geometry: ${bearingConsensus.confidence} / ${bearingConsensus.geometryQuality}`,
+      `- Contributing bearings: ${bearingConsensus.observationCount}`,
+      `- Uncertainty radius: ${formatDecimal(bearingConsensus.radiusM)} m`,
+      `- RMS cross-track error: ${formatDecimal(bearingConsensus.rmsCrossTrackErrorM)} m`,
+    );
+  } else {
+    lines.push('- Not available: at least two eligible, separated directional bearings are required.');
+  }
+  lines.push('', 'Final-approach zone');
+  if (finalApproach?.ready) {
+    lines.push(
+      '- Approximate: yes',
+      `- Confidence: ${finalApproach.confidence}`,
+      `- Area: ${formatDecimal(finalApproach.areaM2)} m²`,
+      `- Inputs: ${finalApproach.bearingCount} bearings and ${finalApproach.signalCellCount} confirmed signal cells.`,
+      `- Method note: ${finalApproach.reason}`,
+    );
+  } else if (finalApproach?.disagreement) {
+    lines.push(
+      '- Not produced: the bearing zone and confirmed-signal search area disagree.',
+      `- Guidance: ${finalApproach.reason}`,
+    );
+  } else {
+    lines.push(`- Not ready: ${finalApproach?.reason ?? 'No final-approach analysis was included in this archive.'}`);
+  }
   lines.push(
     '',
     'Interpretation limits',
     'Relative RSSI/SNR observations can help narrow a search area. Reflections, antenna orientation, terrain, obstructions, radio power, and GPS error can all change the readings.',
-    'This technical search log does not identify or claim an exact transmitter position.',
+    'Every mapped zone is approximate. Close-range searching and visual confirmation are still required.',
   );
   return lines.join('\n');
 }

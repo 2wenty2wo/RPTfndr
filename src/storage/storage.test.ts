@@ -120,7 +120,7 @@ afterEach(async () => {
 });
 
 describe('IndexedDB schema and migrations', () => {
-  it('creates the v1 stores and compound indexes', async () => {
+  it('creates the current stores and compound indexes', async () => {
     const repo = await repository('schema');
     const connection = repo.db.connection;
     expect(connection.version).toBe(DB_VERSION);
@@ -140,15 +140,82 @@ describe('IndexedDB schema and migrations', () => {
     expect(index.keyPath).toEqual(['sessionId', 'conf', 't']);
   });
 
-  it('runs an added migration sequentially from v1', async () => {
+  it('runs an added migration sequentially from v2', async () => {
     const name = databaseName('migration');
     const first = await openFinderDatabase({ name });
     first.close();
-    const migration: Migration = ({ db }) => db.createObjectStore('test-v2');
-    const migrations = new Map([...MIGRATIONS, [2, migration]]);
-    const upgraded = await openFinderDatabase({ name, version: 2, migrations });
+    const migration: Migration = ({ db }) => db.createObjectStore('test-v3');
+    const migrations = new Map([...MIGRATIONS, [3, migration]]);
+    const upgraded = await openFinderDatabase({ name, version: 3, migrations });
     opened.push({ name, close: () => upgraded.close() });
-    expect(upgraded.connection.objectStoreNames.contains('test-v2')).toBe(true);
+    expect(upgraded.connection.objectStoreNames.contains('test-v3')).toBe(true);
+  });
+
+  it('migrates lastKnown targets and legacy bearing fields from v1', async () => {
+    const name = databaseName('v1-data');
+    const migrationV1 = MIGRATIONS.get(1);
+    if (!migrationV1) throw new Error('v1 migration missing');
+    const first = await openFinderDatabase({
+      name,
+      version: 1,
+      migrations: new Map([[1, migrationV1]]),
+    });
+    const legacyTarget = {
+      ...target(),
+      updatedAt: 1_700_000_000_000,
+      lastKnown: {
+        lat: -33.86,
+        lon: 151.2,
+        label: 'Last self-reported advert position',
+      },
+    };
+    await first.put(STORES.targets, legacyTarget);
+    await first.put(STORES.sessions, {
+      ...session(),
+      targetSnapshot: legacyTarget,
+    });
+    await first.add(STORES.events, {
+      sessionId: 'session-1',
+      t: 1_700_000_000_100,
+      type: 'bearing',
+      data: {
+        lat: -33.86,
+        lon: 151.2,
+        degrees: 91,
+        uncertainty: 12,
+        accuracy: 8,
+      },
+    });
+    first.close();
+
+    const upgraded = await openFinderDatabase({ name });
+    opened.push({ name, close: () => upgraded.close() });
+    expect(await upgraded.get(STORES.targets, 'target-1')).toMatchObject({
+      advertisedReference: {
+        lat: -33.86,
+        lon: 151.2,
+        source: 'advert',
+        observedAt: 1_700_000_000_000,
+        trust: 'untrusted-admin',
+      },
+    });
+    expect(await upgraded.get(STORES.sessions, 'session-1')).toMatchObject({
+      targetSnapshot: {
+        advertisedReference: { source: 'advert', trust: 'untrusted-admin' },
+      },
+    });
+    const [bearing] = await upgraded.getAll<Record<string, unknown>>(STORES.events);
+    expect(bearing).toMatchObject({
+      data: {
+        lat: -33.86,
+        lon: 151.2,
+        bearingDeg: 91,
+        accuracyDeg: 12,
+        gpsAccuracyM: 8,
+      },
+    });
+    expect(bearing?.data).not.toHaveProperty('degrees');
+    expect(bearing?.data).not.toHaveProperty('uncertainty');
   });
 });
 
@@ -264,7 +331,19 @@ describe('FinderRepository', () => {
       session(),
       [first, duplicate],
       [archivedFix],
-      [],
+      [{
+        id: 81,
+        sessionId: 'session-1',
+        t: 150,
+        type: 'bearing',
+        data: {
+          lat: 1,
+          lon: 2,
+          bearingDeg: 90,
+          confirmedReceptionId: 71,
+          confirmedReceptionAgeMs: 1_000,
+        },
+      }],
     );
 
     const [importedFix] = await repo.listFixes('session-1');
@@ -275,6 +354,10 @@ describe('FinderRepository', () => {
     expect(importedFirst?.gps.fixId).toBe(importedFix?.id);
     expect(importedDuplicate?.gps.fixId).toBe(importedFix?.id);
     expect(importedDuplicate?.dupOf).toBe(importedFirst?.id);
+    const [importedBearing] = await repo.listEvents('session-1', 'bearing');
+    expect(importedBearing?.id).not.toBe(81);
+    expect(importedBearing?.data.confirmedReceptionId).toBe(importedFirst?.id);
+    expect(importedBearing?.data.confirmedReceptionAgeMs).toBe(50);
     expect(await repo.getSession('session-1')).toMatchObject({
       counters: {
         receptions: 2,
@@ -287,6 +370,30 @@ describe('FinderRepository', () => {
       },
       bestConfirmed: { receptionId: importedFirst?.id },
     });
+  });
+
+  it('rejects imported bearings linked to missing or non-confirmed receptions', async () => {
+    const missingRepo = await repository('import-missing-bearing-link');
+    const event = {
+      sessionId: 'session-1',
+      t: 150,
+      type: 'bearing' as const,
+      data: { lat: 1, lon: 2, bearingDeg: 90, confirmedReceptionId: 999 },
+    };
+    await expect(missingRepo.importSessionBundle(target(), session(), [reception({ id: 71 })], [], [event]))
+      .rejects.toThrow('missing archived reception');
+
+    const unconfirmedRepo = await repository('import-unconfirmed-bearing-link');
+    const unconfirmed = reception({ id: 71 });
+    unconfirmed.cls.confirmed = false;
+    unconfirmed.conf = 0;
+    await expect(unconfirmedRepo.importSessionBundle(
+      target(),
+      session(),
+      [unconfirmed],
+      [],
+      [{ ...event, data: { ...event.data, confirmedReceptionId: 71 } }],
+    )).rejects.toThrow('non-confirmed archived reception');
   });
 
   it('does not overwrite an existing target during an atomic import', async () => {

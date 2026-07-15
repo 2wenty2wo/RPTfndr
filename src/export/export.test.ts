@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { DEFAULT_SESSION_SETTINGS, type CellAggregate, type Reception, type SearchSession } from '../types';
+import type { BearingConsensus, FinalApproachEstimate } from '../location';
 import { buildReceptionCsv, parseCsv, parseReceptionCsv, stringifyCsv } from './csv';
 import { buildGeoJson } from './geojson';
 import { sha256Hex, verifySha256 } from './hash';
@@ -153,18 +154,101 @@ describe('JSON archive', () => {
     expect(() => parseSessionArchive(JSON.stringify(malformed))).toThrow(ArchiveValidationError);
   });
 
-  it('rejects malformed optional target names and last-known labels', () => {
+  it('rejects malformed target names and advertised reference metadata', () => {
     const malformedName = structuredClone(createSessionArchive(archiveInput));
     malformedName.session.targetSnapshot.identity.name = '';
     expect(() => parseSessionArchive(JSON.stringify(malformedName))).toThrow(ArchiveValidationError);
 
     const malformedLocation = structuredClone(createSessionArchive(archiveInput));
-    malformedLocation.session.targetSnapshot.lastKnown = {
-      lat: -33.86,
+    malformedLocation.session.targetSnapshot.advertisedReference = {
+      lat: 91,
       lon: 151.2,
-      label: '',
+      source: 'advert',
+      observedAt: 1_700_000_000_000,
+      trust: 'untrusted-admin',
     };
     expect(() => parseSessionArchive(JSON.stringify(malformedLocation))).toThrow(ArchiveValidationError);
+  });
+
+  it('normalizes v1 lastKnown targets and legacy bearing fields to archive v2', () => {
+    const current = createSessionArchive(archiveInput);
+    const legacy = structuredClone(current) as unknown as {
+      version: number;
+      session: { targetSnapshot: Record<string, unknown> };
+      events: Array<Record<string, unknown>>;
+    };
+    legacy.version = 1;
+    legacy.session.targetSnapshot.lastKnown = {
+      lat: -33.86,
+      lon: 151.2,
+      label: 'Last self-reported contact position',
+    };
+    legacy.events = [{
+      id: 9,
+      sessionId: session.id,
+      t: 1_700_000_001_000,
+      type: 'bearing',
+      data: {
+        lat: -33.86,
+        lon: 151.2,
+        degrees: -270,
+        uncertainty: 15,
+        accuracy: 7,
+      },
+    }];
+
+    const imported = parseSessionArchive(JSON.stringify(legacy));
+    expect(imported.version).toBe(2);
+    expect(imported.session.targetSnapshot.advertisedReference).toEqual({
+      lat: -33.86,
+      lon: 151.2,
+      source: 'contact',
+      observedAt: session.targetSnapshot.updatedAt,
+      trust: 'untrusted-admin',
+    });
+    expect(imported.session.targetSnapshot).not.toHaveProperty('lastKnown');
+    expect(imported.events[0]?.data).toMatchObject({
+      bearingDeg: 90,
+      accuracyDeg: 15,
+      gpsAccuracyM: 7,
+    });
+    expect(imported.events[0]?.data).not.toHaveProperty('degrees');
+    expect(imported.events[0]?.data).not.toHaveProperty('uncertainty');
+  });
+
+  it('round-trips approximate bearing and final-approach metadata in archive v2', () => {
+    const bearingConsensus: BearingConsensus = {
+      point: { lat: -33.86, lon: 151.2 },
+      observationCount: 2,
+      rmsCrossTrackErrorM: 12,
+      confidence: 'medium',
+      radiusM: 45,
+      polygon: [[-33.86, 151.2], [-33.861, 151.201], [-33.861, 151.2]],
+      geometryQuality: 'fair',
+      contributingObservationIds: [1, 2],
+      exclusionReasons: [],
+      approximate: true,
+    };
+    const finalApproach: FinalApproachEstimate = {
+      ready: false,
+      reason: 'The inputs do not overlap.',
+      confidence: 'low',
+      bearingCount: 2,
+      signalCellCount: 3,
+      contributingObservationIds: [1, 2],
+      exclusionReasons: [],
+      approximate: true,
+      disagreement: true,
+      generatedAt: reception.t,
+    };
+    const archive = createSessionArchive({ ...archiveInput, bearingConsensus, finalApproach });
+    const parsed = parseSessionArchive(serializeSessionArchive(archive));
+    expect(parsed.derived?.bearingConsensus).toMatchObject({ approximate: true, radiusM: 45 });
+    expect(parsed.derived?.finalApproach).toMatchObject({
+      approximate: true,
+      ready: false,
+      disagreement: true,
+    });
   });
 
   it('rejects unsafe decoded shapes, impossible dates, and false confirmed invariants', () => {
@@ -208,7 +292,7 @@ describe('CSV export', () => {
 });
 
 describe('GeoJSON and technical summary', () => {
-  it('exports reception, cell, hull, and bearing features in lon/lat order', () => {
+  it('exports reception, signal, bearing, and final-approach zones in lon/lat order', () => {
     const cell: CellAggregate = {
       key: '12:1:2',
       centerLat: -33.86,
@@ -228,6 +312,34 @@ describe('GeoJSON and technical summary', () => {
       minIdentityTier: 'full-pubkey',
       confidence: 0.7,
     };
+    const bearingConsensus: BearingConsensus = {
+      point: { lat: -33.8602, lon: 151.2002 },
+      observationCount: 3,
+      rmsCrossTrackErrorM: 8,
+      confidence: 'high',
+      radiusM: 35,
+      polygon: [[-33.86, 151.2], [-33.8605, 151.201], [-33.861, 151.2]],
+      geometryQuality: 'good',
+      contributingObservationIds: [1, 2, 3],
+      exclusionReasons: [],
+      approximate: true,
+    };
+    const finalApproach: FinalApproachEstimate = {
+      ready: true,
+      reason: 'Approximate overlap',
+      polygon: [[-33.8601, 151.2001], [-33.8604, 151.2007], [-33.8608, 151.2002]],
+      areaM2: 120,
+      confidence: 'medium',
+      bearingCount: 3,
+      signalCellCount: 3,
+      rmsCrossTrackErrorM: 8,
+      geometryQuality: 'good',
+      bearingRadiusM: 35,
+      contributingObservationIds: [1, 2, 3],
+      exclusionReasons: [],
+      approximate: true,
+      generatedAt: reception.t,
+    };
     const geojson = buildGeoJson({
       ...archiveInput,
       cells: [cell],
@@ -241,24 +353,28 @@ describe('GeoJSON and technical summary', () => {
         confidence: 'medium',
         generatedAt: reception.t,
       },
+      bearingConsensus,
+      finalApproach,
       events: [{
         sessionId: session.id,
         t: reception.t,
         type: 'bearing',
-        data: { lat: -33.86, lon: 151.2, degrees: 90 },
+        data: { lat: -33.86, lon: 151.2, bearingDeg: 90, accuracyDeg: 8, gpsAccuracyM: 7 },
       }],
     });
     expect(geojson.features.map((feature) => feature.properties.featureType)).toEqual([
-      'reception', 'signal-cell', 'search-area-estimate', 'bearing',
+      'reception', 'signal-cell', 'search-area-estimate', 'bearing-consensus-zone', 'final-approach-zone', 'bearing',
     ]);
     expect(geojson.features[0]?.geometry).toEqual({ type: 'Point', coordinates: [151.2, -33.86] });
-    expect(geojson.metadata.caveat).toContain('does not identify an exact');
+    expect(geojson.metadata.finalApproach).toMatchObject({ ready: true, approximate: true });
+    expect(JSON.stringify(geojson).toLowerCase()).not.toMatch(/\b(exact|pinpoint(?:ed)?)\b/);
   });
 
-  it('uses technical-search wording and never labels the log as evidence', () => {
+  it('uses approximate technical-search wording and never labels the log as evidence', () => {
     const summary = buildTechnicalSummary(createSessionArchive(archiveInput));
     expect(summary).toContain('technical search log');
-    expect(summary).toContain('does not identify or claim an exact transmitter position');
+    expect(summary).toContain('Every mapped zone is approximate');
+    expect(summary.toLowerCase()).not.toMatch(/\b(exact|pinpoint(?:ed)?)\b/);
     expect(summary.toLowerCase()).not.toContain('evidence');
   });
 });

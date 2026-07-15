@@ -1,5 +1,6 @@
 import type { SignalSnapshot } from '../signal';
 import { DEFAULT_SESSION_SETTINGS } from '../types';
+import type { BearingConsensus, BearingConsensusAnalysis, FinalApproachEstimate } from '../location';
 import type { AreaEstimate, CellAggregate, ConnState, GpsFix, Reception, SearchSession, SessionEvent, SessionSettings, TargetProfile } from '../types';
 
 export interface Notice {
@@ -26,9 +27,13 @@ export interface AppState {
   fixes: GpsFix[];
   events: SessionEvent[];
   estimate?: AreaEstimate;
+  bearingAnalysis?: BearingConsensusAnalysis;
+  bearingConsensus?: BearingConsensus;
+  finalApproach?: FinalApproachEstimate;
   cells: CellAggregate[];
   signal?: SignalSnapshot;
   preferences: SessionSettings;
+  showUntrustedAdminPosition: boolean;
   writer: boolean;
   gpsState: 'good' | 'degraded' | 'searching' | 'denied' | 'unavailable';
   mapAvailable: boolean;
@@ -77,6 +82,7 @@ export const initialAppState: AppState = {
   events: [],
   cells: [],
   preferences: { ...DEFAULT_SESSION_SETTINGS },
+  showUntrustedAdminPosition: false,
   writer: true,
   gpsState: 'searching',
   mapAvailable: true,

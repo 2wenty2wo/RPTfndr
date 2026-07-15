@@ -49,9 +49,11 @@ describe('screen rendering', () => {
     }
   });
 
-  it('keeps non-exact estimate wording on map and privacy screens', () => {
-    expect(mapScreen(initialAppState)).toContain('not an exact position');
-    expect(privacyScreen()).toContain('never an exact position');
+  it('uses approximate-zone wording without precision claims', () => {
+    const output = `${mapScreen(initialAppState)}${privacyScreen()}${dfScreen(initialAppState)}`;
+    expect(output).toContain('approximate search area');
+    expect(output).toContain("single receiver's RSSI and SNR cannot determine coordinates");
+    expect(output.toLowerCase()).not.toMatch(/\b(exact|pinpoint(?:ed)?)\b/);
   });
 
   it('reflects persisted audio preferences in the settings controls', () => {
@@ -71,6 +73,8 @@ describe('screen rendering', () => {
     expect(output).toContain('value="0.45"');
     expect(output).toContain('name="audioMuted" type="checkbox" checked');
     expect(output).toContain('name="forwardedAlert" type="checkbox" checked');
+    expect(output).toContain('name="showUntrustedAdminPosition" type="checkbox"');
+    expect(output).not.toContain('name="showUntrustedAdminPosition" type="checkbox" checked');
   });
 
   it('offers a name-only pin only when one observed contact has that name', () => {

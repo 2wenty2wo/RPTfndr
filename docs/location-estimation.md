@@ -1,6 +1,8 @@
 # Location estimation
 
-MeshCore Finder estimates a **strongest confirmed search area**. It never claims the radio’s exact position and does not convert RSSI into distance.
+MeshCore Finder estimates a **strongest confirmed search area** and, when suitable manual directional bearings exist, an **approximate final-approach zone**. It never claims the radio’s exact position and does not convert RSSI into distance.
+
+A single receiver’s RSSI/SNR cannot uniquely determine coordinates: many possible transmitter locations can produce the same reading, and the propagation environment can dominate received strength. Repeated observations identify a region worth searching, not a point solution.
 
 ## Eligible observations
 
@@ -12,6 +14,8 @@ An observation enters aggregation only when:
 - the session is not mixing simulated and real transport data.
 
 Forwarded, ambiguous, unknown, stale-GPS, no-GPS, and decoder-failed observations remain in the technical log but do not affect cells or the area estimate.
+
+Coordinates advertised by the target or copied from a contact are untrusted admin metadata. They are excluded from observation eligibility, map fitting, signal cells, area construction, bearing calculations, and final-approach calculations. Enabling the optional **Admin-configured position — unverified** map layer changes display only.
 
 ## Cells
 
@@ -25,6 +29,20 @@ The default gate requires at least five located confirmed samples across three c
 
 Confidence is `high` only with at least three cells, mean cell confidence above 0.65, and at least three separated passes; `medium` requires mean confidence above 0.40; otherwise it is `low`. The UI always shows the contributing sample/cell counts and the approximate polygon area.
 
+## Directional bearings and final approach
+
+A bearing is a manually observed direction, normally taken with a directional antenna. It records the observer’s phone position, phone GPS accuracy, direction in degrees, angular uncertainty, and time. A bearing is eligible only when it has usable, fresh GPS and follows a recent confirmed reception from the selected target. This keeps an unrelated apparent peak from being combined with the target’s signal area.
+
+At least two bearings from meaningfully separated observer locations are required; three or more are recommended. The solver excludes intersections behind an observer, near-parallel lines that would be dominated by small angular errors, stale or poor GPS, and observations without recent confirmed target evidence. Exclusion reasons remain available for review.
+
+Eligible bearings are combined with weighted least squares. The result is rendered as a shaded convex zone, not as a target marker. Its uncertainty radius incorporates each bearing’s angular uncertainty at the estimated range, phone GPS accuracy, and cross-track residuals. Geometry quality, contributing observation IDs, exclusions, bearing count, cross-track error, and confidence travel with the result.
+
+Consensus work is bounded to the most recent 128 bearing observations so an oversized imported log cannot stall field use. If that limit is reached, the omitted older-record count is reported as an analysis exclusion.
+
+When a confirmed RSSI search polygon is available, the app intersects it with the bearing zone to form the final-approach zone. If the polygons do not overlap, the app shows a disagreement warning and preserves both inputs for review; it does not invent an overlap or choose one as truth. With no suitable directional bearings, RSSI-only proximity guidance remains available as the less precise fallback.
+
+JSON, GeoJSON, and summary exports identify bearing and final-approach zones as approximate and include their confidence metadata. The final zone is a field-search aid. Physically identify the equipment at close range before concluding that it has been found.
+
 ## How to improve the result
 
 - Make separated passes rather than lingering at one point.
@@ -33,5 +51,7 @@ Confidence is `high` only with at least three cells, mean cell confidence above 
 - Switch from drive to walk mode for the final local search.
 - Revisit strong cells to test repeatability.
 - Treat isolated peaks as possible multipath until another pass reproduces them.
+- Record directional bearings from separated locations immediately after recent confirmed target receptions; use three or more where practical.
+- Increase angular uncertainty when the peak is broad or unstable instead of forcing a narrow bearing.
 
 Calibration changes the relative gauge only. “Set current as weak/strong” does not change raw RSSI, classification, or historical frames.

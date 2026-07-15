@@ -9,7 +9,15 @@ import {
   buildTechnicalSummary,
   parseSessionArchive,
 } from '../export';
-import { aggregateReceptions, estimateArea, GpsService } from '../location';
+import {
+  aggregateReceptions,
+  analyzeBearingConsensus,
+  bearingEvent,
+  deriveFinalApproach,
+  estimateArea,
+  GpsService,
+  observationFromBearingEvent,
+} from '../location';
 import {
   DiscoveryCoordinator,
   IdentityUniverse,
@@ -43,6 +51,7 @@ import {
   type DemoScenarioId,
 } from '../demo';
 import type {
+  AreaEstimate,
   GpsFix,
   ConnState,
   Reception,
@@ -62,9 +71,60 @@ export interface DownloadArtifact {
   digest?: string;
 }
 
+export function deriveApproachState(
+  events: readonly SessionEvent[],
+  estimate: AreaEstimate | undefined,
+  maximumGpsAccuracyM = DEFAULT_SESSION_SETTINGS.maxGpsAccuracyM,
+  generatedAt = Date.now(),
+  receptions: readonly Reception[] = [],
+): Pick<AppState, 'bearingAnalysis' | 'bearingConsensus' | 'finalApproach'> {
+  const receptionById = new Map(
+    receptions
+      .filter((reception): reception is Reception & { id: number } => reception.id !== undefined)
+      .map((reception) => [reception.id, reception]),
+  );
+  const observations = events
+    .map(observationFromBearingEvent)
+    .filter((observation): observation is NonNullable<typeof observation> => observation !== undefined)
+    .map((observation) => {
+      const linked = observation.confirmedReceptionId === undefined
+        ? undefined
+        : receptionById.get(observation.confirmedReceptionId);
+      if (!linked?.cls.confirmed || linked.conf !== 1) {
+        return {
+          ...observation,
+          confirmedReceptionId: undefined,
+          confirmedReceptionAgeMs: undefined,
+        };
+      }
+      return {
+        ...observation,
+        confirmedReceptionAgeMs: observation.t - linked.t,
+      };
+    });
+  const options = {
+    maximumGpsAccuracyM,
+    generatedAt,
+    ...(estimate?.confidence ? { signalConfidence: estimate.confidence } : {}),
+  };
+  const bearingAnalysis = analyzeBearingConsensus(observations, options);
+  const result = deriveFinalApproach(
+    observations,
+    estimate?.ready ? estimate.polygon : undefined,
+    estimate?.cellCount ?? 0,
+    options,
+  );
+  return {
+    bearingAnalysis,
+    bearingConsensus: result.consensus,
+    finalApproach: result.estimate,
+  };
+}
+
 const ACK_SETTING = 'safety-ack-v1';
 const ACTIVE_TARGET_SETTING = 'active-target';
 const SESSION_SETTINGS_SETTING = 'session-settings';
+const SHOW_UNTRUSTED_ADMIN_POSITION_SETTING = 'show-untrusted-admin-position';
 
 function uniqueId(prefix: string): string {
   const random = typeof crypto.randomUUID === 'function'
@@ -101,7 +161,7 @@ function emptyCounters(): SearchSession['counters'] {
   };
 }
 
-function validSelfReportedPosition(lat: number | undefined, lon: number | undefined): lat is number {
+function validAdvertisedPosition(lat: number | undefined, lon: number | undefined): lat is number {
   return Number.isFinite(lat)
     && Number.isFinite(lon)
     && (lat as number) >= -90
@@ -215,13 +275,14 @@ export class AppController {
     });
     this.repository = new FinderRepository(this.#database);
     this.#lease = await acquireWriterLock();
-    const [acknowledged, targets, sessions, resumeCandidates, activeTargetId, savedSettings] = await Promise.all([
+    const [acknowledged, targets, sessions, resumeCandidates, activeTargetId, savedSettings, showUntrustedAdminPosition] = await Promise.all([
       this.repository.getSetting<boolean>(ACK_SETTING),
       this.repository.listTargets(),
       this.repository.listSessions(),
       findResumableSessions(this.repository),
       this.repository.getSetting<string>(ACTIVE_TARGET_SETTING),
       this.repository.getSetting<Partial<SessionSettings>>(SESSION_SETTINGS_SETTING),
+      this.repository.getSetting<boolean>(SHOW_UNTRUSTED_ADMIN_POSITION_SETTING),
     ]);
     const preferences = resolvePreferences(savedSettings);
     this.configureAudio(preferences);
@@ -237,6 +298,7 @@ export class AppController {
       resumeCandidate: this.#lease.acquired ? resumeCandidates[0] : undefined,
       writer: this.#lease.acquired,
       preferences,
+      showUntrustedAdminPosition: showUntrustedAdminPosition === true,
     });
     if (!this.#lease.acquired) {
       this.notice('warning', 'Another MeshCore Finder tab holds the writer lock. This tab is read-only.');
@@ -384,27 +446,34 @@ export class AppController {
         ? [...observed.entries()].filter(([, names]) => [...names].some((name) => name.localeCompare(expectedName, undefined, { sensitivity: 'accent' }) === 0))
         : [];
       if (nameMatches.length !== 1 || nameMatches[0]?.[0] !== pubkeyHex) {
-        throw new Error('A name-only target can be pinned only when exactly one observed full key has the same name.');
+        throw new Error('A name-only target can be pinned only when one unambiguous observed full key has the same name.');
       }
     }
     const previousIdentity = structuredClone(current.identity);
-    const advertReference = [...this.store.value.receptions].reverse().find((reception) => {
+    const advertReferenceReception = [...this.store.value.receptions].reverse().find((reception) => {
       const advert = reception.decoded?.advert;
       return normalizeFullPubkey(advert?.pubkeyHex) === pubkeyHex
         && advert?.hasLocation
-        && validSelfReportedPosition(advert.lat, advert.lon);
-    })?.decoded?.advert;
+        && validAdvertisedPosition(advert.lat, advert.lon);
+    });
+    const advertReference = advertReferenceReception?.decoded?.advert;
     const contactReference = [...this.store.value.targets]
       .sort((left, right) => right.updatedAt - left.updatedAt)
-      .find((target) => normalizeFullPubkey(target.identity.pubkeyHex) === pubkeyHex && target.lastKnown)?.lastKnown;
-    const inheritedLastKnown = advertReference?.lat !== undefined && advertReference.lon !== undefined
-      ? { lat: advertReference.lat, lon: advertReference.lon, label: 'Last self-reported advert position' }
+      .find((target) => normalizeFullPubkey(target.identity.pubkeyHex) === pubkeyHex && target.advertisedReference)?.advertisedReference;
+    const inheritedAdvertisedReference = advertReference?.lat !== undefined && advertReference.lon !== undefined
+      ? {
+          lat: advertReference.lat,
+          lon: advertReference.lon,
+          source: 'advert' as const,
+          observedAt: advertReferenceReception?.t ?? Date.now(),
+          trust: 'untrusted-admin' as const,
+        }
       : contactReference;
     const updated: TargetProfile = {
       ...current,
       identity: { kind: 'full-pubkey', pubkeyHex },
       pinnedFrom: `${current.identity.kind}:${currentBytes ?? current.identity.name ?? 'observed'}`,
-      lastKnown: inheritedLastKnown ?? current.lastKnown,
+      advertisedReference: inheritedAdvertisedReference ?? current.advertisedReference,
       updatedAt: Date.now(),
     };
     await this.repository.putTarget(updated);
@@ -465,6 +534,9 @@ export class AppController {
       events: [],
       cells: [],
       estimate: undefined,
+      bearingAnalysis: undefined,
+      bearingConsensus: undefined,
+      finalApproach: undefined,
       signal: undefined,
     }));
     if (!demo) await this.startGps(session);
@@ -482,7 +554,18 @@ export class AppController {
     this.#recorder = undefined;
     await this.releaseWakeLock();
     await this.reloadSessions();
-    this.store.set({ activeSession: undefined, receptions: [], fixes: [], events: [], cells: [], estimate: undefined, signal: undefined });
+    this.store.set({
+      activeSession: undefined,
+      receptions: [],
+      fixes: [],
+      events: [],
+      cells: [],
+      estimate: undefined,
+      bearingAnalysis: undefined,
+      bearingConsensus: undefined,
+      finalApproach: undefined,
+      signal: undefined,
+    });
   }
 
   async resumeSession(id: string): Promise<void> {
@@ -515,6 +598,13 @@ export class AppController {
       events,
       cells: [],
       estimate: undefined,
+      ...deriveApproachState(
+        events,
+        undefined,
+        session.settings.maxGpsAccuracyM,
+        Date.now(),
+        receptions,
+      ),
       signal: undefined,
     });
     this.createRecorder(session);
@@ -571,16 +661,58 @@ export class AppController {
     this.requireRepository();
     const recorder = this.requireRecorder();
     const fix = recorder.gps.latest();
-    if (!fix) throw new Error('A fresh accepted GPS fix is needed to save a bearing.');
-    const event: SessionEvent = {
-      sessionId: recorder.session.id,
-      t: Date.now(),
-      type: 'bearing',
-      data: { degrees, uncertainty, note: note?.trim() || undefined, lat: fix.lat, lon: fix.lon, accuracy: fix.accuracy },
-    };
+    if (!fix) throw new Error('An accepted GPS fix is needed to save a bearing.');
+    if (!Number.isFinite(degrees)) throw new RangeError('Bearing direction must be a number.');
+    if (!Number.isFinite(uncertainty) || uncertainty < 1 || uncertainty > 90) {
+      throw new RangeError('Bearing uncertainty must be between 1 and 90 degrees.');
+    }
+    const now = Date.now();
+    const gpsAgeMs = Math.max(0, now - fix.t, now - fix.posT);
+    const latestConfirmed = [...this.store.value.receptions]
+      .reverse()
+      .find((reception) => reception.cls.confirmed && reception.t <= now);
+    const event = bearingEvent(recorder.session.id, {
+      t: now,
+      lat: fix.lat,
+      lon: fix.lon,
+      bearingDeg: degrees,
+      accuracyDeg: uncertainty,
+      gpsAccuracyM: fix.accuracy,
+      gpsAgeMs,
+      ...(latestConfirmed?.id === undefined
+        ? {}
+        : { confirmedReceptionId: latestConfirmed.id }),
+      ...(latestConfirmed
+        ? { confirmedReceptionAgeMs: Math.max(0, now - latestConfirmed.t) }
+        : {}),
+      ...(note?.trim() ? { note: note.trim() } : {}),
+    });
     event.id = await this.repository.addEvent(event);
-    this.store.set((state) => ({ events: [...state.events, event] }));
-    this.notice('success', 'Bearing observation saved.');
+    this.store.set((state) => {
+      const events = [...state.events, event];
+      return {
+        events,
+        ...deriveApproachState(
+          events,
+          state.estimate,
+          recorder.session.settings.maxGpsAccuracyM,
+          now,
+          state.receptions,
+        ),
+      };
+    });
+    const recentConfirmed = latestConfirmed?.id !== undefined
+      && now - latestConfirmed.t <= 30_000;
+    const usableGps = gpsAgeMs <= 15_000
+      && fix.accuracy <= recorder.session.settings.maxGpsAccuracyM;
+    this.notice(
+      recentConfirmed && usableGps ? 'success' : 'warning',
+      recentConfirmed && usableGps
+        ? 'Bearing saved for the approximate final-approach analysis.'
+        : !usableGps
+          ? 'Bearing saved as a note but excluded because its phone GPS was stale or outside the accuracy limit.'
+          : 'Bearing saved as an excluded note. Take a new bearing immediately after a confirmed target reception.',
+    );
   }
 
   async discover(): Promise<void> {
@@ -688,14 +820,20 @@ export class AppController {
     this.configureAudio(DEFAULT_SESSION_SETTINGS);
   }
 
-  async saveSettings(settings: Partial<SessionSettings>): Promise<void> {
+  async saveSettings(
+    settings: Partial<SessionSettings>,
+    showUntrustedAdminPosition = this.store.value.showUntrustedAdminPosition,
+  ): Promise<void> {
     this.requireWriter();
     this.requireRepository();
     const previous = await this.repository.getSetting<Partial<SessionSettings>>(SESSION_SETTINGS_SETTING) ?? {};
     const merged = resolvePreferences({ ...previous, ...settings });
-    await this.repository.setSetting(SESSION_SETTINGS_SETTING, merged);
+    await Promise.all([
+      this.repository.setSetting(SESSION_SETTINGS_SETTING, merged),
+      this.repository.setSetting(SHOW_UNTRUSTED_ADMIN_POSITION_SETTING, showUntrustedAdminPosition),
+    ]);
     this.configureAudio(merged);
-    this.store.set({ preferences: merged });
+    this.store.set({ preferences: merged, showUntrustedAdminPosition });
     this.notice('success', 'Settings saved. Cell-size changes apply to the next session.');
   }
 
@@ -805,7 +943,7 @@ export class AppController {
         const indexes = nextTargets
           .map((target, index) => normalizeFullPubkey(target.identity.pubkeyHex) === contactKey ? index : -1)
           .filter((index) => index >= 0);
-        const hasLocation = validSelfReportedPosition(contact.lat, contact.lon);
+        const hasLocation = validAdvertisedPosition(contact.lat, contact.lon);
         if (indexes.length) {
           for (const index of indexes) {
             const existing = nextTargets[index];
@@ -813,23 +951,30 @@ export class AppController {
             const contactName = contact.name?.trim();
             const nextLabel = existing.source === 'contacts' && contactName ? contactName : existing.label;
             const nextName = contactName || existing.identity.name;
-            const nextLastKnown = hasLocation
-              ? { lat: contact.lat, lon: contact.lon, label: 'Last self-reported contact position' }
-              : existing.lastKnown;
+            const nextAdvertisedReference = hasLocation
+              ? {
+                  lat: contact.lat,
+                  lon: contact.lon,
+                  source: 'contact' as const,
+                  observedAt: Date.now(),
+                  trust: 'untrusted-admin' as const,
+                }
+              : existing.advertisedReference;
             const unchanged = nextLabel === existing.label
               && nextName === existing.identity.name
               && existing.source === 'contacts'
               && normalizeFullPubkey(existing.identity.pubkeyHex) === contactKey
-              && nextLastKnown?.lat === existing.lastKnown?.lat
-              && nextLastKnown?.lon === existing.lastKnown?.lon
-              && nextLastKnown?.label === existing.lastKnown?.label;
+              && nextAdvertisedReference?.lat === existing.advertisedReference?.lat
+              && nextAdvertisedReference?.lon === existing.advertisedReference?.lon
+              && nextAdvertisedReference?.source === existing.advertisedReference?.source
+              && nextAdvertisedReference?.observedAt === existing.advertisedReference?.observedAt;
             if (unchanged) continue;
             const updated: TargetProfile = {
               ...existing,
               label: nextLabel,
               identity: { ...existing.identity, pubkeyHex: contactKey, ...(nextName ? { name: nextName } : {}) },
               source: 'contacts',
-              lastKnown: nextLastKnown,
+              advertisedReference: nextAdvertisedReference,
               updatedAt: Date.now(),
             };
             await this.repository.putTarget(updated);
@@ -849,8 +994,14 @@ export class AppController {
             ...(contact.name?.trim() ? { name: contact.name.trim() } : {}),
           },
           source: 'contacts',
-          lastKnown: hasLocation
-            ? { lat: contact.lat, lon: contact.lon, label: 'Last self-reported contact position' }
+          advertisedReference: hasLocation
+            ? {
+                lat: contact.lat,
+                lon: contact.lon,
+                source: 'contact',
+                observedAt: now,
+                trust: 'untrusted-admin',
+              }
             : undefined,
           createdAt: now,
           updatedAt: now,
@@ -911,30 +1062,40 @@ export class AppController {
       }
       if (additions.some((reception) => reception.cls.confirmed)) this.armAudioStaleTimer();
     }
+    const approach = deriveApproachState(
+      this.store.value.events,
+      snapshot.estimate,
+      snapshot.session.settings.maxGpsAccuracyM,
+      Date.now(),
+      snapshot.receptions,
+    );
     this.store.set((state) => ({
       activeSession: snapshot.session,
       receptions: [...snapshot.receptions],
       fixes: [...snapshot.fixes],
       estimate: snapshot.estimate,
+      ...approach,
       cells: [...snapshot.cells],
       signal: snapshot.signal,
       sessions: state.sessions.map((session) => session.id === snapshot.session.id ? snapshot.session : session),
     }));
-    const positionedAdvert = [...additions].reverse().find((reception) => {
+    const positionedAdvertReception = [...additions].reverse().find((reception) => {
       const advert = reception.decoded?.advert;
       return advert?.hasLocation
-        && validSelfReportedPosition(advert.lat, advert.lon)
+        && validAdvertisedPosition(advert.lat, advert.lon)
         && this.advertMatchesTargetExactly(snapshot.session.targetSnapshot, advert.pubkeyHex);
-    })?.decoded?.advert;
-    if (positionedAdvert?.lat !== undefined && positionedAdvert.lon !== undefined) {
-      void this.enqueueTargetMetadata(() => this.updateTargetLastKnownFromAdvert(
+    });
+    const positionedAdvert = positionedAdvertReception?.decoded?.advert;
+    if (positionedAdvert?.lat !== undefined && positionedAdvert.lon !== undefined && positionedAdvertReception) {
+      void this.enqueueTargetMetadata(() => this.updateTargetAdvertisedReferenceFromAdvert(
         snapshot.session.id,
         snapshot.session.targetSnapshot.id,
         positionedAdvert.pubkeyHex,
         positionedAdvert.lat as number,
         positionedAdvert.lon as number,
+        positionedAdvertReception.t,
       )).catch((error: unknown) => {
-        this.notice('warning', `The target's self-reported position could not be saved: ${this.errorMessage(error)}`);
+        this.notice('warning', `The target's unverified admin position could not be saved: ${this.errorMessage(error)}`);
       });
     }
   }
@@ -944,23 +1105,25 @@ export class AppController {
       && normalizeFullPubkey(target.identity.pubkeyHex) === normalizeFullPubkey(pubkeyHex);
   }
 
-  private async updateTargetLastKnownFromAdvert(
+  private async updateTargetAdvertisedReferenceFromAdvert(
     sessionId: string,
     targetId: string,
     pubkeyHex: string,
     lat: number,
     lon: number,
+    observedAt: number,
   ): Promise<void> {
     const state = this.store.value;
     if (state.activeSession?.id !== sessionId || state.activeSession.targetSnapshot.id !== targetId) return;
     const target = state.targets.find((candidate) => candidate.id === targetId)
       ?? state.activeSession.targetSnapshot;
     if (!this.advertMatchesTargetExactly(target, pubkeyHex)) return;
-    if (target.lastKnown?.lat === lat && target.lastKnown.lon === lon
-      && target.lastKnown.label === 'Last self-reported advert position') return;
+    if (target.advertisedReference?.lat === lat && target.advertisedReference.lon === lon
+      && target.advertisedReference.source === 'advert'
+      && target.advertisedReference.observedAt >= observedAt) return;
     const updated: TargetProfile = {
       ...target,
-      lastKnown: { lat, lon, label: 'Last self-reported advert position' },
+      advertisedReference: { lat, lon, source: 'advert', observedAt, trust: 'untrusted-admin' },
       updatedAt: Date.now(),
     };
     await this.repository.putTarget(updated);
@@ -1056,7 +1219,23 @@ export class AppController {
     const estimate = this.store.value.activeSession?.id === id
       ? this.store.value.estimate
       : estimateArea(cells, { minSamples: session.settings.minSamples, minCells: session.settings.minCells });
-    return { session, receptions, fixes, events, cells, estimate };
+    const approach = deriveApproachState(
+      events,
+      estimate,
+      session.settings.maxGpsAccuracyM,
+      Date.now(),
+      receptions,
+    );
+    return {
+      session,
+      receptions,
+      fixes,
+      events,
+      cells,
+      estimate,
+      bearingConsensus: approach.bearingConsensus,
+      finalApproach: approach.finalApproach,
+    };
   }
 
   private async reloadSessions(): Promise<void> {

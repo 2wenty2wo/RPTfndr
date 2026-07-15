@@ -60,7 +60,7 @@ describe('area estimate', () => {
     expect(estimate.cellsUsed).toEqual(['a', 'b', 'c']);
     expect(estimate.polygon?.length).toBeGreaterThanOrEqual(8);
     expect(estimate.areaM2).toBeGreaterThan(0);
-    expect(estimate.reason).toContain('not an exact position');
+    expect(estimate.reason).toContain('approximate search area');
   });
 
   it('uses a low-confidence disc when fewer than three strong cells survive', () => {

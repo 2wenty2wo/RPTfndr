@@ -5,6 +5,11 @@ import type {
   SearchSession,
   SessionEvent,
 } from '../types';
+import {
+  observationFromBearingEvent,
+  type BearingConsensus,
+  type FinalApproachEstimate,
+} from '../location';
 
 export type GeoJsonPosition = [longitude: number, latitude: number];
 export type GeoJsonGeometry =
@@ -30,6 +35,23 @@ export interface MeshCoreGeoJson {
     simulatedData: boolean;
     coordinateOrder: 'longitude, latitude';
     caveat: string;
+    bearingConsensus?: {
+      approximate: true;
+      confidence: string;
+      radiusM: number;
+      geometryQuality: string;
+      observationCount: number;
+    };
+    finalApproach?: {
+      approximate: true;
+      ready: boolean;
+      reason: string;
+      confidence: string;
+      disagreement: boolean;
+      bearingCount: number;
+      signalCellCount: number;
+      areaM2: number | null;
+    };
   };
 }
 
@@ -39,6 +61,8 @@ export interface GeoJsonExportInput {
   cells?: readonly CellAggregate[];
   estimate?: AreaEstimate;
   events?: readonly SessionEvent[];
+  bearingConsensus?: BearingConsensus;
+  finalApproach?: FinalApproachEstimate;
   /** AreaEstimate uses [lat, lon] by default; change only for imported data. */
   estimateCoordinateOrder?: 'lat-lon' | 'lon-lat';
   exportedAt?: Date | string;
@@ -124,18 +148,61 @@ export function buildGeoJson(input: GeoJsonExportInput): MeshCoreGeoJson {
         cellCount: estimate.cellCount,
         areaM2: estimate.areaM2 ?? null,
         confidence: estimate.confidence ?? null,
-        methodCaveat: 'Relative signal strength narrows a search area; it does not identify an exact position.',
+        methodCaveat: 'Relative signal strength narrows an approximate search area; it does not determine transmitter coordinates.',
+        simulatedData: input.session.demo,
+      },
+    });
+  }
+
+  if (input.bearingConsensus?.polygon && input.bearingConsensus.polygon.length >= 3) {
+    features.push({
+      type: 'Feature',
+      id: 'approximate-bearing-zone',
+      geometry: { type: 'Polygon', coordinates: [latLonRing(input.bearingConsensus.polygon)] },
+      properties: {
+        featureType: 'bearing-consensus-zone',
+        label: 'Approximate directional-bearing zone',
+        approximate: true,
+        confidence: input.bearingConsensus.confidence,
+        geometryQuality: input.bearingConsensus.geometryQuality,
+        observationCount: input.bearingConsensus.observationCount,
+        radiusM: input.bearingConsensus.radiusM,
+        rmsCrossTrackErrorM: input.bearingConsensus.rmsCrossTrackErrorM,
+        contributingObservationIds: input.bearingConsensus.contributingObservationIds,
+        exclusionReasons: input.bearingConsensus.exclusionReasons,
+        simulatedData: input.session.demo,
+      },
+    });
+  }
+
+  if (input.finalApproach?.polygon && input.finalApproach.polygon.length >= 3) {
+    features.push({
+      type: 'Feature',
+      id: 'approximate-final-approach-zone',
+      geometry: { type: 'Polygon', coordinates: [latLonRing(input.finalApproach.polygon)] },
+      properties: {
+        featureType: 'final-approach-zone',
+        label: 'Approximate final-approach zone',
+        approximate: true,
+        ready: input.finalApproach.ready,
+        reason: input.finalApproach.reason,
+        confidence: input.finalApproach.confidence,
+        areaM2: input.finalApproach.areaM2 ?? null,
+        bearingCount: input.finalApproach.bearingCount,
+        signalCellCount: input.finalApproach.signalCellCount,
+        rmsCrossTrackErrorM: input.finalApproach.rmsCrossTrackErrorM ?? null,
+        geometryQuality: input.finalApproach.geometryQuality ?? null,
+        contributingObservationIds: input.finalApproach.contributingObservationIds,
+        exclusionReasons: input.finalApproach.exclusionReasons,
         simulatedData: input.session.demo,
       },
     });
   }
 
   for (const event of input.events ?? []) {
-    if (event.type !== 'bearing') continue;
-    const lat = finiteNumber(event.data.lat);
-    const lon = finiteNumber(event.data.lon);
-    const bearing = finiteNumber(event.data.degrees ?? event.data.bearing ?? event.data.heading);
-    if (lat === undefined || lon === undefined || !validCoordinates(lat, lon) || bearing === undefined) continue;
+    const observation = observationFromBearingEvent(event);
+    if (!observation) continue;
+    const { lat, lon, bearingDeg: bearing } = observation;
     const distanceM = finiteNumber(event.data.lengthM) ?? 100;
     const endpoint = destinationPoint(lat, lon, bearing, Math.max(1, distanceM));
     features.push({
@@ -146,6 +213,9 @@ export function buildGeoJson(input: GeoJsonExportInput): MeshCoreGeoJson {
         featureType: 'bearing',
         time: new Date(event.t).toISOString(),
         bearingDeg: bearing,
+        accuracyDeg: observation.accuracyDeg ?? null,
+        gpsAccuracyM: observation.gpsAccuracyM ?? null,
+        confirmedReceptionId: observation.confirmedReceptionId ?? null,
         displayLengthM: Math.max(1, distanceM),
         note: typeof event.data.note === 'string' ? event.data.note : null,
         simulatedData: input.session.demo,
@@ -166,9 +236,36 @@ export function buildGeoJson(input: GeoJsonExportInput): MeshCoreGeoJson {
       exportedAt,
       simulatedData: input.session.demo,
       coordinateOrder: 'longitude, latitude',
-      caveat: 'This mapped signal estimate does not identify an exact transmitter position.',
+      caveat: 'Every mapped zone is approximate and requires close-range searching and visual confirmation.',
+      ...(input.bearingConsensus ? {
+        bearingConsensus: {
+          approximate: true,
+          confidence: input.bearingConsensus.confidence,
+          radiusM: input.bearingConsensus.radiusM,
+          geometryQuality: input.bearingConsensus.geometryQuality,
+          observationCount: input.bearingConsensus.observationCount,
+        },
+      } : {}),
+      ...(input.finalApproach ? {
+        finalApproach: {
+          approximate: true,
+          ready: input.finalApproach.ready,
+          reason: input.finalApproach.reason,
+          confidence: input.finalApproach.confidence,
+          disagreement: input.finalApproach.disagreement === true,
+          bearingCount: input.finalApproach.bearingCount,
+          signalCellCount: input.finalApproach.signalCellCount,
+          areaM2: input.finalApproach.areaM2 ?? null,
+        },
+      } : {}),
     },
   };
+}
+
+function latLonRing(polygon: readonly (readonly [number, number])[]): GeoJsonPosition[] {
+  const ring = polygon.map(([lat, lon]) => [lon, lat] as GeoJsonPosition);
+  closeRing(ring);
+  return ring;
 }
 
 export function stringifyGeoJson(input: GeoJsonExportInput, pretty = true): string {

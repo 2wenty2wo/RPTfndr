@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "A local-first field tool for narrowing the search area of a MeshCore repeater.",
+  "description": "A hosted PWA with device-local data for narrowing the search area of a MeshCore repeater.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -20,6 +20,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
+    "test:hosting": "node scripts/verify-hosted-build.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings=0"
   },

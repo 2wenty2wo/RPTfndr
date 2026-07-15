@@ -7,7 +7,7 @@ export function acknowledgementHtml(): string {
       <h1 id="ack-title">${WORDING.safetyTitle}</h1>
       <p class="muted">${WORDING.safetyBody}</p>
       <ul class="ack-list">
-        <li>This estimates a search area from relative radio signal observations; it does not reveal an exact location.</li>
+        <li>This estimates an approximate search area from relative radio observations; it does not reveal transmitter coordinates.</li>
         <li>Forwarded and ambiguous packets are recorded separately and never influence the finder gauge or search area.</li>
         <li>Your logs, location fixes, targets, and exports stay on this device unless you choose to export them.</li>
       </ul>

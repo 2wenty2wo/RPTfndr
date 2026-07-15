@@ -92,10 +92,26 @@ function render(state: Readonly<AppState>): void {
         const target = state.activeSession?.targetSnapshot ?? state.activeTarget;
         if (retainedMap) {
           element.replaceWith(retainedMap);
-          finderMap.update(state.receptions, state.estimate, state.events, target);
+          finderMap.update(
+            state.receptions,
+            state.estimate,
+            state.events,
+            target,
+            state.bearingConsensus,
+            state.finalApproach,
+          );
           finderMap.invalidateSize();
         } else {
-          finderMap.mount(element, state.receptions, state.estimate, state.events, target);
+          finderMap.mount(
+            element,
+            state.receptions,
+            state.estimate,
+            state.events,
+            target,
+            state.showUntrustedAdminPosition,
+            state.bearingConsensus,
+            state.finalApproach,
+          );
         }
       } catch (error) {
         controller.store.set({ mapAvailable: false });
@@ -241,7 +257,7 @@ root.addEventListener('submit', (event) => {
         smoothingWindow: Number(data.get('smoothingWindow')),
         emaAlpha: Number(data.get('emaAlpha')),
         maxGpsAccuracyM: Number(data.get('maxGpsAccuracyM')),
-      });
+      }, data.get('showUntrustedAdminPosition') === 'on');
     }
   })().catch((error: unknown) => controller.notice('error', error instanceof Error ? error.message : String(error)));
 });
@@ -311,9 +327,12 @@ if (e2e) {
     connectMock: () => controller.connectMock(),
     injectFrame: (frame) => controller.injectMockFrame(frame),
     injectGps: (fix: Omit<GpsFix, 'sessionId' | 'acceptedNum'>) => controller.injectGps(fix),
+    addBearing: (bearingDeg: number, accuracyDeg: number, note?: string) => controller.addBearing(bearingDeg, accuracyDeg, note),
     dropConnection: () => controller.dropMockConnection(),
     restoreConnection: () => controller.restoreMockConnection(),
     receptions: () => controller.store.value.receptions,
+    finalApproach: () => controller.store.value.finalApproach,
+    activeTarget: () => controller.store.value.activeTarget,
     clear: () => controller.deleteAll(),
   };
 }

@@ -1,5 +1,12 @@
+import {
+  normalizeSearchSessionRecord,
+  normalizeSessionEventRecord,
+  normalizeTargetRecord,
+  type NormalizedRecord,
+} from '../normalize';
+
 export const DB_NAME = 'meshcore-finder';
-export const DB_VERSION = 1;
+export const DB_VERSION = 2;
 
 export const STORES = {
   sessions: 'sessions',
@@ -79,11 +86,35 @@ function migrateToV1({ db }: MigrationContext): void {
   db.createObjectStore(STORES.blobs, { keyPath: 'id' });
 }
 
+function migrateStoreRecords(
+  transaction: IDBTransaction,
+  storeName: StoreName,
+  normalize: (value: unknown) => NormalizedRecord,
+): void {
+  const request = transaction.objectStore(storeName).openCursor();
+  request.addEventListener('success', () => {
+    const cursor = request.result;
+    if (!cursor) return;
+    const normalized = normalize(cursor.value);
+    if (normalized.changed) cursor.update(normalized.value);
+    cursor.continue();
+  });
+}
+
+function migrateToV2({ transaction }: MigrationContext): void {
+  migrateStoreRecords(transaction, STORES.targets, normalizeTargetRecord);
+  migrateStoreRecords(transaction, STORES.sessions, normalizeSearchSessionRecord);
+  migrateStoreRecords(transaction, STORES.events, normalizeSessionEventRecord);
+}
+
 /**
  * Migrations are deliberately version keyed and run one at a time. Tests and
  * future releases can extend this map without replacing the v1 migration.
  */
-export const MIGRATIONS: MigrationMap = new Map<number, Migration>([[1, migrateToV1]]);
+export const MIGRATIONS: MigrationMap = new Map<number, Migration>([
+  [1, migrateToV1],
+  [2, migrateToV2],
+]);
 
 export function runMigrations(
   context: Omit<MigrationContext, 'oldVersion' | 'newVersion'> & {
