@@ -178,8 +178,9 @@ button { color: inherit; }
 .modal-backdrop { position: fixed; z-index: 1500; inset: 0; display: grid; place-items: center; padding: 1rem; background: rgb(0 0 0 / .7); backdrop-filter: blur(8px); }
 .modal { width: min(100%, 34rem); max-height: 90vh; overflow: auto; padding: 1.25rem; background: var(--bg-elevated); border: 1px solid var(--line); border-radius: 1.25rem; box-shadow: var(--shadow); }
 .modal h1, .modal h2 { margin-top: 0; }
-.toast-stack { position: fixed; z-index: 1400; top: calc(4.8rem + env(safe-area-inset-top)); left: 50%; width: min(calc(100% - 2rem), 30rem); transform: translateX(-50%); display: grid; gap: .5rem; }
+.toast-stack { position: fixed; z-index: 1400; top: calc(4.8rem + env(safe-area-inset-top)); left: 50%; width: min(calc(100% - 2rem), 30rem); transform: translateX(-50%); display: grid; gap: .5rem; pointer-events: none; }
 .toast { display: flex; align-items: center; justify-content: space-between; gap: .8rem; padding: .75rem .9rem; background: var(--bg-elevated); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: .75rem; box-shadow: var(--shadow); }
+.toast .button { pointer-events: auto; }
 .toast.warning { border-left-color: var(--warning); }
 .toast.error { border-left-color: var(--danger); }
 
@@ -197,6 +198,10 @@ table { width: 100%; border-collapse: collapse; min-width: 38rem; font-size: .8r
 th, td { padding: .65rem .7rem; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
 th { color: var(--muted); font-size: .7rem; text-transform: uppercase; letter-spacing: .05em; }
 tbody tr:last-child td { border-bottom: 0; }
+
+@media (max-width: 759px) {
+  .toast-stack { top: auto; bottom: calc(5rem + var(--safe-bottom)); }
+}
 
 @media (min-width: 760px) {
   .screen { padding: 2rem 1.5rem 3rem; }

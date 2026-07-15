@@ -75,3 +75,32 @@ test('only provably direct target receptions drive finder data and exports round
   await expect(page.getByText('Imported 3 receptions for review.')).toBeVisible();
   await expect(page.locator('a[href^="#/session?id="]')).toHaveCount(2);
 });
+
+test('a persistent notice does not block Import on mobile', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'pixel-7', 'Mobile notification overlap regression');
+  await openTestApp(page);
+  await page.locator('a[href="#/sessions"]').click();
+
+  const importButton = page.getByRole('button', { name: 'Import' });
+  const [invalidChooser] = await Promise.all([
+    page.waitForEvent('filechooser'),
+    importButton.click(),
+  ]);
+  await invalidChooser.setFiles({
+    name: 'invalid.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from('{'),
+  });
+
+  const errorNotice = page.locator('.toast.error');
+  await expect(errorNotice).toBeVisible();
+  await expect(page.getByRole('status')).toHaveAttribute('aria-live', 'polite');
+  const nextChooserPromise = page.waitForEvent('filechooser');
+  await importButton.click();
+  const nextChooser = await nextChooserPromise;
+  await expect(errorNotice).toBeVisible();
+  await nextChooser.setFiles([]);
+
+  await page.getByRole('button', { name: 'Dismiss notification' }).click();
+  await expect(errorNotice).toBeHidden();
+});
