@@ -26,6 +26,26 @@ npm run build
 
 The example produces URLs and service-worker scope beneath `/RPTfndr/`. Rebuild with the real public path whenever that path changes. The app uses a hash router, so a static host does not need SPA rewrite rules. Do not add a Mapy or other private API key; the included tile endpoints require none.
 
+
+## GitHub Actions FTP deployment
+
+The repository includes a `Deploy FTP` workflow that builds `dist/` and publishes it with [`SamKirkland/FTP-Deploy-Action`](https://github.com/SamKirkland/FTP-Deploy-Action). It runs on pushes to `main` and can also be started manually from the Actions tab.
+
+Configure these required repository or environment secrets before running the workflow:
+
+- `FTP_SERVER` — FTP or FTPS hostname.
+- `FTP_USERNAME` — deployment user.
+- `FTP_PASSWORD` — deployment password.
+
+Optional repository or environment variables customize the deployment without editing the workflow:
+
+- `BASE_PATH` — Vite base path for subdirectory deployments, such as `/RPTfndr/`. Leave unset for root deployments.
+- `FTP_PROTOCOL` — defaults to `ftps`; set to `ftp` only when your host does not support FTPS.
+- `FTP_PORT` — defaults to `21`; set this if your host uses a custom FTP/FTPS port.
+- `FTP_SERVER_DIR` — defaults to `./`; set this to the remote publish directory, such as `public_html/`. The value must end with `/`.
+
+The workflow intentionally deploys only `dist/`, after `npm ci`, typechecking, linting, unit tests, production build, and the hosted-build verification pass.
+
 ## Service worker
 
 The generated service worker precaches the application shell, supplies an offline navigation fallback, and caches at most 300 map tiles for seven days. This cache makes the hosted UI more resilient in the field; it is not a backup or synchronisation mechanism for IndexedDB. Updates use a prompt so a capture is not replaced mid-session. `?nosw=1` disables registration for automated tests and troubleshooting.
