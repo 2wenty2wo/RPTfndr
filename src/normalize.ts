@@ -5,6 +5,14 @@ export interface NormalizedRecord {
   changed: boolean;
 }
 
+const SMART_WARDRIVE_DEFAULTS = {
+  smartWardriveEnabled: false,
+  autoDiscoveryEnabled: false,
+  autoDiscoveryIntervalSec: 90,
+  observerAssistEnabled: false,
+  observerPollIntervalMin: 10,
+} as const;
+
 /** Normalize the v1 target coordinate shape without assigning it any trust. */
 export function normalizeTargetRecord(value: unknown): NormalizedRecord {
   if (!isRecord(value)) return { value, changed: false };
@@ -64,11 +72,29 @@ export function normalizeSessionEventRecord(value: unknown): NormalizedRecord {
 export function normalizeSearchSessionRecord(value: unknown): NormalizedRecord {
   if (!isRecord(value)) return { value, changed: false };
   const normalizedTarget = normalizeTargetRecord(value.targetSnapshot);
-  if (!normalizedTarget.changed) return { value, changed: false };
+  const settings = normalizeSessionSettingsRecord(value.settings);
+  if (!normalizedTarget.changed && !settings.changed) return { value, changed: false };
   return {
-    value: { ...value, targetSnapshot: normalizedTarget.value },
+    value: {
+      ...value,
+      ...(normalizedTarget.changed ? { targetSnapshot: normalizedTarget.value } : {}),
+      ...(settings.changed ? { settings: settings.value } : {}),
+    },
     changed: true,
   };
+}
+
+/** Add conservative defaults for sessions saved before Smart Wardrive existed. */
+export function normalizeSessionSettingsRecord(value: unknown): NormalizedRecord {
+  if (!isRecord(value)) return { value, changed: false };
+  const next: JsonRecord = { ...value };
+  let changed = false;
+  for (const [key, defaultValue] of Object.entries(SMART_WARDRIVE_DEFAULTS)) {
+    if (next[key] !== undefined) continue;
+    next[key] = defaultValue;
+    changed = true;
+  }
+  return { value: changed ? next : value, changed };
 }
 
 function isRecord(value: unknown): value is JsonRecord {

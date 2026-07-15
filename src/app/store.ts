@@ -1,13 +1,30 @@
 import type { SignalSnapshot } from '../signal';
 import { DEFAULT_SESSION_SETTINGS } from '../types';
-import type { BearingConsensus, BearingConsensusAnalysis, FinalApproachEstimate } from '../location';
-import type { AreaEstimate, CellAggregate, ConnState, GpsFix, Reception, SearchSession, SessionEvent, SessionSettings, TargetProfile } from '../types';
+import type {
+  BearingConsensus,
+  BearingConsensusAnalysis,
+  FinalApproachEstimate,
+  RemoteObserverAnalysis,
+  RemoteObserverCombinedZone,
+} from '../location';
+import type { AreaEstimate, CellAggregate, ConnState, GpsFix, Reception, RemoteObserverEvidence, SearchSession, SessionEvent, SessionSettings, TargetProfile, VerifiedObserver } from '../types';
+import type { SmartWardriveSnapshot } from './smartWardrive';
 
 export interface Notice {
   id: string;
   kind: 'info' | 'success' | 'warning' | 'error';
   message: string;
   action?: { label: string; run: () => void };
+}
+
+export interface ObserverRuntimeStatus {
+  observerId: string;
+  state: 'idle' | 'queued' | 'querying' | 'matched' | 'no-match' | 'denied' | 'error';
+  lastAttemptAt?: number;
+  lastMatchedAt?: number;
+  lastHeardAt?: number;
+  lastSnr?: number;
+  detail?: string;
 }
 
 export interface AppState {
@@ -34,6 +51,12 @@ export interface AppState {
   signal?: SignalSnapshot;
   preferences: SessionSettings;
   showUntrustedAdminPosition: boolean;
+  observers: VerifiedObserver[];
+  observerEvidence: RemoteObserverEvidence[];
+  remoteObserverAnalysis?: RemoteObserverAnalysis;
+  communityAssistedZone?: RemoteObserverCombinedZone;
+  observerStatuses: ObserverRuntimeStatus[];
+  smartWardrive: SmartWardriveSnapshot;
   writer: boolean;
   gpsState: 'good' | 'degraded' | 'searching' | 'denied' | 'unavailable';
   mapAvailable: boolean;
@@ -83,6 +106,15 @@ export const initialAppState: AppState = {
   cells: [],
   preferences: { ...DEFAULT_SESSION_SETTINGS },
   showUntrustedAdminPosition: false,
+  observers: [],
+  observerEvidence: [],
+  observerStatuses: [],
+  smartWardrive: {
+    active: false,
+    reason: 'Smart Wardrive is disabled.',
+    discoveryRuns: 0,
+    observerPollRuns: 0,
+  },
   writer: true,
   gpsState: 'searching',
   mapAvailable: true,

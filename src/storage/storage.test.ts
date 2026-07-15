@@ -47,6 +47,11 @@ function session(overrides: Partial<SearchSession> = {}): SearchSession {
       audioVolume: 0.8,
       audioMuted: false,
       forwardedAlert: false,
+      smartWardriveEnabled: false,
+      autoDiscoveryEnabled: false,
+      autoDiscoveryIntervalSec: 90,
+      observerAssistEnabled: false,
+      observerPollIntervalMin: 10,
     },
     counters: {
       receptions: 99,
@@ -140,15 +145,15 @@ describe('IndexedDB schema and migrations', () => {
     expect(index.keyPath).toEqual(['sessionId', 'conf', 't']);
   });
 
-  it('runs an added migration sequentially from v2', async () => {
+  it('runs an added migration sequentially from v3', async () => {
     const name = databaseName('migration');
     const first = await openFinderDatabase({ name });
     first.close();
-    const migration: Migration = ({ db }) => db.createObjectStore('test-v3');
-    const migrations = new Map([...MIGRATIONS, [3, migration]]);
-    const upgraded = await openFinderDatabase({ name, version: 3, migrations });
+    const migration: Migration = ({ db }) => db.createObjectStore('test-v4');
+    const migrations = new Map([...MIGRATIONS, [4, migration]]);
+    const upgraded = await openFinderDatabase({ name, version: 4, migrations });
     opened.push({ name, close: () => upgraded.close() });
-    expect(upgraded.connection.objectStoreNames.contains('test-v3')).toBe(true);
+    expect(upgraded.connection.objectStoreNames.contains('test-v4')).toBe(true);
   });
 
   it('migrates lastKnown targets and legacy bearing fields from v1', async () => {
@@ -170,8 +175,17 @@ describe('IndexedDB schema and migrations', () => {
       },
     };
     await first.put(STORES.targets, legacyTarget);
+    const legacySession = structuredClone(session()) as unknown as {
+      targetSnapshot: TargetProfile;
+      settings: Record<string, unknown>;
+    } & Record<string, unknown>;
+    delete legacySession.settings.smartWardriveEnabled;
+    delete legacySession.settings.autoDiscoveryEnabled;
+    delete legacySession.settings.autoDiscoveryIntervalSec;
+    delete legacySession.settings.observerAssistEnabled;
+    delete legacySession.settings.observerPollIntervalMin;
     await first.put(STORES.sessions, {
-      ...session(),
+      ...legacySession,
       targetSnapshot: legacyTarget,
     });
     await first.add(STORES.events, {
@@ -200,6 +214,13 @@ describe('IndexedDB schema and migrations', () => {
       },
     });
     expect(await upgraded.get(STORES.sessions, 'session-1')).toMatchObject({
+      settings: {
+        smartWardriveEnabled: false,
+        autoDiscoveryEnabled: false,
+        autoDiscoveryIntervalSec: 90,
+        observerAssistEnabled: false,
+        observerPollIntervalMin: 10,
+      },
       targetSnapshot: {
         advertisedReference: { source: 'advert', trust: 'untrusted-admin' },
       },

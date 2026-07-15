@@ -7,7 +7,12 @@ import type {
   SearchSession,
   SessionEvent,
 } from '../types';
-import type { BearingConsensus, FinalApproachEstimate } from '../location';
+import type {
+  BearingConsensus,
+  FinalApproachEstimate,
+  RemoteObserverAnalysis,
+  RemoteObserverCombinedZone,
+} from '../location';
 import {
   normalizeSearchSessionRecord,
   normalizeSessionEventRecord,
@@ -15,11 +20,11 @@ import {
 import { sha256Hex } from './hash';
 
 export const ARCHIVE_FORMAT = 'meshcore-finder-session' as const;
-export const ARCHIVE_VERSION = 2 as const;
+export const ARCHIVE_VERSION = 3 as const;
 export const JSON_ARCHIVE_MIME = 'application/vnd.meshcore-finder.session+json';
 export const DEFAULT_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
 
-export interface SessionArchiveV2 {
+export interface SessionArchiveV3 {
   format: typeof ARCHIVE_FORMAT;
   version: typeof ARCHIVE_VERSION;
   exportedAt: string;
@@ -33,12 +38,16 @@ export interface SessionArchiveV2 {
     estimate?: AreaEstimate;
     bearingConsensus?: BearingConsensus;
     finalApproach?: FinalApproachEstimate;
+    remoteObserverAnalysis?: RemoteObserverAnalysis;
+    communityAssistedZone?: RemoteObserverCombinedZone;
   };
 }
 
-export type SessionArchive = SessionArchiveV2;
+export type SessionArchive = SessionArchiveV3;
 /** @deprecated Use SessionArchive; retained as a source-compatible alias. */
-export type SessionArchiveV1 = SessionArchiveV2;
+export type SessionArchiveV2 = SessionArchiveV3;
+/** @deprecated Use SessionArchive; retained as a source-compatible alias. */
+export type SessionArchiveV1 = SessionArchiveV3;
 
 export interface SessionArchiveInput {
   session: SearchSession;
@@ -49,6 +58,8 @@ export interface SessionArchiveInput {
   estimate?: AreaEstimate;
   bearingConsensus?: BearingConsensus;
   finalApproach?: FinalApproachEstimate;
+  remoteObserverAnalysis?: RemoteObserverAnalysis;
+  communityAssistedZone?: RemoteObserverCombinedZone;
   exportedAt?: Date | string;
 }
 
@@ -97,12 +108,21 @@ export function createSessionArchive(input: SessionArchiveInput): SessionArchive
     fixes: input.fixes,
     events: input.events,
   };
-  if (input.cells || input.estimate || input.bearingConsensus || input.finalApproach) {
+  if (
+    input.cells
+    || input.estimate
+    || input.bearingConsensus
+    || input.finalApproach
+    || input.remoteObserverAnalysis
+    || input.communityAssistedZone
+  ) {
     archive.derived = {
       ...(input.cells ? { cells: input.cells } : {}),
       ...(input.estimate ? { estimate: input.estimate } : {}),
       ...(input.bearingConsensus ? { bearingConsensus: input.bearingConsensus } : {}),
       ...(input.finalApproach ? { finalApproach: input.finalApproach } : {}),
+      ...(input.remoteObserverAnalysis ? { remoteObserverAnalysis: input.remoteObserverAnalysis } : {}),
+      ...(input.communityAssistedZone ? { communityAssistedZone: input.communityAssistedZone } : {}),
     };
   }
   // Clone through JSON so the exported snapshot cannot be mutated by live
@@ -161,14 +181,14 @@ export const importSessionArchive = parseSessionArchive;
 
 /**
  * Upgrade legacy archive records in memory before validation. Imports always
- * return the canonical v2 shape, so re-exporting never perpetuates legacy
+ * return the canonical v3 shape, so re-exporting never perpetuates legacy
  * coordinate trust semantics or bearing field names.
  */
 function normalizeArchive(value: unknown): unknown {
   if (!isRecord(value)) return value;
   let changed = false;
   const next: Record<string, unknown> = { ...value };
-  if (value.version === 1) {
+  if (value.version === 1 || value.version === 2) {
     next.version = ARCHIVE_VERSION;
     changed = true;
   }
@@ -237,10 +257,122 @@ export function validateSessionArchive(
     } else if (isRecord(value.derived.finalApproach)) {
       validateApproximateZone(value.derived.finalApproach, '$.derived.finalApproach', issue, true);
     }
+    if (value.derived.remoteObserverAnalysis !== undefined
+        && !isRecord(value.derived.remoteObserverAnalysis)) {
+      issue('$.derived.remoteObserverAnalysis', 'must be an object');
+    } else if (isRecord(value.derived.remoteObserverAnalysis)) {
+      validateRemoteObserverAnalysis(
+        value.derived.remoteObserverAnalysis,
+        '$.derived.remoteObserverAnalysis',
+        issue,
+      );
+    }
+    if (value.derived.communityAssistedZone !== undefined
+        && !isRecord(value.derived.communityAssistedZone)) {
+      issue('$.derived.communityAssistedZone', 'must be an object');
+    } else if (isRecord(value.derived.communityAssistedZone)) {
+      validateCommunityAssistedZone(
+        value.derived.communityAssistedZone,
+        '$.derived.communityAssistedZone',
+        issue,
+      );
+    }
   }
 
   if (issues.length > 0) return { ok: false, issues };
   return { ok: true, archive: cloneJson(value) as unknown as SessionArchive };
+}
+
+function validateRemoteObserverAnalysis(
+  value: Record<string, unknown>,
+  path: string,
+  issue: (path: string, message: string) => void,
+): void {
+  if (typeof value.ready !== 'boolean') issue(`${path}.ready`, 'must be a boolean');
+  if (!isNonEmptyString(value.reason, 10_000)) issue(`${path}.reason`, 'must be text');
+  for (const field of ['eligibleObserverCount', 'eligibleObservationCount'] as const) {
+    if (!isNonNegativeInteger(value[field])) {
+      issue(`${path}.${field}`, 'must be a non-negative integer');
+    }
+  }
+  if (!Array.isArray(value.exclusions)) issue(`${path}.exclusions`, 'must be an array');
+  if (value.zone !== undefined && !isRecord(value.zone)) {
+    issue(`${path}.zone`, 'must be an object');
+  } else if (isRecord(value.zone)) {
+    validateRemoteObserverZone(value.zone, `${path}.zone`, issue);
+  }
+  if (value.ready === true && !isRecord(value.zone)) {
+    issue(`${path}.zone`, 'is required when remote-observer analysis is ready');
+  }
+}
+
+function validateRemoteObserverZone(
+  value: Record<string, unknown>,
+  path: string,
+  issue: (path: string, message: string) => void,
+): void {
+  validateApproximateZone(value, path, issue, false);
+  if (value.confidence === 'high') {
+    issue(`${path}.confidence`, 'remote-observer confidence cannot exceed medium');
+  }
+  if (!Array.isArray(value.polygon)) {
+    issue(`${path}.polygon`, 'is required for a remote-observer zone');
+  }
+  if (value.method !== 'relative-snr-envelope') {
+    issue(`${path}.method`, 'must identify the relative-SNR envelope method');
+  }
+  if (!['limited', 'fair', 'good'].includes(String(value.geometryQuality))) {
+    issue(`${path}.geometryQuality`, 'must be limited, fair, or good');
+  }
+  for (const field of ['observerCount', 'observationCount', 'relativeConstraintCount'] as const) {
+    if (!isNonNegativeInteger(value[field])) {
+      issue(`${path}.${field}`, 'must be a non-negative integer');
+    }
+  }
+  if (!isFiniteNumber(value.areaM2) || value.areaM2 < 0) {
+    issue(`${path}.areaM2`, 'must be a non-negative number');
+  }
+  if (!isFiniteNumber(value.terrainUncertaintyDb) || value.terrainUncertaintyDb < 0) {
+    issue(`${path}.terrainUncertaintyDb`, 'must be a non-negative number');
+  }
+  if (!isTimestamp(value.generatedAt)) issue(`${path}.generatedAt`, 'must be a valid timestamp');
+  if (!Array.isArray(value.contributingObserverIds)) {
+    issue(`${path}.contributingObserverIds`, 'must be an array');
+  }
+  if (!Array.isArray(value.exclusionReasons)) {
+    issue(`${path}.exclusionReasons`, 'must be an array');
+  }
+}
+
+function validateCommunityAssistedZone(
+  value: Record<string, unknown>,
+  path: string,
+  issue: (path: string, message: string) => void,
+): void {
+  validateApproximateZone(value, path, issue, true);
+  if (value.confidence === 'high') {
+    issue(`${path}.confidence`, 'community-assisted confidence cannot exceed medium');
+  }
+  if (!isNonEmptyString(value.reason, 10_000)) issue(`${path}.reason`, 'must be text');
+  if (!isNonNegativeInteger(value.observerCount)) {
+    issue(`${path}.observerCount`, 'must be a non-negative integer');
+  }
+  if (!Array.isArray(value.contributingObserverIds)) {
+    issue(`${path}.contributingObserverIds`, 'must be an array');
+  }
+  if (!isTimestamp(value.generatedAt)) issue(`${path}.generatedAt`, 'must be a valid timestamp');
+  if (value.areaM2 !== undefined && (!isFiniteNumber(value.areaM2) || value.areaM2 < 0)) {
+    issue(`${path}.areaM2`, 'must be a non-negative number');
+  }
+  if (value.ready === true && !Array.isArray(value.polygon)) {
+    issue(`${path}.polygon`, 'is required when the combined zone is ready');
+  }
+  if (value.ready === true && !isFiniteNumber(value.areaM2)) {
+    issue(`${path}.areaM2`, 'is required when the combined zone is ready');
+  }
+  if (value.disagreement !== undefined && typeof value.disagreement !== 'boolean') {
+    issue(`${path}.disagreement`, 'must be a boolean');
+  }
 }
 
 function validateApproximateZone(
@@ -412,6 +544,8 @@ function validateSettings(
     ['emaAlpha', 0.2, 0.6],
     ['maxGpsAccuracyM', 25, 200],
     ['audioVolume', 0, 1],
+    ['autoDiscoveryIntervalSec', 60, 900, true],
+    ['observerPollIntervalMin', 5, 60, true],
   ];
   for (const [key, minimum, maximum, integer] of ranges) {
     const field = value[key];
@@ -422,6 +556,9 @@ function validateSettings(
   if (!['chime', 'tone', 'geiger', 'off'].includes(String(value.audioMode))) issue(`${path}.audioMode`, 'is invalid');
   if (typeof value.audioMuted !== 'boolean') issue(`${path}.audioMuted`, 'must be a boolean');
   if (typeof value.forwardedAlert !== 'boolean') issue(`${path}.forwardedAlert`, 'must be a boolean');
+  for (const key of ['smartWardriveEnabled', 'autoDiscoveryEnabled', 'observerAssistEnabled']) {
+    if (typeof value[key] !== 'boolean') issue(`${path}.${key}`, 'must be a boolean');
+  }
 }
 
 function validateCounters(value: unknown, issue: (path: string, message: string) => void): void {
@@ -601,7 +738,18 @@ function validateEvent(
   if (value.id !== undefined && !isPositiveInteger(value.id)) issue(`${path}.id`, 'must be a positive integer');
   if (value.sessionId !== sessionId) issue(`${path}.sessionId`, 'must match the archive session');
   if (!isTimestamp(value.t)) issue(`${path}.t`, 'must be a valid timestamp');
-  if (!['note', 'mark', 'bearing', 'discovery-cmd', 'lifecycle', 'identity-change', 'suspension-gap'].includes(String(value.type))) issue(`${path}.type`, 'is invalid');
+  if (![
+    'note',
+    'mark',
+    'bearing',
+    'discovery-cmd',
+    'lifecycle',
+    'identity-change',
+    'suspension-gap',
+    'observer-query',
+    'observer-evidence',
+    'smart-wardrive',
+  ].includes(String(value.type))) issue(`${path}.type`, 'is invalid');
   if (!isRecord(value.data)) {
     issue(`${path}.data`, 'must be an object');
   } else if (value.type === 'bearing') {
@@ -636,6 +784,87 @@ function validateEvent(
     if (value.data.note !== undefined && typeof value.data.note !== 'string') {
       issue(`${path}.data.note`, 'must be text');
     }
+  } else if (value.type === 'observer-evidence') {
+    validateObserverEvidenceEvent(
+      value.data,
+      `${path}.data`,
+      issue,
+      isTimestamp(value.t) ? value.t : undefined,
+    );
+  }
+}
+
+function validateObserverEvidenceEvent(
+  value: Record<string, unknown>,
+  path: string,
+  issue: (path: string, message: string) => void,
+  eventTime?: number,
+): void {
+  if (value.id !== undefined && !isNonEmptyString(value.id, 500)) {
+    issue(`${path}.id`, 'must be text when present');
+  }
+  if (!isNonEmptyString(value.observerId, 500)) issue(`${path}.observerId`, 'must be text');
+  for (const field of ['observerPubkeyHex', 'targetPubkeyHex'] as const) {
+    validateHex(value[field], `${path}.${field}`, issue, true);
+    if (typeof value[field] === 'string' && value[field].length !== 64) {
+      issue(`${path}.${field}`, 'must contain a 32-byte public key');
+    }
+  }
+  if (!isTimestamp(value.observedAt) || value.observedAt < 0) issue(`${path}.observedAt`, 'must be a valid timestamp');
+  if (!isTimestamp(value.receivedAt) || value.receivedAt < 0) issue(`${path}.receivedAt`, 'must be a valid timestamp');
+  if (!isTimestamp(value.anchorVerifiedAt) || value.anchorVerifiedAt < 0) {
+    issue(`${path}.anchorVerifiedAt`, 'must be a valid timestamp');
+  }
+  if (!isFiniteNumber(value.heardSecondsAgo) || value.heardSecondsAgo < 0) {
+    issue(`${path}.heardSecondsAgo`, 'must be a non-negative number');
+  }
+  if (
+    isTimestamp(value.observedAt)
+    && isTimestamp(value.receivedAt)
+    && isFiniteNumber(value.heardSecondsAgo)
+    && value.heardSecondsAgo >= 0
+  ) {
+    if (value.observedAt > value.receivedAt) {
+      issue(`${path}.observedAt`, 'must not be later than the report receipt time');
+    }
+    const reportedAgeMs = value.receivedAt - value.observedAt;
+    const encodedAgeMs = value.heardSecondsAgo * 1_000;
+    if (Math.abs(reportedAgeMs - encodedAgeMs) > 2_000) {
+      issue(`${path}.heardSecondsAgo`, 'must agree with observedAt and receivedAt within 2 seconds');
+    }
+    if (eventTime !== undefined && Math.abs(eventTime - value.receivedAt) > 30_000) {
+      issue(`${path}.receivedAt`, 'must be within 30 seconds of the containing event time');
+    }
+  }
+  if (
+    isTimestamp(value.anchorVerifiedAt)
+    && isTimestamp(value.receivedAt)
+    && value.anchorVerifiedAt > value.receivedAt + 30_000
+  ) {
+    issue(`${path}.anchorVerifiedAt`, 'must not be materially later than the report receipt time');
+  }
+  if (!isFiniteNumber(value.snr) || value.snr < -32 || value.snr > 31.75) {
+    issue(`${path}.snr`, 'must be between -32 and 31.75 dB');
+  }
+  if (!isFiniteNumber(value.anchorLat) || value.anchorLat < -90 || value.anchorLat > 90) {
+    issue(`${path}.anchorLat`, 'must be between -90 and 90');
+  }
+  if (!isFiniteNumber(value.anchorLon) || value.anchorLon < -180 || value.anchorLon > 180) {
+    issue(`${path}.anchorLon`, 'must be between -180 and 180');
+  }
+  if (!isFiniteNumber(value.anchorAccuracyM)
+      || value.anchorAccuracyM < 1
+      || value.anchorAccuracyM > 10_000) {
+    issue(`${path}.anchorAccuracyM`, 'must be between 1 and 10000');
+  }
+  if (!['user-surveyed', 'operator-confirmed'].includes(String(value.anchorVerification))) {
+    issue(`${path}.anchorVerification`, 'must describe an independent verification method');
+  }
+  if (value.source !== 'guest-neighbour') {
+    issue(`${path}.source`, 'must identify a guest neighbour report');
+  }
+  if (value.trust !== 'verified-observer') {
+    issue(`${path}.trust`, 'must identify a verified observer anchor');
   }
 }
 
@@ -684,6 +913,10 @@ function isFiniteNumber(value: unknown): value is number {
 
 function isPositiveInteger(value: unknown): value is number {
   return isFiniteNumber(value) && Number.isSafeInteger(value) && value > 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return isFiniteNumber(value) && Number.isSafeInteger(value) && value >= 0;
 }
 
 function isTimestamp(value: unknown): value is number {

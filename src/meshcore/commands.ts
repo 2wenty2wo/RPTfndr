@@ -6,6 +6,7 @@ export interface ResponseMatcher {
 export interface SendOptions {
   label: string;
   timeoutMs: number;
+  signal?: AbortSignal;
 }
 
 export interface CommandQueueState {
@@ -27,6 +28,7 @@ interface PendingCommand {
   writeDone: boolean;
   responseDone: boolean;
   cancelled: boolean;
+  abortListener?: () => void;
 }
 
 export class CommandTimeoutError extends Error {
@@ -44,6 +46,16 @@ export class CommandCancelledError extends Error {
     super(message);
     this.name = 'CommandCancelledError';
   }
+}
+
+function cancellationError(signal: AbortSignal, label: string): CommandCancelledError {
+  const reason = signal.reason;
+  const message = reason instanceof Error
+    ? reason.message
+    : typeof reason === 'string' && reason
+      ? reason
+      : `${label} cancelled`;
+  return new CommandCancelledError(message);
 }
 
 /**
@@ -65,13 +77,14 @@ export class CommandQueue {
     const normalizedOptions: SendOptions = {
       label: options.label,
       timeoutMs: options.timeoutMs ?? 5_000,
+      ...(options.signal ? { signal: options.signal } : {}),
     };
     if (!Number.isFinite(normalizedOptions.timeoutMs) || normalizedOptions.timeoutMs <= 0) {
       return Promise.reject(new RangeError('Command timeout must be greater than zero'));
     }
 
     return new Promise<Uint8Array[]>((resolve, reject) => {
-      this.waiting.push({
+      const pending: PendingCommand = {
         command: command.slice(),
         matcher,
         options: normalizedOptions,
@@ -81,7 +94,17 @@ export class CommandQueue {
         writeDone: false,
         responseDone: false,
         cancelled: false,
-      });
+      };
+      this.waiting.push(pending);
+      if (normalizedOptions.signal) {
+        const signal = normalizedOptions.signal;
+        pending.abortListener = () => this.cancel(pending, cancellationError(signal, normalizedOptions.label));
+        signal.addEventListener('abort', pending.abortListener, { once: true });
+        if (signal.aborted) {
+          this.cancel(pending, cancellationError(signal, normalizedOptions.label));
+          return;
+        }
+      }
       this.pump();
     });
   }
@@ -135,17 +158,13 @@ export class CommandQueue {
       reason instanceof Error
         ? reason
         : new CommandCancelledError(reason);
-    const active = this.active;
-    this.active = undefined;
-    if (active) {
-      active.cancelled = true;
-      if (active.timeout) clearTimeout(active.timeout);
-      active.reject(error);
-    }
     for (const pending of this.waiting.splice(0)) {
       pending.cancelled = true;
+      this.detachAbortListener(pending);
       pending.reject(error);
     }
+    const active = this.active;
+    if (active) this.cancel(active, error);
   }
 
   private pump(): void {
@@ -157,7 +176,14 @@ export class CommandQueue {
 
     void this.write(next.command.slice()).then(
       () => {
-        if (next.cancelled || this.active !== next) return;
+        if (next.cancelled) {
+          if (this.active === next) {
+            this.active = undefined;
+            this.pump();
+          }
+          return;
+        }
+        if (this.active !== next) return;
         next.writeDone = true;
         if (!next.matcher || next.responseDone) {
           this.succeed(next);
@@ -168,7 +194,14 @@ export class CommandQueue {
         }, next.options.timeoutMs);
       },
       (cause: unknown) => {
-        if (next.cancelled || this.active !== next) return;
+        if (next.cancelled) {
+          if (this.active === next) {
+            this.active = undefined;
+            this.pump();
+          }
+          return;
+        }
+        if (this.active !== next) return;
         const detail = cause instanceof Error ? cause.message : String(cause);
         this.fail(next, new Error(`${next.options.label} write failed: ${detail}`));
       },
@@ -178,6 +211,7 @@ export class CommandQueue {
   private succeed(command: PendingCommand): void {
     if (this.active !== command || command.cancelled) return;
     if (command.timeout) clearTimeout(command.timeout);
+    this.detachAbortListener(command);
     this.active = undefined;
     command.resolve(command.frames.map((frame) => frame.slice()));
     this.pump();
@@ -187,9 +221,42 @@ export class CommandQueue {
     if (this.active !== command || command.cancelled) return;
     command.cancelled = true;
     if (command.timeout) clearTimeout(command.timeout);
+    this.detachAbortListener(command);
     this.active = undefined;
     command.reject(error);
     this.pump();
+  }
+
+  private cancel(command: PendingCommand, error: Error): void {
+    if (command.cancelled) return;
+    command.cancelled = true;
+    if (command.timeout) clearTimeout(command.timeout);
+    this.detachAbortListener(command);
+
+    if (this.active === command) {
+      command.reject(error);
+      // Do not overlap transport writes. Once a pending write settles, pump()
+      // advances from its continuation; a command already awaiting a response
+      // can release the queue immediately.
+      if (command.writeDone) {
+        this.active = undefined;
+        this.pump();
+      }
+      return;
+    }
+
+    const index = this.waiting.indexOf(command);
+    if (index < 0) return;
+    this.waiting.splice(index, 1);
+    command.reject(error);
+    this.pump();
+  }
+
+  private detachAbortListener(command: PendingCommand): void {
+    if (command.abortListener && command.options.signal) {
+      command.options.signal.removeEventListener('abort', command.abortListener);
+    }
+    command.abortListener = undefined;
   }
 
   private emitPush(frame: Uint8Array): void {

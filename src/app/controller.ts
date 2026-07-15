@@ -11,15 +11,19 @@ import {
 } from '../export';
 import {
   aggregateReceptions,
+  analyzeRemoteObservers,
   analyzeBearingConsensus,
   bearingEvent,
+  combineRemoteObserverZone,
   deriveFinalApproach,
   estimateArea,
   GpsService,
   observationFromBearingEvent,
+  type RemoteObserverObservation,
 } from '../location';
 import {
   DiscoveryCoordinator,
+  GuestObserverCoordinator,
   IdentityUniverse,
   MeshCoreDevice,
   normalizeHex,
@@ -55,13 +59,16 @@ import type {
   GpsFix,
   ConnState,
   Reception,
+  RemoteObserverEvidence,
   SearchSession,
   SessionEvent,
   SessionSettings,
   TargetProfile,
   Transport,
+  VerifiedObserver,
 } from '../types';
 import { DEFAULT_SESSION_SETTINGS } from '../types';
+import { SmartWardriveScheduler } from './smartWardrive';
 
 export type ExportKind = 'json' | 'csv' | 'geojson' | 'summary';
 
@@ -121,10 +128,190 @@ export function deriveApproachState(
   };
 }
 
+function finiteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+export function observedAtFromNeighbourAge(
+  receivedAt: number,
+  heardSecondsAgo: number,
+): number | undefined {
+  if (
+    !Number.isFinite(receivedAt)
+    || receivedAt < 0
+    || !Number.isInteger(heardSecondsAgo)
+    || heardSecondsAgo < 0
+    || heardSecondsAgo > 0xffff_ffff
+  ) return undefined;
+  const ageMs = heardSecondsAgo * 1_000;
+  return ageMs <= receivedAt ? receivedAt - ageMs : undefined;
+}
+
+export function observerEvidenceFromEvent(event: SessionEvent): RemoteObserverEvidence | undefined {
+  if (event.type !== 'observer-evidence') return undefined;
+  const data = event.data;
+  const observerPubkeyHex = normalizeFullPubkey(
+    typeof data.observerPubkeyHex === 'string' ? data.observerPubkeyHex : undefined,
+  );
+  const targetPubkeyHex = normalizeFullPubkey(
+    typeof data.targetPubkeyHex === 'string' ? data.targetPubkeyHex : undefined,
+  );
+  if (!observerPubkeyHex || !targetPubkeyHex) return undefined;
+  if (
+    typeof data.observerId !== 'string'
+    || !finiteNumber(data.observedAt)
+    || !finiteNumber(data.receivedAt)
+    || !finiteNumber(data.heardSecondsAgo)
+    || !finiteNumber(data.snr)
+    || !finiteNumber(data.anchorLat)
+    || !finiteNumber(data.anchorLon)
+    || !finiteNumber(data.anchorAccuracyM)
+    || !finiteNumber(data.anchorVerifiedAt)
+    || data.source !== 'guest-neighbour'
+    || data.trust !== 'verified-observer'
+    || (data.anchorVerification !== 'user-surveyed' && data.anchorVerification !== 'operator-confirmed')
+    || !validCoordinate(data.anchorLat, data.anchorLon)
+    || data.observedAt < 0
+    || data.receivedAt < 0
+    || data.observedAt > data.receivedAt
+    || data.heardSecondsAgo < 0
+    || Math.abs((data.receivedAt - data.observedAt) - data.heardSecondsAgo * 1_000) > 2_000
+    || Math.abs(event.t - data.receivedAt) > 30_000
+    || data.anchorAccuracyM < 1
+    || data.anchorAccuracyM > 10_000
+    || data.anchorVerifiedAt < 0
+    || data.anchorVerifiedAt > data.receivedAt + 30_000
+    || data.snr < -32
+    || data.snr > 31.75
+  ) return undefined;
+  return {
+    ...(typeof data.id === 'string' && data.id ? { id: data.id } : event.id === undefined ? {} : { id: `event-${event.id}` }),
+    observerId: data.observerId,
+    observerPubkeyHex,
+    targetPubkeyHex,
+    observedAt: data.observedAt,
+    receivedAt: data.receivedAt,
+    heardSecondsAgo: data.heardSecondsAgo,
+    snr: data.snr,
+    anchorLat: data.anchorLat,
+    anchorLon: data.anchorLon,
+    anchorAccuracyM: data.anchorAccuracyM,
+    anchorVerifiedAt: data.anchorVerifiedAt,
+    anchorVerification: data.anchorVerification,
+    source: 'guest-neighbour',
+    trust: 'verified-observer',
+  };
+}
+
+export function deriveRemoteObserverState(
+  events: readonly SessionEvent[],
+  target: TargetProfile | undefined,
+  estimate: AreaEstimate | undefined,
+  finalApproach: ReturnType<typeof deriveApproachState>['finalApproach'],
+  generatedAt = Date.now(),
+  currentObservers?: readonly VerifiedObserver[],
+): Pick<AppState, 'observerEvidence' | 'remoteObserverAnalysis' | 'communityAssistedZone'> {
+  const allEvidence = events
+    .map(observerEvidenceFromEvent)
+    .filter((evidence): evidence is RemoteObserverEvidence => evidence !== undefined);
+  const targetPublicKey = target?.identity.kind === 'full-pubkey'
+    ? normalizeFullPubkey(target.identity.pubkeyHex) ?? ''
+    : '';
+  const targetEvidence = allEvidence.filter((evidence) => evidence.targetPubkeyHex === targetPublicKey);
+  const currentObserverByKey = currentObservers === undefined
+    ? undefined
+    : new Map(currentObservers.map((observer) => [observer.repeaterPubkeyHex, observer]));
+  const hasCurrentVerifiedAnchor = (evidence: RemoteObserverEvidence): boolean => {
+    if (!currentObserverByKey) return true;
+    const observer = currentObserverByKey.get(evidence.observerPubkeyHex);
+    return observer !== undefined
+      && observer.enabled
+      && observer.permissionConfirmed
+      && observer.trust === 'verified-observer'
+      && observer.accuracyM <= MAX_OBSERVER_ANCHOR_ACCURACY_M
+      && observer.lat === evidence.anchorLat
+      && observer.lon === evidence.anchorLon
+      && observer.accuracyM === evidence.anchorAccuracyM
+      && observer.verifiedAt === evidence.anchorVerifiedAt
+      && observer.verification === evidence.anchorVerification;
+  };
+  const observerEvidence = targetEvidence.filter(hasCurrentVerifiedAnchor);
+  const observations: RemoteObserverObservation[] = allEvidence.map((evidence, index) => ({
+    id: evidence.id ?? `${evidence.observerId}:${evidence.observedAt}:${index}`,
+    observerId: evidence.observerPubkeyHex,
+    targetPublicKey: evidence.targetPubkeyHex,
+    observedAt: evidence.observedAt,
+    snrDb: evidence.snr,
+    lat: evidence.anchorLat,
+    lon: evidence.anchorLon,
+    coordinateVerified: evidence.trust === 'verified-observer' && hasCurrentVerifiedAnchor(evidence),
+    coordinateAccuracyM: evidence.anchorAccuracyM,
+    targetMatch: 'full-key',
+    directNeighbour: true,
+  }));
+  const remoteObserverAnalysis = analyzeRemoteObservers(observations, {
+    targetPublicKey,
+    generatedAt,
+  });
+  const localPolygon = finalApproach?.ready && finalApproach.polygon?.length
+    ? finalApproach.polygon
+    : estimate?.ready && estimate.polygon?.length
+      ? estimate.polygon
+      : undefined;
+  const localLabel = finalApproach?.ready
+    ? 'directional final-approach zone'
+    : 'confirmed-signal search zone';
+  const localConfidence = finalApproach?.ready
+    ? finalApproach.confidence
+    : estimate?.confidence;
+  const communityAssistedZone = combineRemoteObserverZone(
+    remoteObserverAnalysis.zone,
+    localPolygon,
+    {
+      generatedAt,
+      otherZoneLabel: localLabel,
+      ...(localConfidence ? { otherConfidence: localConfidence } : {}),
+    },
+  );
+  return { observerEvidence, remoteObserverAnalysis, communityAssistedZone };
+}
+
+/** Imported observer claims are preserved for review but never regain live-analysis trust. */
+export function eventForImportedSession(event: SessionEvent, sessionId: string): SessionEvent {
+  const cloned = structuredClone(event);
+  if (cloned.type !== 'observer-evidence') return { ...cloned, sessionId };
+  return {
+    ...(cloned.id === undefined ? {} : { id: cloned.id }),
+    sessionId,
+    t: cloned.t,
+    type: 'note',
+    data: {
+      kind: 'imported-observer-evidence-audit',
+      eligibility: 'audit-only',
+      reason: 'Observer position and query provenance must be re-confirmed on this device before live analysis.',
+      originalEventType: 'observer-evidence',
+      evidence: cloned.data,
+    },
+  };
+}
+
 const ACK_SETTING = 'safety-ack-v1';
 const ACTIVE_TARGET_SETTING = 'active-target';
 const SESSION_SETTINGS_SETTING = 'session-settings';
 const SHOW_UNTRUSTED_ADMIN_POSITION_SETTING = 'show-untrusted-admin-position';
+const VERIFIED_OBSERVERS_SETTING = 'verified-observers-v1';
+const MIN_OBSERVER_POLL_INTERVAL_MS = 5 * 60_000;
+const REMOTE_OBSERVER_MAX_AGE_MS = 5 * 60_000;
+const MAX_OBSERVER_ANCHOR_ACCURACY_M = 250;
+const MAX_OBSERVERS_PER_POLL = 3;
+const MAX_OBSERVER_PAGES_PER_POLL = 8;
+
+class ObserverPollCancelledError extends Error {
+  constructor(message = 'Observer poll cancelled because its live context changed.') {
+    super(message);
+    this.name = 'ObserverPollCancelledError';
+  }
+}
 
 function uniqueId(prefix: string): string {
   const random = typeof crypto.randomUUID === 'function'
@@ -181,6 +368,46 @@ function normalizeFullPubkey(value: string | undefined): string | undefined {
   }
 }
 
+function validCoordinate(lat: number, lon: number): boolean {
+  return Number.isFinite(lat) && lat >= -90 && lat <= 90
+    && Number.isFinite(lon) && lon >= -180 && lon <= 180;
+}
+
+function normalizeObservers(value: unknown): VerifiedObserver[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const observers: VerifiedObserver[] = [];
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null) continue;
+    const candidate = item as Partial<VerifiedObserver>;
+    const repeaterPubkeyHex = normalizeFullPubkey(candidate.repeaterPubkeyHex);
+    if (!repeaterPubkeyHex || seen.has(repeaterPubkeyHex)) continue;
+    if (typeof candidate.label !== 'string' || !candidate.label.trim()) continue;
+    if (!validCoordinate(Number(candidate.lat), Number(candidate.lon))) continue;
+    if (!Number.isFinite(candidate.accuracyM) || (candidate.accuracyM as number) < 1 || (candidate.accuracyM as number) > 10_000) continue;
+    if (candidate.verification !== 'user-surveyed' && candidate.verification !== 'operator-confirmed') continue;
+    if (candidate.trust !== 'verified-observer') continue;
+    if (!Number.isFinite(candidate.verifiedAt) || !Number.isFinite(candidate.createdAt) || !Number.isFinite(candidate.updatedAt)) continue;
+    seen.add(repeaterPubkeyHex);
+    observers.push({
+      id: typeof candidate.id === 'string' && candidate.id ? candidate.id : `observer-${repeaterPubkeyHex}`,
+      label: candidate.label.trim().slice(0, 80),
+      repeaterPubkeyHex,
+      lat: Number(candidate.lat),
+      lon: Number(candidate.lon),
+      accuracyM: Number(candidate.accuracyM),
+      verifiedAt: Number(candidate.verifiedAt),
+      verification: candidate.verification,
+      trust: 'verified-observer',
+      permissionConfirmed: candidate.permissionConfirmed === true,
+      enabled: candidate.enabled === true,
+      createdAt: Number(candidate.createdAt),
+      updatedAt: Number(candidate.updatedAt),
+    });
+  }
+  return observers.sort((left, right) => left.label.localeCompare(right.label));
+}
+
 function bounded(value: number, minimum: number, maximum: number, fallback: number): number {
   return Number.isFinite(value) ? Math.max(minimum, Math.min(maximum, value)) : fallback;
 }
@@ -201,6 +428,21 @@ function resolvePreferences(saved?: Partial<SessionSettings>): SessionSettings {
     audioVolume: bounded(merged.audioVolume, 0, 1, DEFAULT_SESSION_SETTINGS.audioVolume),
     audioMuted: merged.audioMuted === true,
     forwardedAlert: merged.forwardedAlert === true,
+    smartWardriveEnabled: merged.smartWardriveEnabled === true,
+    autoDiscoveryEnabled: merged.autoDiscoveryEnabled === true,
+    autoDiscoveryIntervalSec: Math.round(bounded(
+      merged.autoDiscoveryIntervalSec,
+      60,
+      900,
+      DEFAULT_SESSION_SETTINGS.autoDiscoveryIntervalSec,
+    )),
+    observerAssistEnabled: merged.observerAssistEnabled === true,
+    observerPollIntervalMin: Math.round(bounded(
+      merged.observerPollIntervalMin,
+      5,
+      60,
+      DEFAULT_SESSION_SETTINGS.observerPollIntervalMin,
+    )),
   };
 }
 
@@ -235,6 +477,11 @@ export function resolveSessionSettings(mode: 'walk' | 'drive', saved?: Partial<S
     audioVolume: merged.audioVolume,
     audioMuted: merged.audioMuted,
     forwardedAlert: merged.forwardedAlert,
+    smartWardriveEnabled: merged.smartWardriveEnabled,
+    autoDiscoveryEnabled: merged.autoDiscoveryEnabled,
+    autoDiscoveryIntervalSec: merged.autoDiscoveryIntervalSec,
+    observerAssistEnabled: merged.observerAssistEnabled,
+    observerPollIntervalMin: merged.observerPollIntervalMin,
   };
 }
 
@@ -252,7 +499,16 @@ export class AppController {
   #lease?: WriterLease;
   #transport?: Transport;
   #device?: MeshCoreDevice;
+  #protocolReady = false;
   #discovery?: DiscoveryCoordinator;
+  #automaticDiscoveryAbort?: AbortController;
+  #guestObservers?: GuestObserverCoordinator;
+  #guestAttempted = new Set<string>();
+  #observerPollGeneration = 0;
+  #observerPollPromise?: Promise<void>;
+  #lastObserverPollStartedAt = 0;
+  #observerPollCursor = 0;
+  #observerExpiryTimer?: ReturnType<typeof globalThis.setTimeout>;
   #recorder?: SessionRecorder;
   #gps?: GpsService;
   #gpsGeneration = 0;
@@ -268,6 +524,13 @@ export class AppController {
   #audioStaleTimer?: ReturnType<typeof globalThis.setTimeout>;
   #connectionLossAlerted = false;
   #expectedDisconnect = false;
+  #automationVisibilityListener?: () => void;
+  #smartWardriveSignature = '';
+  readonly #smartWardrive = new SmartWardriveScheduler({
+    onDiscovery: () => this.discover('automatic'),
+    onObserverPoll: () => this.pollObservers(),
+    onUpdate: (smartWardrive) => this.store.set({ smartWardrive }),
+  });
 
   async init(): Promise<void> {
     this.#database = await openFinderDatabase({
@@ -275,7 +538,7 @@ export class AppController {
     });
     this.repository = new FinderRepository(this.#database);
     this.#lease = await acquireWriterLock();
-    const [acknowledged, targets, sessions, resumeCandidates, activeTargetId, savedSettings, showUntrustedAdminPosition] = await Promise.all([
+    const [acknowledged, targets, sessions, resumeCandidates, activeTargetId, savedSettings, showUntrustedAdminPosition, savedObservers] = await Promise.all([
       this.repository.getSetting<boolean>(ACK_SETTING),
       this.repository.listTargets(),
       this.repository.listSessions(),
@@ -283,10 +546,24 @@ export class AppController {
       this.repository.getSetting<string>(ACTIVE_TARGET_SETTING),
       this.repository.getSetting<Partial<SessionSettings>>(SESSION_SETTINGS_SETTING),
       this.repository.getSetting<boolean>(SHOW_UNTRUSTED_ADMIN_POSITION_SETTING),
+      this.repository.getSetting<unknown>(VERIFIED_OBSERVERS_SETTING),
     ]);
     const preferences = resolvePreferences(savedSettings);
     this.configureAudio(preferences);
     if (typeof document !== 'undefined') this.audio.bindGesture(document);
+    if (typeof document !== 'undefined' && !this.#automationVisibilityListener) {
+      this.#automationVisibilityListener = () => {
+        this.refreshRemoteObserverState();
+        if (document.visibilityState !== 'visible') {
+          this.#discovery?.cancel('Discovery cancelled because the page is hidden.');
+        }
+        if (document.visibilityState === 'visible' && this.store.value.activeSession && !this.#wakeLock) {
+          void this.acquireWakeLock();
+        }
+        this.syncSmartWardrive();
+      };
+      document.addEventListener('visibilitychange', this.#automationVisibilityListener);
+    }
     for (const target of targets) this.#universe.addTarget(target);
     const activeTarget = targets.find((target) => target.id === activeTargetId);
     this.store.set({
@@ -299,6 +576,7 @@ export class AppController {
       writer: this.#lease.acquired,
       preferences,
       showUntrustedAdminPosition: showUntrustedAdminPosition === true,
+      observers: normalizeObservers(savedObservers),
     });
     if (!this.#lease.acquired) {
       this.notice('warning', 'Another MeshCore Finder tab holds the writer lock. This tab is read-only.');
@@ -342,6 +620,9 @@ export class AppController {
 
   async disconnect(): Promise<void> {
     this.#expectedDisconnect = true;
+    this.#protocolReady = false;
+    this.#discovery?.cancel('Discovery cancelled because the radio was disconnected.');
+    this.stopSmartWardrive('Radio disconnected.');
     try {
       await this.#device?.disconnect();
       if (!this.#device) await this.#transport?.disconnect();
@@ -492,6 +773,7 @@ export class AppController {
       targets: [updated, ...state.targets.filter((target) => target.id !== updated.id)],
       ...(event ? { events: [...state.events, event] } : {}),
     }));
+    this.syncSmartWardrive();
     this.notice('success', 'Full public key pinned; stored receptions were reclassified conservatively.');
   }
 
@@ -526,6 +808,7 @@ export class AppController {
     await this.repository.putSession(session);
     await this.repository.addEvent({ sessionId: session.id, t: now, type: 'lifecycle', data: { state: 'active', transport: transport.kind } });
     this.createRecorder(session);
+    this.clearObserverExpiryTimer();
     this.store.set((state) => ({
       activeSession: session,
       sessions: [session, ...state.sessions.filter((item) => item.id !== session.id)],
@@ -537,17 +820,25 @@ export class AppController {
       bearingAnalysis: undefined,
       bearingConsensus: undefined,
       finalApproach: undefined,
+      observerEvidence: [],
+      remoteObserverAnalysis: undefined,
+      communityAssistedZone: undefined,
+      observerStatuses: state.observerStatuses.map((status) => ({ ...status, state: 'idle' as const })),
       signal: undefined,
     }));
     if (!demo) await this.startGps(session);
     void navigator.storage?.persist?.().catch(() => false);
     void this.acquireWakeLock();
+    this.syncSmartWardrive();
     return session;
   }
 
   async endSession(): Promise<void> {
     const recorder = this.#recorder;
     if (!recorder) return;
+    this.#discovery?.cancel('Discovery cancelled because the session ended.');
+    this.stopSmartWardrive('No active Drive session.');
+    this.clearObserverExpiryTimer();
     await this.stopGps();
     this.stopSignalAudio();
     await recorder.end();
@@ -564,6 +855,9 @@ export class AppController {
       bearingAnalysis: undefined,
       bearingConsensus: undefined,
       finalApproach: undefined,
+      observerEvidence: [],
+      remoteObserverAnalysis: undefined,
+      communityAssistedZone: undefined,
       signal: undefined,
     });
   }
@@ -589,6 +883,13 @@ export class AppController {
     await this.repository.addEvent({ sessionId: id, t: Date.now(), type: 'lifecycle', data: { action: 'resumed' } });
     this.#universe.addTarget(session.targetSnapshot);
     this.rebuildIdentityUniverse(receptions);
+    const resumedApproach = deriveApproachState(
+      events,
+      undefined,
+      session.settings.maxGpsAccuracyM,
+      Date.now(),
+      receptions,
+    );
     this.store.set({
       activeTarget: session.targetSnapshot,
       activeSession: session,
@@ -598,15 +899,18 @@ export class AppController {
       events,
       cells: [],
       estimate: undefined,
-      ...deriveApproachState(
+      ...resumedApproach,
+      ...deriveRemoteObserverState(
         events,
+        session.targetSnapshot,
         undefined,
-        session.settings.maxGpsAccuracyM,
+        resumedApproach.finalApproach,
         Date.now(),
-        receptions,
+        this.store.value.observers,
       ),
       signal: undefined,
     });
+    this.armObserverExpiryTimer();
     this.createRecorder(session);
     this.#suppressAudio = true;
     try {
@@ -618,6 +922,7 @@ export class AppController {
     }
     if (!session.demo) await this.startGps(session);
     void this.acquireWakeLock();
+    this.syncSmartWardrive();
   }
 
   async endResumeCandidate(id: string): Promise<void> {
@@ -690,17 +995,27 @@ export class AppController {
     event.id = await this.repository.addEvent(event);
     this.store.set((state) => {
       const events = [...state.events, event];
+      const approach = deriveApproachState(
+        events,
+        state.estimate,
+        recorder.session.settings.maxGpsAccuracyM,
+        now,
+        state.receptions,
+      );
       return {
         events,
-        ...deriveApproachState(
+        ...approach,
+        ...deriveRemoteObserverState(
           events,
+          recorder.session.targetSnapshot,
           state.estimate,
-          recorder.session.settings.maxGpsAccuracyM,
+          approach.finalApproach,
           now,
-          state.receptions,
+          state.observers,
         ),
       };
     });
+    this.armObserverExpiryTimer();
     const recentConfirmed = latestConfirmed?.id !== undefined
       && now - latestConfirmed.t <= 30_000;
     const usableGps = gpsAgeMs <= 15_000
@@ -715,15 +1030,31 @@ export class AppController {
     );
   }
 
-  async discover(): Promise<void> {
+  async discover(trigger: 'manual' | 'automatic' = 'manual'): Promise<void> {
     this.requireRepository();
     const discovery = this.#discovery;
     const session = this.store.value.activeSession;
     if (!discovery || !session) throw new Error('Connect a radio and start a session before discovery.');
-    const run = discovery.start();
-    await this.repository.addEvent({ sessionId: session.id, t: Date.now(), type: 'discovery-cmd', data: { tag: run.tag } });
-    const result = await run.done;
-    this.notice('info', `Discovery window complete: ${result.responses.length} response${result.responses.length === 1 ? '' : 's'}.`);
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+      throw new Error('Discovery pauses while the page is hidden.');
+    }
+    const abortController = new AbortController();
+    if (trigger === 'automatic') this.#automaticDiscoveryAbort = abortController;
+    const run = discovery.start(0x04, { signal: abortController.signal });
+    try {
+      await this.appendSessionEvent('discovery-cmd', { tag: run.tag, trigger, filterMask: 0x04 });
+      const result = await run.done;
+      if (trigger === 'manual') {
+        this.notice('info', `Discovery window complete: ${result.responses.length} response${result.responses.length === 1 ? '' : 's'}.`);
+      }
+    } finally {
+      if (this.#automaticDiscoveryAbort === abortController) this.#automaticDiscoveryAbort = undefined;
+    }
+  }
+
+  async queryObservers(): Promise<void> {
+    await this.pollObservers();
+    this.notice('info', 'Authorised observer poll complete. Only target-matched direct-neighbour evidence was retained.');
   }
 
   async exportSession(id: string, kind: ExportKind): Promise<DownloadArtifact> {
@@ -747,6 +1078,7 @@ export class AppController {
     this.requireWriter();
     this.requireRepository();
     const archive = parseSessionArchive(text);
+    const importedObserverReportCount = archive.events.filter((event) => event.type === 'observer-evidence').length;
     const [existing, targetConflict] = await Promise.all([
       this.repository.getSession(archive.session.id),
       this.repository.getTarget(archive.session.targetSnapshot.id),
@@ -771,10 +1103,7 @@ export class AppController {
         sessionId: newId,
       }));
       const fixes = archive.fixes.map((fix) => ({ ...fix, sessionId: newId }));
-      const events = archive.events.map((event) => ({
-        ...structuredClone(event),
-        sessionId: newId,
-      }));
+      const events = archive.events.map((event) => eventForImportedSession(event, newId));
       try {
         reconciled = await this.repository.importSessionBundle(target, session, receptions, fixes, events);
         break;
@@ -787,7 +1116,10 @@ export class AppController {
     if (!reconciled) throw new Error('Unable to allocate unique IDs for the imported session');
     await this.reloadTargets();
     await this.reloadSessions();
-    this.notice('success', `Imported ${archive.receptions.length} receptions for review.`);
+    this.notice(
+      'success',
+      `Imported ${archive.receptions.length} receptions for review.${importedObserverReportCount ? ` ${importedObserverReportCount} observer report${importedObserverReportCount === 1 ? '' : 's'} retained as audit-only.` : ''}`,
+    );
     return reconciled;
   }
 
@@ -801,9 +1133,11 @@ export class AppController {
 
   async deleteAll(): Promise<void> {
     this.requireWriter();
+    this.clearObserverExpiryTimer();
     await this.stopGps();
-    this.#recorder?.dispose();
+    const recorder = this.#recorder;
     this.#recorder = undefined;
+    if (recorder) await recorder.shutdown().catch(() => undefined);
     this.stopSignalAudio();
     await this.cleanupTransport();
     this.#database?.close();
@@ -834,7 +1168,99 @@ export class AppController {
     ]);
     this.configureAudio(merged);
     this.store.set({ preferences: merged, showUntrustedAdminPosition });
-    this.notice('success', 'Settings saved. Cell-size changes apply to the next session.');
+    if (this.#recorder) {
+      await this.#recorder.updateAutomationSettings({
+        smartWardriveEnabled: merged.smartWardriveEnabled,
+        autoDiscoveryEnabled: merged.autoDiscoveryEnabled,
+        autoDiscoveryIntervalSec: merged.autoDiscoveryIntervalSec,
+        observerAssistEnabled: merged.observerAssistEnabled,
+        observerPollIntervalMin: merged.observerPollIntervalMin,
+      });
+    }
+    this.syncSmartWardrive();
+    this.notice('success', 'Settings saved. Automation changes apply now; aggregation changes apply to the next session.');
+  }
+
+  async saveObserver(input: {
+    label: string;
+    repeaterPubkeyHex: string;
+    lat: number;
+    lon: number;
+    accuracyM: number;
+    verification: VerifiedObserver['verification'];
+    permissionConfirmed: boolean;
+  }): Promise<VerifiedObserver> {
+    this.requireWriter();
+    this.requireRepository();
+    const label = input.label.trim();
+    if (!label || label.length > 80) throw new Error('Observer label must contain 1 to 80 characters.');
+    const repeaterPubkeyHex = normalizeFullPubkey(input.repeaterPubkeyHex);
+    if (!repeaterPubkeyHex) throw new Error('Observer identity must be a full 32-byte public key.');
+    if (!validCoordinate(input.lat, input.lon)) throw new Error('Observer coordinates are invalid.');
+    if (!Number.isFinite(input.accuracyM) || input.accuracyM < 1 || input.accuracyM > MAX_OBSERVER_ANCHOR_ACCURACY_M) {
+      throw new Error(`Observer coordinate accuracy must be between 1 and ${MAX_OBSERVER_ANCHOR_ACCURACY_M} metres.`);
+    }
+    if (input.verification !== 'user-surveyed' && input.verification !== 'operator-confirmed') {
+      throw new Error('Choose how the observer coordinates were independently verified.');
+    }
+    if (!input.permissionConfirmed) {
+      throw new Error('Confirm that you have permission to query this observer.');
+    }
+    const now = Date.now();
+    const existing = this.store.value.observers.find((observer) => observer.repeaterPubkeyHex === repeaterPubkeyHex);
+    const observer: VerifiedObserver = {
+      id: existing?.id ?? `observer-${repeaterPubkeyHex}`,
+      label,
+      repeaterPubkeyHex,
+      lat: input.lat,
+      lon: input.lon,
+      accuracyM: input.accuracyM,
+      verifiedAt: now,
+      verification: input.verification,
+      trust: 'verified-observer',
+      permissionConfirmed: true,
+      enabled: true,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    const observers = normalizeObservers([
+      observer,
+      ...this.store.value.observers.filter((item) => item.id !== observer.id),
+    ]);
+    await this.repository.setSetting(VERIFIED_OBSERVERS_SETTING, observers);
+    this.store.set({ observers });
+    this.refreshRemoteObserverState();
+    this.syncSmartWardrive();
+    this.notice('success', `${observer.label} saved as an authorised verified observer.`);
+    return observer;
+  }
+
+  async setObserverEnabled(id: string, enabled: boolean): Promise<void> {
+    this.requireWriter();
+    this.requireRepository();
+    const now = Date.now();
+    const observers = this.store.value.observers.map((observer) => (
+      observer.id === id ? { ...observer, enabled, updatedAt: now } : observer
+    ));
+    if (!observers.some((observer) => observer.id === id)) throw new Error('Observer not found.');
+    await this.repository.setSetting(VERIFIED_OBSERVERS_SETTING, observers);
+    this.store.set({ observers });
+    this.refreshRemoteObserverState();
+    this.syncSmartWardrive();
+  }
+
+  async deleteObserver(id: string): Promise<void> {
+    this.requireWriter();
+    this.requireRepository();
+    const observers = this.store.value.observers.filter((observer) => observer.id !== id);
+    if (observers.length === this.store.value.observers.length) throw new Error('Observer not found.');
+    await this.repository.setSetting(VERIFIED_OBSERVERS_SETTING, observers);
+    this.store.set((state) => ({
+      observers,
+      observerStatuses: state.observerStatuses.filter((status) => status.observerId !== id),
+    }));
+    this.refreshRemoteObserverState();
+    this.syncSmartWardrive();
   }
 
   storageEstimate(): Promise<StorageEstimate | undefined> {
@@ -859,6 +1285,46 @@ export class AppController {
     await recorder.addFix({ ...fix, sessionId: recorder.session.id, acceptedNum: fix.accepted ? 1 : 0 });
   }
 
+  async injectObserverEvidenceForTest(evidence: RemoteObserverEvidence): Promise<void> {
+    if (!this.#mock) throw new Error('Observer evidence injection is available only with the test mock transport.');
+    const session = this.requireRecorder().session;
+    const targetPubkeyHex = normalizeFullPubkey(session.targetSnapshot.identity.pubkeyHex);
+    const candidate: SessionEvent = {
+      sessionId: session.id,
+      t: evidence.receivedAt,
+      type: 'observer-evidence',
+      data: { ...evidence, id: evidence.id ?? uniqueId('observer-evidence-test') },
+    };
+    const normalized = observerEvidenceFromEvent(candidate);
+    if (!normalized || normalized.targetPubkeyHex !== targetPubkeyHex) {
+      throw new Error('Injected observer evidence must be valid and match the active full target key.');
+    }
+    const existingObserver = this.store.value.observers.find(
+      (observer) => observer.repeaterPubkeyHex === normalized.observerPubkeyHex,
+    );
+    if (!existingObserver) {
+      const observer: VerifiedObserver = {
+        id: normalized.observerId,
+        label: `Test observer ${normalized.observerPubkeyHex.slice(0, 8)}`,
+        repeaterPubkeyHex: normalized.observerPubkeyHex,
+        lat: normalized.anchorLat,
+        lon: normalized.anchorLon,
+        accuracyM: normalized.anchorAccuracyM,
+        verifiedAt: normalized.anchorVerifiedAt,
+        verification: normalized.anchorVerification,
+        trust: 'verified-observer',
+        permissionConfirmed: true,
+        enabled: true,
+        createdAt: normalized.anchorVerifiedAt,
+        updatedAt: normalized.anchorVerifiedAt,
+      };
+      const observers = normalizeObservers([...this.store.value.observers, observer]);
+      await this.repository.setSetting(VERIFIED_OBSERVERS_SETTING, observers);
+      this.store.set({ observers });
+    }
+    await this.appendSessionEvent('observer-evidence', { ...normalized }, normalized.receivedAt);
+  }
+
   dismissNotice(id: string): void {
     this.store.set((state) => ({ notices: state.notices.filter((notice) => notice.id !== id) }));
   }
@@ -870,6 +1336,8 @@ export class AppController {
   }
 
   async destroy(): Promise<void> {
+    this.stopSmartWardrive('Application closed.');
+    this.clearObserverExpiryTimer();
     await this.stopGps();
     const recorder = this.#recorder;
     this.#recorder = undefined;
@@ -881,6 +1349,10 @@ export class AppController {
     await this.releaseWakeLock();
     this.stopSignalAudio();
     await this.audio.destroy();
+    if (this.#automationVisibilityListener && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.#automationVisibilityListener);
+      this.#automationVisibilityListener = undefined;
+    }
     this.#lease?.release();
     this.#database?.close();
   }
@@ -897,15 +1369,20 @@ export class AppController {
 
   private async connectDevice(): Promise<void> {
     const transport = this.requireTransport();
+    this.#protocolReady = false;
     const device = new MeshCoreDevice(transport);
     this.#device = device;
-    this.#discovery = new DiscoveryCoordinator(async (command) => {
-      await device.commands.send(command, null, { label: 'DISCOVERY' });
+    this.#discovery = new DiscoveryCoordinator(async (command, signal) => {
+      await device.commands.send(command, null, { label: 'DISCOVERY', signal });
     });
+    this.#guestObservers = new GuestObserverCoordinator(device.commands);
+    this.#guestAttempted.clear();
     this.#removeDevicePush = device.onPush((frame) => this.handleCompanionPush(frame));
     try {
       const snapshot = await device.connect();
       await this.applyDeviceSnapshot(snapshot);
+      this.#protocolReady = true;
+      this.syncSmartWardrive();
       this.notice('success', `Connected to ${snapshot.info?.model || 'MeshCore companion'}.`);
     } catch (error) {
       await this.cleanupTransport();
@@ -1069,16 +1546,26 @@ export class AppController {
       Date.now(),
       snapshot.receptions,
     );
+    const remote = deriveRemoteObserverState(
+      this.store.value.events,
+      snapshot.session.targetSnapshot,
+      snapshot.estimate,
+      approach.finalApproach,
+      Date.now(),
+      this.store.value.observers,
+    );
     this.store.set((state) => ({
       activeSession: snapshot.session,
       receptions: [...snapshot.receptions],
       fixes: [...snapshot.fixes],
       estimate: snapshot.estimate,
       ...approach,
+      ...remote,
       cells: [...snapshot.cells],
       signal: snapshot.signal,
       sessions: state.sessions.map((session) => session.id === snapshot.session.id ? snapshot.session : session),
     }));
+    this.armObserverExpiryTimer();
     const positionedAdvertReception = [...additions].reverse().find((reception) => {
       const advert = reception.decoded?.advert;
       return advert?.hasLocation
@@ -1226,6 +1713,20 @@ export class AppController {
       Date.now(),
       receptions,
     );
+    const generatedAt = session.state === 'ended'
+      ? events.reduce(
+          (latest, event) => Math.max(latest, event.t),
+          session.endedAt ?? session.startedAt,
+        )
+      : Date.now();
+    const remote = deriveRemoteObserverState(
+      events,
+      session.targetSnapshot,
+      estimate,
+      approach.finalApproach,
+      generatedAt,
+      this.store.value.observers,
+    );
     return {
       session,
       receptions,
@@ -1235,6 +1736,9 @@ export class AppController {
       estimate,
       bearingConsensus: approach.bearingConsensus,
       finalApproach: approach.finalApproach,
+      observerEvidence: remote.observerEvidence,
+      remoteObserverAnalysis: remote.remoteObserverAnalysis,
+      communityAssistedZone: remote.communityAssistedZone,
     };
   }
 
@@ -1264,6 +1768,8 @@ export class AppController {
   }
 
   private async cleanupTransport(): Promise<void> {
+    this.#protocolReady = false;
+    this.stopSmartWardrive('Radio disconnected.');
     this.#removeReplayEvent?.();
     this.#removeReplayEvent = undefined;
     this.#removeDevicePush?.();
@@ -1272,6 +1778,9 @@ export class AppController {
     this.#removeTransportState = undefined;
     this.#discovery?.cancel('Transport replaced');
     this.#discovery = undefined;
+    this.#guestObservers?.dispose('Transport replaced');
+    this.#guestObservers = undefined;
+    this.#guestAttempted.clear();
     this.#device?.dispose();
     this.#device = undefined;
     const transport = this.#transport;
@@ -1285,8 +1794,10 @@ export class AppController {
     const previous = this.store.value.connection;
     const pickerFreeReconnect = previous === 'reconnecting' && connection === 'connected';
     if (connection === 'connected') this.#connectionLossAlerted = false;
+    else this.#protocolReady = false;
     const lostConnection = previous === 'connected'
       && (connection === 'reconnecting' || connection === 'disconnected');
+    if (lostConnection) this.#discovery?.cancel('Discovery cancelled because the radio connection was lost.');
     if (
       lostConnection
       && this.store.value.activeSession
@@ -1298,20 +1809,507 @@ export class AppController {
       this.audio.playDisconnectAlarm();
     }
     this.store.set({ connection });
+    this.syncSmartWardrive();
     if (pickerFreeReconnect && this.#device) void this.rehydrateAfterReconnect(this.#device);
   }
 
   private async rehydrateAfterReconnect(device: MeshCoreDevice): Promise<void> {
+    this.#protocolReady = false;
+    const pendingObserverPoll = this.#observerPollPromise;
+    this.cancelObserverPoll('Bluetooth protocol is being restored.');
+    await pendingObserverPoll?.catch(() => undefined);
     try {
       const snapshot = await device.rehydrate();
       if (this.#device !== device) return;
+      this.#guestObservers?.dispose('Bluetooth reconnected');
+      this.#guestObservers = new GuestObserverCoordinator(device.commands);
+      this.#guestAttempted.clear();
       await this.applyDeviceSnapshot(snapshot);
+      this.#protocolReady = true;
+      this.syncSmartWardrive();
       this.notice('success', 'Companion protocol restored after Bluetooth reconnect.');
     } catch (error) {
       if (this.#device !== device) return;
       this.notice('error', `Bluetooth reconnected, but the MeshCore session could not be restored: ${this.errorMessage(error)}`);
       await this.cleanupTransport();
     }
+  }
+
+  private pollObservers(): Promise<void> {
+    if (this.#observerPollPromise) return this.#observerPollPromise;
+    const session = this.store.value.activeSession;
+    const coordinator = this.#guestObservers;
+    if (!session || session.demo || session.mode !== 'drive') {
+      throw new Error('Observer assist requires an active real Drive session.');
+    }
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+      throw new Error('Observer assist pauses while the page is hidden.');
+    }
+    if (this.store.value.connection !== 'connected' || !coordinator) {
+      throw new Error('Observer assist requires a connected companion.');
+    }
+    if (!this.#protocolReady) throw new Error('Observer assist is waiting for the companion protocol to be restored.');
+    const targetPubkeyHex = normalizeFullPubkey(session.targetSnapshot.identity.pubkeyHex);
+    if (!targetPubkeyHex) throw new Error('Pin the target full public key before querying observers.');
+    const eligibleObservers = this.store.value.observers.filter((observer) => (
+      observer.enabled
+      && observer.permissionConfirmed
+      && observer.trust === 'verified-observer'
+      && observer.accuracyM <= MAX_OBSERVER_ANCHOR_ACCURACY_M
+    ));
+    if (!eligibleObservers.length) {
+      throw new Error(`No enabled observer has permission and a verified anchor accurate to ${MAX_OBSERVER_ANCHOR_ACCURACY_M} metres or better.`);
+    }
+
+    const intervalMs = Math.max(
+      MIN_OBSERVER_POLL_INTERVAL_MS,
+      session.settings.observerPollIntervalMin * 60_000,
+    );
+    const remainingMs = this.#lastObserverPollStartedAt + intervalMs - Date.now();
+    if (remainingMs > 0) {
+      const waitMinutes = Math.max(1, Math.ceil(remainingMs / 60_000));
+      throw new Error(
+        `Observer polling is rate-limited. Wait about ${waitMinutes} more minute${waitMinutes === 1 ? '' : 's'}.`,
+      );
+    }
+
+    const generation = ++this.#observerPollGeneration;
+    this.#lastObserverPollStartedAt = Date.now();
+    const observerCount = Math.min(MAX_OBSERVERS_PER_POLL, eligibleObservers.length);
+    const observers = Array.from({ length: observerCount }, (_, offset) => (
+      eligibleObservers[(this.#observerPollCursor + offset) % eligibleObservers.length]
+    )).filter((observer): observer is VerifiedObserver => observer !== undefined);
+    this.#observerPollCursor = (this.#observerPollCursor + observers.length) % eligibleObservers.length;
+    const task = this.runObserverPoll(
+      generation,
+      session.id,
+      targetPubkeyHex,
+      coordinator,
+      observers,
+    ).finally(() => {
+      this.#observerPollPromise = undefined;
+    });
+    this.#observerPollPromise = task;
+    return task;
+  }
+
+  private async runObserverPoll(
+    generation: number,
+    sessionId: string,
+    targetPubkeyHex: string,
+    coordinator: GuestObserverCoordinator,
+    observers: readonly VerifiedObserver[],
+  ): Promise<void> {
+    let remainingPageBudget = MAX_OBSERVER_PAGES_PER_POLL;
+    for (const observer of observers) {
+      if (remainingPageBudget <= 0) break;
+      this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+      const attemptedAt = Date.now();
+      this.setObserverStatus(observer.id, {
+        state: 'querying',
+        lastAttemptAt: attemptedAt,
+        detail: 'Requesting a rate-limited target-matched neighbour record.',
+      });
+      await this.appendSessionEvent('observer-query', {
+        observerId: observer.id,
+        observerPubkeyHex: observer.repeaterPubkeyHex,
+        action: 'started',
+        blankGuestOnly: true,
+        permissionConfirmed: true,
+      }, attemptedAt, sessionId);
+      this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+      if (observer.repeaterPubkeyHex === targetPubkeyHex) {
+        const detail = 'The target cannot also be used as its own observer.';
+        this.setObserverStatus(observer.id, { state: 'error', detail });
+        await this.appendSessionEvent('observer-query', {
+          observerId: observer.id,
+          action: 'rejected',
+          reason: 'observer-is-target',
+        }, Date.now(), sessionId);
+        this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+        continue;
+      }
+      try {
+        if (!coordinator.isAuthenticated(observer.repeaterPubkeyHex)) {
+          if (this.#guestAttempted.has(observer.repeaterPubkeyHex)) {
+            this.setObserverStatus(observer.id, {
+              state: 'denied',
+              detail: 'Blank guest login previously failed on this Bluetooth connection; no retry or password guessing was attempted.',
+            });
+            await this.appendSessionEvent('observer-query', {
+              observerId: observer.id,
+              observerPubkeyHex: observer.repeaterPubkeyHex,
+              action: 'login-not-retried',
+              blankGuestOnly: true,
+            }, Date.now(), sessionId);
+            this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+            continue;
+          }
+          this.#guestAttempted.add(observer.repeaterPubkeyHex);
+          const login = await coordinator.loginBlankGuest(observer.repeaterPubkeyHex);
+          this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+          if (!login.accepted) {
+            const adminRefused = login.reason === 'admin-session-refused';
+            const detail = adminRefused
+              ? 'The blank login returned administrative permission, so MeshCore Finder refused the session without issuing a request.'
+              : 'Blank guest access was denied. No password was requested, stored, or guessed.';
+            this.setObserverStatus(observer.id, { state: 'denied', detail });
+            await this.appendSessionEvent('observer-query', {
+              observerId: observer.id,
+              observerPubkeyHex: observer.repeaterPubkeyHex,
+              action: adminRefused ? 'admin-session-refused' : 'login-denied',
+              blankGuestOnly: true,
+            }, Date.now(), sessionId);
+            this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+            continue;
+          }
+          await this.appendSessionEvent('observer-query', {
+            observerId: observer.id,
+            observerPubkeyHex: observer.repeaterPubkeyHex,
+            action: 'login-accepted',
+            blankGuestOnly: true,
+            route: login.route,
+            legacy: login.legacy,
+          }, Date.now(), sessionId);
+          this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+        }
+
+        const pageBudget = Math.min(3, remainingPageBudget);
+        const result = await coordinator.fetchNeighbours(observer.repeaterPubkeyHex, {
+          order: 'newest-to-oldest',
+          pageSize: 3,
+          maxPages: pageBudget,
+          maxNeighbours: pageBudget * 3,
+        });
+        remainingPageBudget -= result.pagesFetched;
+        this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+        const match = result.observations.find((item) => item.pubkeyHex === targetPubkeyHex);
+        const receivedAt = Date.now();
+        if (!match) {
+          this.setObserverStatus(observer.id, {
+            state: 'no-match',
+            detail: `No full-key target match in ${result.observations.length} bounded neighbour record${result.observations.length === 1 ? '' : 's'}.`,
+          });
+          await this.appendSessionEvent('observer-query', {
+            observerId: observer.id,
+            observerPubkeyHex: observer.repeaterPubkeyHex,
+            action: 'completed-no-match',
+            recordsChecked: result.observations.length,
+            pagesFetched: result.pagesFetched,
+            complete: result.complete,
+            ...(result.truncatedReason ? { truncatedReason: result.truncatedReason } : {}),
+          }, receivedAt, sessionId);
+          this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+          continue;
+        }
+        const observedAt = observedAtFromNeighbourAge(receivedAt, match.heardSecondsAgo);
+        if (observedAt === undefined) {
+          const detail = 'The observer returned an impossible neighbour age, so the record was kept out of evidence and exports.';
+          this.setObserverStatus(observer.id, { state: 'error', detail });
+          await this.appendSessionEvent('observer-query', {
+            observerId: observer.id,
+            observerPubkeyHex: observer.repeaterPubkeyHex,
+            action: 'invalid-neighbour-age',
+            heardSecondsAgo: match.heardSecondsAgo,
+          }, receivedAt, sessionId);
+          this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+          continue;
+        }
+        const evidence: RemoteObserverEvidence = {
+          id: uniqueId('observer-evidence'),
+          observerId: observer.id,
+          observerPubkeyHex: observer.repeaterPubkeyHex,
+          targetPubkeyHex,
+          observedAt,
+          receivedAt,
+          heardSecondsAgo: match.heardSecondsAgo,
+          snr: match.snrDb,
+          anchorLat: observer.lat,
+          anchorLon: observer.lon,
+          anchorAccuracyM: observer.accuracyM,
+          anchorVerifiedAt: observer.verifiedAt,
+          anchorVerification: observer.verification,
+          source: 'guest-neighbour',
+          trust: 'verified-observer',
+        };
+        this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+        await this.appendSessionEvent('observer-evidence', { ...evidence }, receivedAt, sessionId);
+        this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+        this.setObserverStatus(observer.id, {
+          state: 'matched',
+          lastMatchedAt: receivedAt,
+          lastHeardAt: observedAt,
+          lastSnr: match.snrDb,
+          detail: match.heardSecondsAgo <= 300
+            ? `Fresh full-key direct-neighbour match at ${match.snrDb.toFixed(1)} dB SNR.`
+            : `Full-key match was ${Math.round(match.heardSecondsAgo / 60)} minutes old and is retained for audit but excluded from the live zone.`,
+        });
+        await this.appendSessionEvent('observer-query', {
+          observerId: observer.id,
+          observerPubkeyHex: observer.repeaterPubkeyHex,
+          action: 'completed-match',
+          evidenceId: evidence.id,
+          recordsChecked: result.observations.length,
+          pagesFetched: result.pagesFetched,
+          complete: result.complete,
+          ...(result.truncatedReason ? { truncatedReason: result.truncatedReason } : {}),
+        }, receivedAt, sessionId);
+        this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+      } catch (error) {
+        if (error instanceof ObserverPollCancelledError) throw error;
+        this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+        const detail = this.errorMessage(error);
+        this.setObserverStatus(observer.id, { state: 'error', detail });
+        await this.appendSessionEvent('observer-query', {
+          observerId: observer.id,
+          observerPubkeyHex: observer.repeaterPubkeyHex,
+          action: 'error',
+          detail,
+        }, Date.now(), sessionId);
+        this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
+      }
+    }
+  }
+
+  private assertObserverPollContext(
+    generation: number,
+    sessionId: string,
+    targetPubkeyHex: string,
+    coordinator: GuestObserverCoordinator,
+    observer?: VerifiedObserver,
+  ): void {
+    const state = this.store.value;
+    const session = state.activeSession;
+    if (
+      generation !== this.#observerPollGeneration
+      || coordinator !== this.#guestObservers
+      || !session
+      || session.id !== sessionId
+      || session.demo
+      || session.mode !== 'drive'
+      || normalizeFullPubkey(session.targetSnapshot.identity.pubkeyHex) !== targetPubkeyHex
+      || state.connection !== 'connected'
+      || !this.#protocolReady
+      || (typeof document !== 'undefined' && document.visibilityState !== 'visible')
+    ) {
+      throw new ObserverPollCancelledError();
+    }
+    if (!observer) return;
+    const live = state.observers.find((candidate) => candidate.id === observer.id);
+    if (
+      !live
+      || !live.enabled
+      || !live.permissionConfirmed
+      || live.trust !== 'verified-observer'
+      || live.updatedAt !== observer.updatedAt
+      || live.repeaterPubkeyHex !== observer.repeaterPubkeyHex
+      || live.lat !== observer.lat
+      || live.lon !== observer.lon
+      || live.accuracyM !== observer.accuracyM
+      || live.verifiedAt !== observer.verifiedAt
+      || live.verification !== observer.verification
+    ) {
+      throw new ObserverPollCancelledError('Observer poll cancelled because its permission or verified anchor changed.');
+    }
+  }
+
+  private cancelObserverPoll(reason: string): void {
+    if (!this.#observerPollPromise) return;
+    this.#observerPollGeneration += 1;
+    this.#guestObservers?.cancelPending(reason);
+    this.store.set((state) => ({
+      observerStatuses: state.observerStatuses.map((status) => (
+        status.state === 'querying' || status.state === 'queued'
+          ? { ...status, state: 'idle' as const, detail: `Poll stopped: ${reason}` }
+          : status
+      )),
+    }));
+  }
+
+  private setObserverStatus(
+    observerId: string,
+    patch: Partial<AppState['observerStatuses'][number]>,
+  ): void {
+    this.store.set((state) => {
+      const current = state.observerStatuses.find((status) => status.observerId === observerId);
+      const next = { observerId, state: 'idle' as const, ...current, ...patch };
+      return {
+        observerStatuses: [
+          ...state.observerStatuses.filter((status) => status.observerId !== observerId),
+          next,
+        ],
+      };
+    });
+  }
+
+  private syncSmartWardrive(): void {
+    const state = this.store.value;
+    const session = state.activeSession;
+    const settings = session?.settings;
+    const visible = typeof document === 'undefined' || document.visibilityState === 'visible';
+    let reason: string | undefined;
+    if (!session) reason = 'No active Drive session.';
+    else if (session.demo) reason = 'Smart Wardrive never runs against simulated data.';
+    else if (session.mode !== 'drive') reason = 'Smart Wardrive runs only during Drive sessions.';
+    else if (!settings?.smartWardriveEnabled) reason = 'Smart Wardrive is disabled.';
+    else if (!visible) reason = 'Smart Wardrive paused while the page is not visible.';
+    else if (state.connection !== 'connected' || !this.#device || !this.#discovery) reason = 'Smart Wardrive paused until the radio is connected.';
+    else if (!this.#protocolReady) reason = 'Smart Wardrive paused while the companion protocol is being restored.';
+
+    const authorisedObservers = state.observers.filter((observer) => (
+      observer.enabled
+      && observer.permissionConfirmed
+      && observer.trust === 'verified-observer'
+    ));
+    const eligibleObservers = authorisedObservers.filter(
+      (observer) => observer.accuracyM <= MAX_OBSERVER_ANCHOR_ACCURACY_M,
+    );
+    const hasFullTargetKey = normalizeFullPubkey(session?.targetSnapshot.identity.pubkeyHex) !== undefined;
+    const autoDiscovery = settings?.autoDiscoveryEnabled === true;
+    const observerAssist = settings?.observerAssistEnabled === true
+      && eligibleObservers.length > 0
+      && hasFullTargetKey;
+    if (!reason && !autoDiscovery && !observerAssist) {
+      reason = settings?.observerAssistEnabled && !hasFullTargetKey
+        ? 'Pin the target full public key for observer assist, or enable automatic discovery.'
+        : settings?.observerAssistEnabled && authorisedObservers.length > 0
+          ? `Verify an observer anchor to ${MAX_OBSERVER_ANCHOR_ACCURACY_M} metres or better, or enable automatic discovery.`
+        : settings?.observerAssistEnabled
+          ? 'Add and enable an authorised verified observer, or enable automatic discovery.'
+        : 'Enable automatic discovery or observer assist to run Smart Wardrive.';
+    }
+    if (reason || !settings) {
+      this.stopSmartWardrive(reason ?? 'Smart Wardrive stopped.');
+      return;
+    }
+    const signature = JSON.stringify({
+      sessionId: session.id,
+      autoDiscovery,
+      observerAssist,
+      discoveryIntervalSec: settings.autoDiscoveryIntervalSec,
+      observerPollIntervalMin: settings.observerPollIntervalMin,
+      targetPubkeyHex: hasFullTargetKey ? session.targetSnapshot.identity.pubkeyHex : undefined,
+      observers: eligibleObservers.map(({ id, updatedAt }) => [id, updatedAt]),
+    });
+    if (this.#smartWardriveSignature === signature && this.#smartWardrive.snapshot().active) return;
+    const wasActive = this.#smartWardrive.snapshot().active;
+    if (this.#smartWardriveSignature && this.#smartWardriveSignature !== signature) {
+      this.#automaticDiscoveryAbort?.abort(new Error('Smart Wardrive configuration changed.'));
+      this.#automaticDiscoveryAbort = undefined;
+      this.cancelObserverPoll('Smart Wardrive configuration or target changed.');
+    }
+    this.#smartWardriveSignature = signature;
+    this.#smartWardrive.start({
+      enabled: true,
+      autoDiscovery,
+      discoveryIntervalMs: settings.autoDiscoveryIntervalSec * 1_000,
+      observerAssist,
+      observerPollIntervalMs: settings.observerPollIntervalMin * 60_000,
+    });
+    if (!wasActive) {
+      void this.appendSessionEvent('smart-wardrive', {
+        state: 'started',
+        foregroundOnly: true,
+        autoDiscovery,
+        observerAssist,
+        discoveryIntervalSec: settings.autoDiscoveryIntervalSec,
+        observerPollIntervalMin: settings.observerPollIntervalMin,
+      }).catch((error: unknown) => this.notice('warning', `Smart Wardrive audit event could not be saved: ${this.errorMessage(error)}`));
+    }
+  }
+
+  private stopSmartWardrive(reason: string): void {
+    this.#automaticDiscoveryAbort?.abort(new Error(reason));
+    this.#automaticDiscoveryAbort = undefined;
+    this.cancelObserverPoll(reason);
+    const previous = this.#smartWardrive.snapshot();
+    const signature = `stopped:${reason}`;
+    if (this.#smartWardriveSignature === signature && !previous.active) return;
+    this.#smartWardriveSignature = signature;
+    this.#smartWardrive.stop(reason);
+    if (previous.active) {
+      void this.appendSessionEvent('smart-wardrive', { state: 'stopped', reason })
+        .catch(() => undefined);
+    }
+  }
+
+  private async appendSessionEvent(
+    type: SessionEvent['type'],
+    data: Record<string, unknown>,
+    t = Date.now(),
+    expectedSessionId?: string,
+  ): Promise<SessionEvent | undefined> {
+    const session = this.store.value.activeSession;
+    if (expectedSessionId && session?.id !== expectedSessionId) {
+      throw new ObserverPollCancelledError('Observer poll cancelled because the active session changed.');
+    }
+    if (!session || !this.repository) return undefined;
+    const sessionId = expectedSessionId ?? session.id;
+    const event: SessionEvent = { sessionId, t, type, data };
+    event.id = await this.repository.addEvent(event);
+    if (this.store.value.activeSession?.id === sessionId) {
+      this.store.set((state) => {
+        const events = [...state.events, event];
+        return {
+          events,
+          ...deriveRemoteObserverState(
+            events,
+            state.activeSession?.targetSnapshot,
+            state.estimate,
+            state.finalApproach,
+            t,
+            state.observers,
+          ),
+        };
+      });
+      this.armObserverExpiryTimer();
+    }
+    return event;
+  }
+
+  private refreshRemoteObserverState(): void {
+    const state = this.store.value;
+    const session = state.activeSession;
+    if (!session) {
+      this.clearObserverExpiryTimer();
+      if (state.observerEvidence.length || state.remoteObserverAnalysis || state.communityAssistedZone) {
+        this.store.set({
+          observerEvidence: [],
+          remoteObserverAnalysis: undefined,
+          communityAssistedZone: undefined,
+        });
+      }
+      return;
+    }
+    this.store.set(deriveRemoteObserverState(
+      state.events,
+      session.targetSnapshot,
+      state.estimate,
+      state.finalApproach,
+      Date.now(),
+      state.observers,
+    ));
+    this.armObserverExpiryTimer();
+  }
+
+  private armObserverExpiryTimer(): void {
+    this.clearObserverExpiryTimer();
+    if (!this.store.value.activeSession) return;
+    const now = Date.now();
+    const nextExpiry = this.store.value.observerEvidence
+      .map((evidence) => evidence.observedAt + REMOTE_OBSERVER_MAX_AGE_MS + 1)
+      .filter((expiresAt) => expiresAt > now)
+      .sort((left, right) => left - right)[0];
+    if (nextExpiry === undefined) return;
+    this.#observerExpiryTimer = globalThis.setTimeout(() => {
+      this.#observerExpiryTimer = undefined;
+      this.refreshRemoteObserverState();
+    }, Math.max(0, nextExpiry - now));
+  }
+
+  private clearObserverExpiryTimer(): void {
+    if (this.#observerExpiryTimer !== undefined) globalThis.clearTimeout(this.#observerExpiryTimer);
+    this.#observerExpiryTimer = undefined;
   }
 
   private configureAudio(settings: SessionSettings): void {

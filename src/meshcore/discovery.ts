@@ -6,7 +6,7 @@ import {
 } from './frames';
 
 export const DISCOVERY_WINDOW_MS = 2_000;
-export const DISCOVERY_COOLDOWN_MS = 5_000;
+export const DISCOVERY_COOLDOWN_MS = 60_000;
 
 export function buildDiscoveryCommand(filterMask: number, tag: number): Uint8Array {
   const normalizedTag = tag >>> 0;
@@ -40,6 +40,11 @@ export interface DiscoveryRun {
   tag: number;
   command: Uint8Array;
   done: Promise<DiscoveryResult>;
+  signal: AbortSignal;
+}
+
+export interface DiscoveryStartOptions {
+  signal?: AbortSignal;
 }
 
 export interface DiscoveryCoordinatorOptions {
@@ -58,6 +63,8 @@ interface ActiveDiscovery {
   timer: ReturnType<typeof setTimeout>;
   resolve: (result: DiscoveryResult) => void;
   reject: (error: Error) => void;
+  abortController: AbortController;
+  removeExternalAbortListener?: () => void;
 }
 
 export class DiscoveryCooldownError extends Error {
@@ -77,24 +84,31 @@ export class DiscoveryCoordinator {
   private nextAllowedAt = 0;
 
   constructor(
-    private readonly send: (command: Uint8Array) => Promise<unknown>,
+    private readonly send: (command: Uint8Array, signal: AbortSignal) => Promise<unknown>,
     options: DiscoveryCoordinatorOptions = {},
   ) {
     this.now = options.now ?? Date.now;
     this.nextTag = options.nextTag ?? randomDiscoveryTag;
     this.windowMs = options.windowMs ?? DISCOVERY_WINDOW_MS;
-    this.cooldownMs = options.cooldownMs ?? DISCOVERY_COOLDOWN_MS;
+    this.cooldownMs = Math.max(
+      DISCOVERY_COOLDOWN_MS,
+      options.cooldownMs ?? DISCOVERY_COOLDOWN_MS,
+    );
   }
 
-  start(filterMask = 0x0f): DiscoveryRun {
+  start(filterMask = 0x0f, options: DiscoveryStartOptions = {}): DiscoveryRun {
     const startedAt = this.now();
     if (this.active) throw new Error('A discovery window is already active');
     if (startedAt < this.nextAllowedAt) {
       throw new DiscoveryCooldownError(this.nextAllowedAt - startedAt);
     }
+    if (options.signal?.aborted) {
+      throw abortReason(options.signal.reason, 'Discovery cancelled before start');
+    }
 
     const tag = this.nextTag() >>> 0;
     const command = buildDiscoveryCommand(filterMask, tag);
+    const abortController = new AbortController();
     let resolve!: (result: DiscoveryResult) => void;
     let reject!: (error: Error) => void;
     const done = new Promise<DiscoveryResult>((resolvePromise, rejectPromise) => {
@@ -102,7 +116,7 @@ export class DiscoveryCoordinator {
       reject = rejectPromise;
     });
     const timer = setTimeout(() => this.finish(tag), this.windowMs);
-    this.active = {
+    const active: ActiveDiscovery = {
       tag,
       command,
       startedAt,
@@ -111,14 +125,27 @@ export class DiscoveryCoordinator {
       timer,
       resolve,
       reject,
+      abortController,
     };
+    this.active = active;
 
-    void this.send(command.slice()).catch((cause: unknown) => {
+    if (options.signal) {
+      const externalSignal = options.signal;
+      const onAbort = () => {
+        if (this.active !== active) return;
+        this.abort(abortReason(externalSignal.reason, 'Discovery cancelled'));
+      };
+      externalSignal.addEventListener('abort', onAbort, { once: true });
+      active.removeExternalAbortListener = () =>
+        externalSignal.removeEventListener('abort', onAbort);
+    }
+
+    void this.send(command.slice(), abortController.signal).catch((cause: unknown) => {
       if (this.active?.tag !== tag) return;
       const message = cause instanceof Error ? cause.message : String(cause);
       this.abort(new Error(`Discovery command failed: ${message}`));
     });
-    return { tag, command: command.slice(), done };
+    return { tag, command: command.slice(), done, signal: abortController.signal };
   }
 
   /** Returns true only when a valid response belongs to the active tag/window. */
@@ -148,6 +175,7 @@ export class DiscoveryCoordinator {
     if (!active || active.tag !== tag) return;
     clearTimeout(active.timer);
     this.active = undefined;
+    active.removeExternalAbortListener?.();
     const endedAt = this.now();
     this.nextAllowedAt = endedAt + this.cooldownMs;
     active.resolve({
@@ -163,9 +191,18 @@ export class DiscoveryCoordinator {
     if (!active) return;
     clearTimeout(active.timer);
     this.active = undefined;
+    active.removeExternalAbortListener?.();
     this.nextAllowedAt = this.now() + this.cooldownMs;
+    active.abortController.abort(error);
     active.reject(error);
   }
+}
+
+function abortReason(reason: unknown, fallback: string): Error {
+  if (reason instanceof Error) return reason;
+  const error = new Error(typeof reason === 'string' && reason.length > 0 ? reason : fallback);
+  error.name = 'AbortError';
+  return error;
 }
 
 /** Useful when discovery is routed through a queue controlled by a higher layer. */

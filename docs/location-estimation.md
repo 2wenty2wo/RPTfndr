@@ -41,7 +41,15 @@ Consensus work is bounded to the most recent 128 bearing observations so an over
 
 When a confirmed RSSI search polygon is available, the app intersects it with the bearing zone to form the final-approach zone. If the polygons do not overlap, the app shows a disagreement warning and preserves both inputs for review; it does not invent an overlap or choose one as truth. With no suitable directional bearings, RSSI-only proximity guidance remains available as the less precise fallback.
 
-JSON, GeoJSON, and summary exports identify bearing and final-approach zones as approximate and include their confidence metadata. The final zone is a field-search aid. Physically identify the equipment at close range before concluding that it has been found.
+## Community observer likelihood zone
+
+An authorised stationary repeater can contribute a target-attributed neighbour report through MeshCore's blank guest interface. A report is eligible only when the configured observer position was independently surveyed or confirmed by its operator, its uncertainty is within the analysis limit, the neighbour record contains the selected target's full 32-byte public key, the record is direct/zero-hop, and it is no more than five minutes old. Advert/contact coordinates cannot satisfy this requirement and are never promoted automatically.
+
+At least two eligible observer identities at separated positions are required; three or more are recommended. For each observer the newest eligible reports are aggregated. The estimator builds a padded convex envelope around the verified observer network and may trim that envelope only when pairwise SNR differences exceed a conservative terrain/fading allowance. It uses relative ordering only: SNR is never converted into a distance or path-loss radius. A common SNR offset leaves the result unchanged, and remote confidence is capped at `medium` even with good geometry.
+
+The remote zone can be intersected with the local directional final-approach polygon when available, otherwise with the confirmed RSSI search polygon. A non-overlap is preserved as disagreement. Observer anchors and both polygons have separate Leaflet layers; none of them alters the operational viewport, which continues to frame only measured local reception positions.
+
+JSON, GeoJSON, and summary exports identify bearing, remote-observer, community-assisted, and final-approach zones as approximate and include their confidence metadata. Verified observer points in GeoJSON are labelled as observer anchors, never as target positions. Every zone is a field-search aid. Physically identify the equipment at close range before concluding that it has been found.
 
 ## How to improve the result
 

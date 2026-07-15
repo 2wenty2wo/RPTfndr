@@ -1,7 +1,18 @@
 import { describe, expect, it } from 'vitest';
 
-import { DEFAULT_SESSION_SETTINGS, type CellAggregate, type Reception, type SearchSession } from '../types';
-import type { BearingConsensus, FinalApproachEstimate } from '../location';
+import {
+  DEFAULT_SESSION_SETTINGS,
+  type CellAggregate,
+  type Reception,
+  type RemoteObserverEvidence,
+  type SearchSession,
+} from '../types';
+import type {
+  BearingConsensus,
+  FinalApproachEstimate,
+  RemoteObserverAnalysis,
+  RemoteObserverCombinedZone,
+} from '../location';
 import { buildReceptionCsv, parseCsv, parseReceptionCsv, stringifyCsv } from './csv';
 import { buildGeoJson } from './geojson';
 import { sha256Hex, verifySha256 } from './hash';
@@ -170,7 +181,7 @@ describe('JSON archive', () => {
     expect(() => parseSessionArchive(JSON.stringify(malformedLocation))).toThrow(ArchiveValidationError);
   });
 
-  it('normalizes v1 lastKnown targets and legacy bearing fields to archive v2', () => {
+  it('normalizes v1 lastKnown targets and legacy bearing fields to archive v3', () => {
     const current = createSessionArchive(archiveInput);
     const legacy = structuredClone(current) as unknown as {
       version: number;
@@ -198,7 +209,7 @@ describe('JSON archive', () => {
     }];
 
     const imported = parseSessionArchive(JSON.stringify(legacy));
-    expect(imported.version).toBe(2);
+    expect(imported.version).toBe(3);
     expect(imported.session.targetSnapshot.advertisedReference).toEqual({
       lat: -33.86,
       lon: 151.2,
@@ -216,7 +227,30 @@ describe('JSON archive', () => {
     expect(imported.events[0]?.data).not.toHaveProperty('uncertainty');
   });
 
-  it('round-trips approximate bearing and final-approach metadata in archive v2', () => {
+  it('normalizes archive v2 sessions with conservative Smart Wardrive defaults', () => {
+    const legacy = structuredClone(createSessionArchive(archiveInput)) as unknown as {
+      version: number;
+      session: { settings: Record<string, unknown> };
+    };
+    legacy.version = 2;
+    delete legacy.session.settings.smartWardriveEnabled;
+    delete legacy.session.settings.autoDiscoveryEnabled;
+    delete legacy.session.settings.autoDiscoveryIntervalSec;
+    delete legacy.session.settings.observerAssistEnabled;
+    delete legacy.session.settings.observerPollIntervalMin;
+
+    const imported = parseSessionArchive(JSON.stringify(legacy));
+    expect(imported.version).toBe(3);
+    expect(imported.session.settings).toMatchObject({
+      smartWardriveEnabled: false,
+      autoDiscoveryEnabled: false,
+      autoDiscoveryIntervalSec: 90,
+      observerAssistEnabled: false,
+      observerPollIntervalMin: 10,
+    });
+  });
+
+  it('round-trips approximate bearing and final-approach metadata in archive v3', () => {
     const bearingConsensus: BearingConsensus = {
       point: { lat: -33.86, lon: 151.2 },
       observationCount: 2,
@@ -270,6 +304,107 @@ describe('JSON archive', () => {
     wrongPathSize.receptions[0]!.decoded!.pathHashSize = 2;
     wrongPathSize.receptions[0]!.decoded!.path = ['aa'];
     expect(() => parseSessionArchive(JSON.stringify(wrongPathSize))).toThrow(ArchiveValidationError);
+  });
+
+  it('round-trips verified observer reports and approximate remote/local zones', () => {
+    const observerEvent = {
+      sessionId: session.id,
+      t: reception.t,
+      type: 'observer-evidence' as const,
+      data: {
+        id: 'report-1',
+        observerId: 'ridge-observer',
+        observerPubkeyHex: 'bb'.repeat(32),
+        targetPubkeyHex: 'aa'.repeat(32),
+        observedAt: reception.t - 30_000,
+        receivedAt: reception.t,
+        heardSecondsAgo: 30,
+        snr: -4.25,
+        anchorLat: -33.85,
+        anchorLon: 151.19,
+        anchorAccuracyM: 8,
+        anchorVerifiedAt: reception.t - 86_400_000,
+        anchorVerification: 'operator-confirmed',
+        source: 'guest-neighbour',
+        trust: 'verified-observer',
+      },
+    };
+    const remoteObserverAnalysis: RemoteObserverAnalysis = {
+      ready: true,
+      reason: 'Approximate remote-observer likelihood zone.',
+      eligibleObserverCount: 2,
+      eligibleObservationCount: 2,
+      exclusions: [],
+      zone: {
+        polygon: [[-33.85, 151.19], [-33.86, 151.21], [-33.87, 151.19]],
+        areaM2: 1_250_000,
+        confidence: 'low',
+        geometryQuality: 'fair',
+        observerCount: 2,
+        observationCount: 2,
+        relativeConstraintCount: 1,
+        contributingObservationIds: ['report-1', 'report-2'],
+        contributingObserverIds: ['bb'.repeat(32), 'cc'.repeat(32)],
+        exclusionReasons: [],
+        terrainUncertaintyDb: 10,
+        generatedAt: reception.t,
+        approximate: true,
+        method: 'relative-snr-envelope',
+      },
+    };
+    const communityAssistedZone: RemoteObserverCombinedZone = {
+      ready: true,
+      reason: 'Approximate overlap between remote observers and the local search zone.',
+      polygon: [[-33.855, 151.195], [-33.86, 151.2], [-33.865, 151.195]],
+      areaM2: 350_000,
+      confidence: 'low',
+      observerCount: 2,
+      contributingObservationIds: ['report-1', 'report-2'],
+      contributingObserverIds: ['bb'.repeat(32), 'cc'.repeat(32)],
+      approximate: true,
+      generatedAt: reception.t,
+    };
+    const archive = createSessionArchive({
+      ...archiveInput,
+      events: [observerEvent],
+      remoteObserverAnalysis,
+      communityAssistedZone,
+    });
+    const parsed = parseSessionArchive(serializeSessionArchive(archive));
+    expect(parsed.events[0]?.type).toBe('observer-evidence');
+    expect(parsed.derived?.remoteObserverAnalysis?.zone).toMatchObject({
+      approximate: true,
+      method: 'relative-snr-envelope',
+      observerCount: 2,
+    });
+    expect(parsed.derived?.communityAssistedZone).toMatchObject({
+      approximate: true,
+      ready: true,
+    });
+
+    const untrusted = structuredClone(archive);
+    untrusted.events[0]!.data.trust = 'untrusted-admin';
+    expect(() => parseSessionArchive(JSON.stringify(untrusted))).toThrow(ArchiveValidationError);
+
+    const invalidAnchor = structuredClone(archive);
+    invalidAnchor.events[0]!.data.anchorLat = 120;
+    try {
+      parseSessionArchive(JSON.stringify(invalidAnchor));
+      throw new Error('Expected invalid observer latitude to be rejected');
+    } catch (error) {
+      expect(error).toBeInstanceOf(ArchiveValidationError);
+      expect((error as ArchiveValidationError).issues).toContainEqual({
+        path: '$.events[0].data.anchorLat',
+        message: 'must be between -90 and 90',
+      });
+    }
+
+    const inconsistentAge = structuredClone(archive);
+    inconsistentAge.events[0]!.data.observedAt = reception.t - 1_000;
+    inconsistentAge.events[0]!.data.heardSecondsAgo = 300;
+    expect(() => parseSessionArchive(JSON.stringify(inconsistentAge))).toThrowError(
+      /heardSecondsAgo: must agree with observedAt and receivedAt/,
+    );
   });
 });
 
@@ -368,6 +503,149 @@ describe('GeoJSON and technical summary', () => {
     expect(geojson.features[0]?.geometry).toEqual({ type: 'Point', coordinates: [151.2, -33.86] });
     expect(geojson.metadata.finalApproach).toMatchObject({ ready: true, approximate: true });
     expect(JSON.stringify(geojson).toLowerCase()).not.toMatch(/\b(exact|pinpoint(?:ed)?)\b/);
+  });
+
+  it('exports verified observer anchors and approximate remote and combined zones', () => {
+    const report: RemoteObserverEvidence = {
+      id: 'report-1',
+      observerId: 'ridge-observer',
+      observerPubkeyHex: 'bb'.repeat(32),
+      targetPubkeyHex: 'aa'.repeat(32),
+      observedAt: reception.t - 20_000,
+      receivedAt: reception.t,
+      heardSecondsAgo: 20,
+      snr: -3,
+      anchorLat: -33.85,
+      anchorLon: 151.19,
+      anchorAccuracyM: 7,
+      anchorVerifiedAt: reception.t - 86_400_000,
+      anchorVerification: 'user-surveyed',
+      source: 'guest-neighbour',
+      trust: 'verified-observer',
+    };
+    const remoteObserverAnalysis: RemoteObserverAnalysis = {
+      ready: true,
+      reason: 'Approximate remote-observer likelihood zone.',
+      eligibleObserverCount: 2,
+      eligibleObservationCount: 2,
+      exclusions: [],
+      zone: {
+        polygon: [[-33.85, 151.19], [-33.86, 151.21], [-33.87, 151.19]],
+        areaM2: 1_250_000,
+        confidence: 'low',
+        geometryQuality: 'fair',
+        observerCount: 2,
+        observationCount: 2,
+        relativeConstraintCount: 1,
+        contributingObservationIds: ['report-1', 'report-2'],
+        contributingObserverIds: ['bb'.repeat(32), 'cc'.repeat(32)],
+        exclusionReasons: [],
+        terrainUncertaintyDb: 10,
+        generatedAt: reception.t,
+        approximate: true,
+        method: 'relative-snr-envelope',
+      },
+    };
+    const communityAssistedZone: RemoteObserverCombinedZone = {
+      ready: true,
+      reason: 'Approximate overlap between remote observers and the local search zone.',
+      polygon: [[-33.855, 151.195], [-33.86, 151.2], [-33.865, 151.195]],
+      areaM2: 350_000,
+      confidence: 'low',
+      observerCount: 2,
+      contributingObservationIds: ['report-1', 'report-2'],
+      contributingObserverIds: ['bb'.repeat(32), 'cc'.repeat(32)],
+      approximate: true,
+      generatedAt: reception.t,
+    };
+    const observerEvent = {
+      sessionId: session.id,
+      t: reception.t,
+      type: 'observer-evidence' as const,
+      data: { ...report },
+    };
+    const geojson = buildGeoJson({
+      ...archiveInput,
+      events: [observerEvent],
+      observerEvidence: [report],
+      remoteObserverAnalysis,
+      communityAssistedZone,
+    });
+    expect(geojson.features.map((feature) => feature.properties.featureType)).toContain('remote-observer-report');
+    expect(geojson.features.map((feature) => feature.properties.featureType)).toContain('remote-observer-zone');
+    expect(geojson.features.map((feature) => feature.properties.featureType)).toContain('community-assisted-zone');
+    const anchor = geojson.features.find((feature) => feature.properties.featureType === 'remote-observer-report');
+    expect(anchor?.geometry).toEqual({ type: 'Point', coordinates: [151.19, -33.85] });
+    expect(anchor?.properties.positionRole).toBe('verified-observer-anchor');
+    expect(anchor?.properties.analysisEligibility).toBe('contributing');
+    expect(geojson.metadata.remoteObservers).toMatchObject({ approximate: true, observerCount: 2 });
+    expect(geojson.metadata.communityAssistedZone).toMatchObject({ approximate: true, ready: true });
+
+    const summary = buildTechnicalSummary(createSessionArchive({
+      ...archiveInput,
+      events: [observerEvent],
+      remoteObserverAnalysis,
+      communityAssistedZone,
+    }));
+    expect(summary).toContain('Target-matched guest neighbour reports: 1');
+    expect(summary).toContain('Community-assisted search zone');
+    expect(summary.toLowerCase()).not.toMatch(/\b(exact|pinpoint(?:ed)?)\b/);
+    expect(JSON.stringify(geojson).toLowerCase()).not.toMatch(/\b(exact|pinpoint(?:ed)?)\b/);
+
+    const wrongTargetReport = { ...report, id: 'wrong-target', targetPubkeyHex: 'dd'.repeat(32) };
+    const wrongTargetGeoJson = buildGeoJson({
+      ...archiveInput,
+      events: [{ ...observerEvent, data: { ...wrongTargetReport } }],
+      observerEvidence: [wrongTargetReport],
+    });
+    expect(wrongTargetGeoJson.features.some((feature) => (
+      feature.properties.featureType === 'remote-observer-report'
+    ))).toBe(false);
+    const wrongTargetSummary = buildTechnicalSummary(createSessionArchive({
+      ...archiveInput,
+      events: [{ ...observerEvent, data: { ...wrongTargetReport } }],
+    }));
+    expect(wrongTargetSummary).toContain('Target-matched guest neighbour reports: 0');
+
+    const nonContributingGeoJson = buildGeoJson({
+      ...archiveInput,
+      events: [observerEvent],
+      observerEvidence: [report],
+    });
+    const nonContributing = nonContributingGeoJson.features.find((feature) => (
+      feature.properties.featureType === 'remote-observer-report'
+    ));
+    expect(nonContributing?.properties.analysisEligibility).toBe('not-contributing');
+
+    const importedAuditEvent = {
+      sessionId: session.id,
+      t: reception.t,
+      type: 'note' as const,
+      data: {
+        kind: 'imported-observer-evidence-audit',
+        eligibility: 'audit-only',
+        originalEventType: 'observer-evidence',
+        evidence: { ...report },
+      },
+    };
+    const auditGeoJson = buildGeoJson({
+      ...archiveInput,
+      events: [importedAuditEvent],
+    });
+    expect(auditGeoJson.metadata.importedObserverAudit).toEqual({
+      reportCount: 1,
+      analysisEligibility: 'audit-only',
+      geometryExported: false,
+    });
+    expect(auditGeoJson.features.some((feature) => (
+      feature.properties.featureType === 'remote-observer-report'
+    ))).toBe(false);
+    const auditSummary = buildTechnicalSummary(createSessionArchive({
+      ...archiveInput,
+      events: [importedAuditEvent],
+    }));
+    expect(auditSummary).toContain('Imported audit-only observer reports: 1');
+    expect(auditSummary).toContain('excluded from every location calculation');
   });
 
   it('uses approximate technical-search wording and never labels the log as evidence', () => {

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { APP_COMMIT, APP_VERSION, DECODER_VERSION } from '../app/version';
 import { IdentityUniverse } from '../meshcore';
 import { deleteFinderDatabase, FinderRepository, openFinderDatabase, type FinderDatabase } from '../storage';
@@ -192,5 +192,49 @@ describe('SessionRecorder', () => {
     await ingest;
 
     expect((await repository.getSession(searchSession.id))?.state).toBe('ended');
+  });
+
+  it('flushes and clears its debounced session write during shutdown', async () => {
+    databaseName = `recorder-${crypto.randomUUID()}`;
+    database = await openFinderDatabase({ name: databaseName });
+    const repository = new FinderRepository(database);
+    const searchSession = session('session-shutdown');
+    await repository.putSession(searchSession);
+    const universe = new IdentityUniverse();
+    universe.addTarget(target);
+    const recorder = new SessionRecorder({ repository, session: searchSession, universe });
+    const putSession = vi.spyOn(repository, 'putSession');
+    const clearTimeout = vi.spyOn(globalThis, 'clearTimeout');
+
+    try {
+      await recorder.updateAutomationSettings({
+        smartWardriveEnabled: true,
+        autoDiscoveryEnabled: true,
+        autoDiscoveryIntervalSec: 120,
+        observerAssistEnabled: false,
+        observerPollIntervalMin: 10,
+      });
+
+      await recorder.shutdown();
+
+      expect(clearTimeout).toHaveBeenCalled();
+      expect(putSession).toHaveBeenCalledTimes(1);
+      expect((await repository.getSession(searchSession.id))?.settings).toMatchObject({
+        smartWardriveEnabled: true,
+        autoDiscoveryEnabled: true,
+        autoDiscoveryIntervalSec: 120,
+      });
+
+      await recorder.updateAutomationSettings({
+        smartWardriveEnabled: false,
+        autoDiscoveryEnabled: false,
+        autoDiscoveryIntervalSec: 90,
+        observerAssistEnabled: false,
+        observerPollIntervalMin: 10,
+      });
+      expect(putSession).toHaveBeenCalledTimes(1);
+    } finally {
+      clearTimeout.mockRestore();
+    }
   });
 });

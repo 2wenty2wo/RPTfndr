@@ -21,6 +21,7 @@ See [packet classification](docs/packet-classification.md) for the exact precede
 - Opening the map requests raster tiles from OpenStreetMap; up to 300 viewed tiles may be cached for seven days. Capture and exports remain usable without a basemap.
 - JSON archives include a displayed SHA-256 digest. CSV, GeoJSON, and a human-readable technical summary are also available.
 - Coordinates advertised by a repeater or copied from a contact are treated as untrusted admin metadata. They are hidden by default and, if enabled, appear only as **Admin-configured position — unverified**; they never feed map bounds or location calculations.
+- Verified community-observer definitions, query audit events, and target-matched reports are also device-local. Observer assist is opt-in and sends radio traffic only while an authorised foreground Drive session is running.
 
 Read [privacy and safety](docs/privacy-and-safety.md) before field use.
 
@@ -41,14 +42,23 @@ Web Bluetooth requires HTTPS (localhost is allowed for development), a user gest
 2. Connect a MeshCore/Meshtastic companion radio.
 3. Choose a repeater contact or enter its full 32-byte public key / 4-byte node ID. Shorter prefixes can never create confirmed samples.
 4. Start in **drive mode** for broad, passenger-operated coverage. Never handle the app while driving.
-5. Make separated passes. Look for a repeatable cluster of confirmed direct receptions, not one peak.
-6. Change to **walk mode** near the strongest confirmed search area and approach from several directions.
-7. Near the search area, record manual directional-antenna bearings from separated locations. Two eligible bearings are the minimum; three or more are recommended.
-8. Treat the shaded final-approach zone as approximate. Poor crossing geometry, GPS error, angular uncertainty, and multipath can move or enlarge it, and a disagreement with the RSSI search area is reported rather than concealed.
-9. Search the final area at close range and visually confirm the physical equipment.
-10. Export the technical search log before deleting local data or copying an ended log to another device for review. Imported sessions remain ended; start a new local session for further capture.
+5. Optionally configure **Smart Wardrive**. Automatic repeater discovery and community observer polling are separate opt-ins with conservative minimum intervals. Both stop when the page is hidden, Bluetooth disconnects, or the Drive session ends.
+6. Make separated passes. Look for a repeatable cluster of confirmed direct receptions, not one peak.
+7. Change to **walk mode** near the strongest confirmed search area and approach from several directions.
+8. Near the search area, record manual directional-antenna bearings from separated locations. Two eligible bearings are the minimum; three or more are recommended.
+9. Treat every shaded overlap as approximate. Poor geometry, GPS error, angular uncertainty, propagation, and multipath can move or enlarge it, and disagreement is reported rather than concealed.
+10. Search the final area at close range and visually confirm the physical equipment.
+11. Export the technical search log before deleting local data or copying an ended log to another device for review. Imported sessions remain ended; start a new local session for further capture.
 
 The gauge shows relative, session-calibrated signal—not distance. “100%” means strong relative to the configured/session range, not “at the repeater.” Details are in [location estimation](docs/location-estimation.md).
+
+## Smart Wardrive and community observers
+
+Smart Wardrive automates the parts a browser and companion can do safely: passive reception capture continues as before, repeater-only discovery pulses share a hard 60-second minimum interval with manual discovery, and enabled community observers can be polled no more often than every 5–60 minutes. It requires a real Drive session, a visible page, a fully restored companion protocol, and a connected companion; observer polling additionally requires the target's full 32-byte public key. Queued automation writes are cancelled before transmission when those prerequisites are lost. It is not background tracking; phone locking and browser suspension stop it.
+
+Community observer assist is deliberately manual to configure and automatic only after configuration. For each stationary repeater you must enter an independently surveyed or operator-confirmed position and confirm permission to query it. Do not copy its advert/contact coordinates: those remain untrusted and can never become an observer anchor automatically. The app sends only MeshCore's documented blank-password guest login; there is no password field, storage, retry guessing, or administrative command path. A rejected or failed login is not retried until the Bluetooth connection is re-established.
+
+After a successful guest login, the app requests a bounded, newest-first neighbour list with full 32-byte keys and retains only a record matching the selected target's full key. Each cycle visits at most three observers in round-robin order and eight neighbour pages overall; anchors worse than 250 m are audit-only and are not polled. Two fresh, separated observers are the minimum and three or more are recommended. Their relative SNR ordering produces a broad likelihood envelope—it is never converted into range. The app can shade its overlap with the local confirmed-signal or directional-bearing zone, but displays a disagreement warning when the inputs do not overlap.
 
 ## Demo and replay
 

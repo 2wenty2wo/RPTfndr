@@ -16,6 +16,8 @@ export function dfScreen(state: Readonly<AppState>): string {
   const analysis = state.bearingAnalysis;
   const consensus = state.bearingConsensus;
   const finalApproach = state.finalApproach;
+  const assisted = state.communityAssistedZone;
+  const remote = state.remoteObserverAnalysis;
   const exclusions = analysis?.exclusions ?? [];
   const statusClass = finalApproach?.ready
     ? 'good'
@@ -44,6 +46,7 @@ export function dfScreen(state: Readonly<AppState>): string {
         ${consensus ? `<p class="fine-print">Bearing geometry: ${escapeHtml(consensus.geometryQuality)} · ${Math.round(consensus.radiusM)} m uncertainty radius · ${consensus.rmsCrossTrackErrorM.toFixed(1)} m RMS cross-track error.</p>` : '<p class="fine-print">At least two eligible bearings from separated locations are required; three or more are strongly recommended.</p>'}
         ${finalApproach?.disagreement ? '<p class="warning-text"><strong>Disagreement:</strong> the directional-bearing zone does not overlap the confirmed-signal search area. Recheck antenna direction, multipath, and GPS, then collect another pass.</p>' : ''}
         ${!consensus && state.estimate?.ready ? '<p class="muted">Directional bearings are not ready. Continue using the RSSI-only strongest confirmed search area as lower-precision proximity guidance.</p>' : ''}
+        <p class="${assisted?.disagreement ? 'warning-text' : 'fine-print'}"><strong>Community assist:</strong> ${escapeHtml(assisted?.reason ?? remote?.reason ?? 'No eligible remote-observer evidence yet.')}</p>
         <a class="button" href="#/map">View shaded zones</a>
       </article>
     </div>

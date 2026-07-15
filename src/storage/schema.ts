@@ -6,7 +6,7 @@ import {
 } from '../normalize';
 
 export const DB_NAME = 'meshcore-finder';
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 export const STORES = {
   sessions: 'sessions',
@@ -107,6 +107,10 @@ function migrateToV2({ transaction }: MigrationContext): void {
   migrateStoreRecords(transaction, STORES.events, normalizeSessionEventRecord);
 }
 
+function migrateToV3({ transaction }: MigrationContext): void {
+  migrateStoreRecords(transaction, STORES.sessions, normalizeSearchSessionRecord);
+}
+
 /**
  * Migrations are deliberately version keyed and run one at a time. Tests and
  * future releases can extend this map without replacing the v1 migration.
@@ -114,6 +118,7 @@ function migrateToV2({ transaction }: MigrationContext): void {
 export const MIGRATIONS: MigrationMap = new Map<number, Migration>([
   [1, migrateToV1],
   [2, migrateToV2],
+  [3, migrateToV3],
 ]);
 
 export function runMigrations(

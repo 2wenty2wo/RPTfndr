@@ -4,8 +4,10 @@ import {
   observationFromBearingEvent,
   type BearingConsensus,
   type FinalApproachEstimate,
+  type RemoteObserverAnalysis,
+  type RemoteObserverCombinedZone,
 } from '../location';
-import type { AreaEstimate, Reception, SessionEvent, TargetProfile } from '../types';
+import type { AreaEstimate, Reception, RemoteObserverEvidence, SessionEvent, TargetProfile } from '../types';
 
 export interface FinderLayers {
   confirmed: LayerGroup;
@@ -16,6 +18,9 @@ export interface FinderLayers {
   bearings: LayerGroup;
   bearingZone: LayerGroup;
   finalApproach: LayerGroup;
+  observerEvidence: LayerGroup;
+  remoteObserverZone: LayerGroup;
+  communityAssisted: LayerGroup;
   reference: LayerGroup;
 }
 
@@ -29,6 +34,9 @@ export function createFinderLayers(map: LeafletMap, showUntrustedAdminPosition =
     bearings: L.layerGroup().addTo(map),
     bearingZone: L.layerGroup().addTo(map),
     finalApproach: L.layerGroup().addTo(map),
+    observerEvidence: L.layerGroup(),
+    remoteObserverZone: L.layerGroup().addTo(map),
+    communityAssisted: L.layerGroup().addTo(map),
     reference: L.layerGroup(),
   };
   if (showUntrustedAdminPosition) layers.reference.addTo(map);
@@ -41,9 +49,60 @@ export function createFinderLayers(map: LeafletMap, showUntrustedAdminPosition =
     'Bearing notes': layers.bearings,
     'Approximate bearing zone': layers.bearingZone,
     'Approximate final-approach zone': layers.finalApproach,
+    'Verified community observers': layers.observerEvidence,
+    'Approximate remote-observer zone': layers.remoteObserverZone,
+    'Approximate community-assisted overlap': layers.communityAssisted,
     'Admin-configured position — unverified': layers.reference,
   }, { collapsed: true }).addTo(map);
   return layers;
+}
+
+export function drawRemoteObserverAssist(
+  evidence: readonly RemoteObserverEvidence[],
+  analysis: RemoteObserverAnalysis | undefined,
+  assisted: RemoteObserverCombinedZone | undefined,
+  layers: FinderLayers,
+): void {
+  layers.observerEvidence.clearLayers();
+  layers.remoteObserverZone.clearLayers();
+  layers.communityAssisted.clearLayers();
+  const latestByObserver = new Map<string, RemoteObserverEvidence>();
+  for (const item of evidence) {
+    const previous = latestByObserver.get(item.observerId);
+    if (!previous || item.observedAt > previous.observedAt) latestByObserver.set(item.observerId, item);
+  }
+  for (const item of latestByObserver.values()) {
+    const tooltip = document.createElement('span');
+    tooltip.textContent = `Verified observer · target heard ${new Date(item.observedAt).toLocaleString()} · ${item.snr.toFixed(1)} dB SNR`;
+    L.circleMarker([item.anchorLat, item.anchorLon], {
+      radius: 7,
+      color: '#a88cf2',
+      fillColor: '#a88cf2',
+      fillOpacity: 0.4,
+      weight: 2,
+    }).bindTooltip(tooltip).addTo(layers.observerEvidence);
+  }
+  if (analysis?.ready && analysis.zone?.polygon.length) {
+    L.polygon(analysis.zone.polygon, {
+      color: '#a88cf2',
+      fillColor: '#a88cf2',
+      fillOpacity: 0.1,
+      weight: 2,
+      dashArray: '3 7',
+    }).bindTooltip(
+      `Approximate remote-observer likelihood zone · ${analysis.zone.confidence} confidence · ${analysis.zone.observerCount} observers`,
+    ).addTo(layers.remoteObserverZone);
+  }
+  if (assisted?.ready && assisted.polygon?.length) {
+    L.polygon(assisted.polygon, {
+      color: '#62b6ff',
+      fillColor: '#62b6ff',
+      fillOpacity: 0.26,
+      weight: 3,
+    }).bindTooltip(
+      `Approximate community-assisted overlap · ${assisted.confidence} confidence`,
+    ).addTo(layers.communityAssisted);
+  }
 }
 
 function targetLayer(reception: Reception, layers: FinderLayers): { layer: LayerGroup; color: string } {

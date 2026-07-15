@@ -29,7 +29,7 @@ In the UI, choose **Open demo scenario**. The default approach-and-pass scenario
 
 ## Automated tests
 
-Unit tests cover frame/packet round trips, replay timing/acceleration/drop events, provenance rejection, every classification branch, GPS boundaries, aggregation, exports, audio, storage, and recorder fan-out.
+Unit tests cover frame/packet round trips, replay timing/acceleration/drop events, provenance rejection, every classification branch, GPS boundaries, aggregation, exports, audio, storage, recorder fan-out, foreground Smart Wardrive scheduling, blank guest protocol correlation/pagination, and conservative multi-observer geometry. Guest tests use a deterministic command queue; they do not contact public repeaters.
 
 Playwright builds and previews the production app, then runs desktop Chromium and Pixel 7 emulation:
 
@@ -40,6 +40,8 @@ npm run test:e2e
 - `unsupported.spec.ts`: Web Bluetooth absent → Bluefy guidance; archive import remains available for review.
 - `workflow.spec.ts`: acknowledgement, mock companion, target, session, direct/forwarded/ambiguous frames, confirmed-only gauge, JSON/CSV/GeoJSON downloads, SHA-256 verification, and JSON re-import.
 - `resume.spec.ts`: reload mid-session, resume prompt, reconstruction from IndexedDB, and classification persistence.
+
+Remote observer math tests inject deliberately false target advert coordinates and prove they do not alter eligible anchors, the remote likelihood polygon, the local search polygon, map bounds, or the community-assisted overlap. Archive tests cover v1/v2-to-v3 migration, verified report validation, GeoJSON observer-anchor labelling, and disagreement metadata. Hardware validation must still confirm that the intended observer has blank guest access enabled and that its operator has authorised the query.
 
 Use `?e2e=1` only for automation; it exposes `window.__finderTest`. Use `?nosw=1` to prevent service-worker state from making browser tests nondeterministic.
 

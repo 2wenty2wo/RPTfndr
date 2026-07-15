@@ -81,6 +81,57 @@ describe('CommandQueue', () => {
     await secondRejection;
   });
 
+  it('removes an individually aborted queued command before it can write', async () => {
+    const writes: number[] = [];
+    const queue = new CommandQueue(async (command) => {
+      writes.push(command[0] ?? -1);
+    });
+    const first = queue.send(Uint8Array.of(1), opcodeMatcher(5), { label: 'first' });
+    const controller = new AbortController();
+    const queued = queue.send(Uint8Array.of(2), null, {
+      label: 'guest queued',
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(writes).toEqual([1]));
+
+    controller.abort(new Error('guest poll stopped'));
+    await expect(queued).rejects.toMatchObject({
+      name: 'CommandCancelledError',
+      message: 'guest poll stopped',
+    });
+    queue.handleFrame(Uint8Array.of(5));
+    await expect(first).resolves.toHaveLength(1);
+    await Promise.resolve();
+    expect(writes).toEqual([1]);
+  });
+
+  it('does not overlap writes when an active command is aborted mid-write', async () => {
+    const writes: number[] = [];
+    let finishFirstWrite!: () => void;
+    const firstWrite = new Promise<void>((resolve) => {
+      finishFirstWrite = resolve;
+    });
+    const queue = new CommandQueue(async (command) => {
+      writes.push(command[0] ?? -1);
+      if (command[0] === 1) await firstWrite;
+    });
+    const controller = new AbortController();
+    const active = queue.send(Uint8Array.of(1), null, {
+      label: 'guest active',
+      signal: controller.signal,
+    });
+    const next = queue.send(Uint8Array.of(2), null, { label: 'next' });
+    await vi.waitFor(() => expect(writes).toEqual([1]));
+
+    controller.abort('stop active guest command');
+    await expect(active).rejects.toBeInstanceOf(CommandCancelledError);
+    expect(writes).toEqual([1]);
+
+    finishFirstWrite();
+    await expect(next).resolves.toEqual([]);
+    expect(writes).toEqual([1, 2]);
+  });
+
   it('does not lose a synchronous response emitted during write', async () => {
     // A deferred assignment is required because the write callback intentionally
     // re-enters the queue synchronously during construction.

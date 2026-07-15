@@ -1,7 +1,21 @@
 import L, { type Map as LeafletMap } from 'leaflet';
-import type { BearingConsensus, FinalApproachEstimate } from '../location';
-import type { AreaEstimate, Reception, SessionEvent, TargetProfile } from '../types';
-import { createFinderLayers, drawApproachZones, drawBearings, drawEstimate, drawReceptions, drawTargetReference, type FinderLayers } from './layers';
+import type {
+  BearingConsensus,
+  FinalApproachEstimate,
+  RemoteObserverAnalysis,
+  RemoteObserverCombinedZone,
+} from '../location';
+import type { AreaEstimate, Reception, RemoteObserverEvidence, SessionEvent, TargetProfile } from '../types';
+import {
+  createFinderLayers,
+  drawApproachZones,
+  drawBearings,
+  drawEstimate,
+  drawReceptions,
+  drawRemoteObserverAssist,
+  drawTargetReference,
+  type FinderLayers,
+} from './layers';
 
 /**
  * Only measured reception positions may frame the operational map. The target
@@ -34,6 +48,9 @@ export class FinderMap {
     showUntrustedAdminPosition = false,
     bearingConsensus?: BearingConsensus,
     finalApproach?: FinalApproachEstimate,
+    observerEvidence: RemoteObserverEvidence[] = [],
+    remoteObserverAnalysis?: RemoteObserverAnalysis,
+    communityAssistedZone?: RemoteObserverCombinedZone,
   ): void {
     this.destroy();
     this.#map = L.map(element, { zoomControl: true, preferCanvas: true, attributionControl: true });
@@ -42,7 +59,17 @@ export class FinderMap {
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
     }).addTo(this.#map);
     this.#layers = createFinderLayers(this.#map, showUntrustedAdminPosition);
-    this.update(receptions, estimate, events, target, bearingConsensus, finalApproach);
+    this.update(
+      receptions,
+      estimate,
+      events,
+      target,
+      bearingConsensus,
+      finalApproach,
+      observerEvidence,
+      remoteObserverAnalysis,
+      communityAssistedZone,
+    );
     const points = finderViewportPoints(receptions, target);
     if (points.length) {
       const bounds = L.latLngBounds(points);
@@ -60,12 +87,16 @@ export class FinderMap {
     target?: TargetProfile,
     bearingConsensus?: BearingConsensus,
     finalApproach?: FinalApproachEstimate,
+    observerEvidence: RemoteObserverEvidence[] = [],
+    remoteObserverAnalysis?: RemoteObserverAnalysis,
+    communityAssistedZone?: RemoteObserverCombinedZone,
   ): void {
     if (!this.#layers) return;
     drawReceptions(receptions, this.#layers);
     drawEstimate(estimate, this.#layers);
     drawBearings(events, this.#layers);
     drawApproachZones(bearingConsensus, finalApproach, this.#layers);
+    drawRemoteObserverAssist(observerEvidence, remoteObserverAnalysis, communityAssistedZone, this.#layers);
     drawTargetReference(target, this.#layers);
   }
 

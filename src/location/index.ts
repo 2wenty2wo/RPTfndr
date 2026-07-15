@@ -4,3 +4,4 @@ export * from './gps';
 export * from './cells';
 export * from './estimate';
 export * from './bearings';
+export * from './remoteObservers';

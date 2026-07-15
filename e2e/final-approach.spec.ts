@@ -78,9 +78,55 @@ test('false admin coordinates stay hidden while field bearings produce an approx
     Math.abs(lat - target.lat) < 0.01 && Math.abs(lon - target.lon) < 0.01
   ))).toBe(true);
 
+  await page.evaluate(async ({ targetKey, targetLat, targetLon }) => {
+    const receivedAt = Date.now();
+    const base = {
+      targetPubkeyHex: targetKey,
+      receivedAt,
+      anchorAccuracyM: 10,
+      anchorVerifiedAt: receivedAt - 60_000,
+      anchorVerification: 'operator-confirmed' as const,
+      source: 'guest-neighbour' as const,
+      trust: 'verified-observer' as const,
+    };
+    await window.__finderTest?.injectObserverEvidence({
+      ...base,
+      id: 'north-observer-report',
+      observerId: 'north-observer',
+      observerPubkeyHex: '11'.repeat(32),
+      observedAt: receivedAt - 5_000,
+      heardSecondsAgo: 5,
+      snr: 8,
+      anchorLat: targetLat + 0.005,
+      anchorLon: targetLon - 0.004,
+    });
+    await window.__finderTest?.injectObserverEvidence({
+      ...base,
+      id: 'south-observer-report',
+      observerId: 'south-observer',
+      observerPubkeyHex: '22'.repeat(32),
+      observedAt: receivedAt - 8_000,
+      heardSecondsAgo: 8,
+      snr: -5,
+      anchorLat: targetLat - 0.005,
+      anchorLon: targetLon + 0.004,
+    });
+  }, { targetKey: DEMO_TARGET_PUBKEY_HEX, targetLat: target.lat, targetLon: target.lon });
+  await expect.poll(() => page.evaluate(() => window.__finderTest?.communityAssistedZone())).toMatchObject({
+    ready: true,
+    approximate: true,
+    observerCount: 2,
+  });
+  const communityZone = await page.evaluate(() => window.__finderTest?.communityAssistedZone());
+  expect(communityZone?.polygon?.every(([lat, lon]) => (
+    Math.abs(lat - target.lat) < 0.01 && Math.abs(lon - target.lon) < 0.01
+  ))).toBe(true);
+
   await page.getByRole('link', { name: 'View shaded zones' }).click();
   await expect(page.getByText(/Final approach · .* confidence/)).toBeVisible();
+  await expect(page.getByText(/Community assist · .* confidence/)).toBeVisible();
   await expect(page.getByLabel('Admin-configured position — unverified')).not.toBeChecked();
+  await expect(page.getByLabel('Verified community observers')).not.toBeChecked();
   await expect(page.getByText('Approximate final-approach guidance')).toBeVisible();
   const visibleText = (await page.locator('main').innerText()).toLowerCase();
   expect(visibleText).not.toMatch(/\b(exact|pinpoint(?:ed)?)\b/);

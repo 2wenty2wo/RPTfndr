@@ -99,6 +99,9 @@ function render(state: Readonly<AppState>): void {
             target,
             state.bearingConsensus,
             state.finalApproach,
+            state.observerEvidence,
+            state.remoteObserverAnalysis,
+            state.communityAssistedZone,
           );
           finderMap.invalidateSize();
         } else {
@@ -111,6 +114,9 @@ function render(state: Readonly<AppState>): void {
             state.showUntrustedAdminPosition,
             state.bearingConsensus,
             state.finalApproach,
+            state.observerEvidence,
+            state.remoteObserverAnalysis,
+            state.communityAssistedZone,
           );
         }
       } catch (error) {
@@ -137,6 +143,9 @@ async function runAction(button: HTMLElement, action: string): Promise<void> {
       break;
     case 'disconnect':
       await controller.disconnect();
+      break;
+    case 'poll-observers':
+      await controller.queryObservers();
       break;
     case 'start-demo':
       await controller.startDemo('approach-and-pass');
@@ -218,6 +227,12 @@ async function runAction(button: HTMLElement, action: string): Promise<void> {
     case 'apply-update':
       await updateServiceWorker?.(true);
       break;
+    case 'toggle-observer':
+      await controller.setObserverEnabled(button.dataset.id ?? '', button.dataset.enabled === 'true');
+      break;
+    case 'delete-observer':
+      await controller.deleteObserver(button.dataset.id ?? '');
+      break;
   }
 }
 
@@ -257,7 +272,23 @@ root.addEventListener('submit', (event) => {
         smoothingWindow: Number(data.get('smoothingWindow')),
         emaAlpha: Number(data.get('emaAlpha')),
         maxGpsAccuracyM: Number(data.get('maxGpsAccuracyM')),
+        smartWardriveEnabled: data.get('smartWardriveEnabled') === 'on',
+        autoDiscoveryEnabled: data.get('autoDiscoveryEnabled') === 'on',
+        autoDiscoveryIntervalSec: Number(data.get('autoDiscoveryIntervalSec')),
+        observerAssistEnabled: data.get('observerAssistEnabled') === 'on',
+        observerPollIntervalMin: Number(data.get('observerPollIntervalMin')),
       }, data.get('showUntrustedAdminPosition') === 'on');
+    } else if (form.dataset.form === 'observer') {
+      await controller.saveObserver({
+        label: String(data.get('label') ?? ''),
+        repeaterPubkeyHex: String(data.get('pubkey') ?? ''),
+        lat: Number(data.get('lat')),
+        lon: Number(data.get('lon')),
+        accuracyM: Number(data.get('accuracyM')),
+        verification: String(data.get('verification')) as 'user-surveyed' | 'operator-confirmed',
+        permissionConfirmed: data.get('permissionConfirmed') === 'on',
+      });
+      form.reset();
     }
   })().catch((error: unknown) => controller.notice('error', error instanceof Error ? error.message : String(error)));
 });
@@ -328,10 +359,12 @@ if (e2e) {
     injectFrame: (frame) => controller.injectMockFrame(frame),
     injectGps: (fix: Omit<GpsFix, 'sessionId' | 'acceptedNum'>) => controller.injectGps(fix),
     addBearing: (bearingDeg: number, accuracyDeg: number, note?: string) => controller.addBearing(bearingDeg, accuracyDeg, note),
+    injectObserverEvidence: (evidence) => controller.injectObserverEvidenceForTest(evidence),
     dropConnection: () => controller.dropMockConnection(),
     restoreConnection: () => controller.restoreMockConnection(),
     receptions: () => controller.store.value.receptions,
     finalApproach: () => controller.store.value.finalApproach,
+    communityAssistedZone: () => controller.store.value.communityAssistedZone,
     activeTarget: () => controller.store.value.activeTarget,
     clear: () => controller.deleteAll(),
   };

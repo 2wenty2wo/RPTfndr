@@ -72,6 +72,7 @@ export class SessionRecorder {
   #estimate?: AreaEstimate;
   #lastArrival?: number;
   #closed = false;
+  #disposed = false;
   #reclassifying = false;
   #suppressUniverseGrowth = false;
   #operationChain: Promise<void> = Promise.resolve();
@@ -328,6 +329,22 @@ export class SessionRecorder {
     });
   }
 
+  async updateAutomationSettings(settings: Pick<
+    SearchSession['settings'],
+    | 'smartWardriveEnabled'
+    | 'autoDiscoveryEnabled'
+    | 'autoDiscoveryIntervalSec'
+    | 'observerAssistEnabled'
+    | 'observerPollIntervalMin'
+  >): Promise<void> {
+    return this.enqueue(async () => {
+      if (this.#closed) return;
+      this.#session.settings = { ...this.#session.settings, ...settings };
+      this.#writer.queue(this.#session);
+      this.emit();
+    });
+  }
+
   async updateTargetMetadata(target: TargetProfile): Promise<void> {
     return this.enqueue(async () => {
       const current = this.#session.targetSnapshot;
@@ -398,12 +415,29 @@ export class SessionRecorder {
     return this.enqueue(() => this.flushWriter());
   }
 
+  /**
+   * Stop accepting capture work and drain the debounced session snapshot before
+   * its database connection is closed or replaced.
+   */
+  async shutdown(): Promise<void> {
+    return this.enqueue(async () => {
+      this.#closed = true;
+      try {
+        await this.#writer.close();
+      } finally {
+        this.dispose();
+      }
+    });
+  }
+
   private async flushWriter(): Promise<void> {
     await this.#writer.flush();
     await this.#repository.putSession(this.#session);
   }
 
   dispose(): void {
+    if (this.#disposed) return;
+    this.#disposed = true;
     this.#removeGrowthListener();
     this.#removeEstimateListener();
     this.estimator.cancel();

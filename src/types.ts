@@ -44,6 +44,46 @@ export interface TargetProfile {
   updatedAt: number;
 }
 
+/**
+ * A repeater whose physical coordinates were independently verified for use as
+ * a stationary RF observer. Advert/contact coordinates are intentionally not
+ * accepted here.
+ */
+export interface VerifiedObserver {
+  id: string;
+  label: string;
+  repeaterPubkeyHex: Hex;
+  lat: number;
+  lon: number;
+  accuracyM: number;
+  verifiedAt: number;
+  verification: 'user-surveyed' | 'operator-confirmed';
+  trust: 'verified-observer';
+  permissionConfirmed: boolean;
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** A target-attributed zero-hop neighbour record returned by a remote observer. */
+export interface RemoteObserverEvidence {
+  id?: string;
+  observerId: string;
+  observerPubkeyHex: Hex;
+  targetPubkeyHex: Hex;
+  observedAt: number;
+  receivedAt: number;
+  heardSecondsAgo: number;
+  snr: number;
+  anchorLat: number;
+  anchorLon: number;
+  anchorAccuracyM: number;
+  anchorVerifiedAt: number;
+  anchorVerification: VerifiedObserver['verification'];
+  source: 'guest-neighbour';
+  trust: 'verified-observer';
+}
+
 export interface GpsFix {
   id?: number;
   sessionId: string;
@@ -149,7 +189,10 @@ export interface SessionEvent {
     | 'discovery-cmd'
     | 'lifecycle'
     | 'identity-change'
-    | 'suspension-gap';
+    | 'suspension-gap'
+    | 'observer-query'
+    | 'observer-evidence'
+    | 'smart-wardrive';
   data: Record<string, unknown>;
 }
 
@@ -164,6 +207,11 @@ export interface SessionSettings {
   audioVolume: number;
   audioMuted: boolean;
   forwardedAlert: boolean;
+  smartWardriveEnabled: boolean;
+  autoDiscoveryEnabled: boolean;
+  autoDiscoveryIntervalSec: number;
+  observerAssistEnabled: boolean;
+  observerPollIntervalMin: number;
 }
 
 export interface SearchSession {
@@ -254,4 +302,9 @@ export const DEFAULT_SESSION_SETTINGS: SessionSettings = {
   audioVolume: 0.8,
   audioMuted: false,
   forwardedAlert: false,
+  smartWardriveEnabled: false,
+  autoDiscoveryEnabled: false,
+  autoDiscoveryIntervalSec: 90,
+  observerAssistEnabled: false,
+  observerPollIntervalMin: 10,
 };

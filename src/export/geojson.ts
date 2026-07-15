@@ -1,6 +1,7 @@
 import type {
   AreaEstimate,
   CellAggregate,
+  RemoteObserverEvidence,
   Reception,
   SearchSession,
   SessionEvent,
@@ -9,6 +10,8 @@ import {
   observationFromBearingEvent,
   type BearingConsensus,
   type FinalApproachEstimate,
+  type RemoteObserverAnalysis,
+  type RemoteObserverCombinedZone,
 } from '../location';
 
 export type GeoJsonPosition = [longitude: number, latitude: number];
@@ -52,6 +55,29 @@ export interface MeshCoreGeoJson {
       signalCellCount: number;
       areaM2: number | null;
     };
+    remoteObservers?: {
+      approximate: true;
+      ready: boolean;
+      reason: string;
+      confidence: string | null;
+      observerCount: number;
+      observationCount: number;
+      areaM2: number | null;
+    };
+    communityAssistedZone?: {
+      approximate: true;
+      ready: boolean;
+      reason: string;
+      confidence: string;
+      disagreement: boolean;
+      observerCount: number;
+      areaM2: number | null;
+    };
+    importedObserverAudit?: {
+      reportCount: number;
+      analysisEligibility: 'audit-only';
+      geometryExported: false;
+    };
   };
 }
 
@@ -63,6 +89,9 @@ export interface GeoJsonExportInput {
   events?: readonly SessionEvent[];
   bearingConsensus?: BearingConsensus;
   finalApproach?: FinalApproachEstimate;
+  observerEvidence?: readonly RemoteObserverEvidence[];
+  remoteObserverAnalysis?: RemoteObserverAnalysis;
+  communityAssistedZone?: RemoteObserverCombinedZone;
   /** AreaEstimate uses [lat, lon] by default; change only for imported data. */
   estimateCoordinateOrder?: 'lat-lon' | 'lon-lat';
   exportedAt?: Date | string;
@@ -99,6 +128,53 @@ export function buildGeoJson(input: GeoJsonExportInput): MeshCoreGeoJson {
         gpsStatus: reception.gps.status,
         gpsAccuracyM: reception.gps.accuracy ?? null,
         gpsAgeMs: reception.gps.ageMs ?? null,
+        simulatedData: input.session.demo,
+      },
+    });
+  }
+
+  const targetPubkeyHex = input.session.targetSnapshot.identity.kind === 'full-pubkey'
+    ? input.session.targetSnapshot.identity.pubkeyHex?.toLowerCase()
+    : undefined;
+  const observerReportMap = new Map<string, RemoteObserverEvidence>();
+  for (const report of [
+    ...observerEvidenceFromEvents(input.events ?? [], targetPubkeyHex),
+    ...(input.observerEvidence ?? []),
+  ]) {
+    const key = report.id
+      ?? `${report.observerPubkeyHex}:${report.targetPubkeyHex}:${report.receivedAt}`;
+    observerReportMap.set(key, report);
+  }
+  const observerReports = [...observerReportMap.values()];
+  const contributingReportIds = new Set(
+    (input.remoteObserverAnalysis?.zone?.contributingObservationIds ?? []).map(String),
+  );
+  for (const report of observerReports) {
+    if (!validObserverReport(report, targetPubkeyHex)) continue;
+    features.push({
+      type: 'Feature',
+      ...(report.id === undefined ? {} : { id: `remote-observer-${report.id}` }),
+      geometry: { type: 'Point', coordinates: [report.anchorLon, report.anchorLat] },
+      properties: {
+        featureType: 'remote-observer-report',
+        label: 'Verified remote observer report',
+        positionRole: 'verified-observer-anchor',
+        observerId: report.observerId,
+        observerPubkey: report.observerPubkeyHex,
+        targetPubkey: report.targetPubkeyHex,
+        observedAt: new Date(report.observedAt).toISOString(),
+        receivedAt: new Date(report.receivedAt).toISOString(),
+        heardSecondsAgo: report.heardSecondsAgo,
+        snrDb: report.snr,
+        observerPositionAccuracyM: report.anchorAccuracyM,
+        observerPositionVerifiedAt: new Date(report.anchorVerifiedAt).toISOString(),
+        observerPositionVerification: report.anchorVerification,
+        source: report.source,
+        trust: report.trust,
+        analysisEligibility: report.id !== undefined && contributingReportIds.has(String(report.id))
+          ? 'contributing'
+          : 'not-contributing',
+        methodCaveat: 'This point is the independently verified observer position, not a target position.',
         simulatedData: input.session.demo,
       },
     });
@@ -199,6 +275,59 @@ export function buildGeoJson(input: GeoJsonExportInput): MeshCoreGeoJson {
     });
   }
 
+  const remoteZone = input.remoteObserverAnalysis?.zone;
+  if (remoteZone?.polygon && remoteZone.polygon.length >= 3) {
+    features.push({
+      type: 'Feature',
+      id: 'approximate-remote-observer-zone',
+      geometry: { type: 'Polygon', coordinates: [latLonRing(remoteZone.polygon)] },
+      properties: {
+        featureType: 'remote-observer-zone',
+        label: 'Approximate remote-observer likelihood zone',
+        approximate: true,
+        method: remoteZone.method,
+        confidence: remoteZone.confidence,
+        geometryQuality: remoteZone.geometryQuality,
+        observerCount: remoteZone.observerCount,
+        observationCount: remoteZone.observationCount,
+        relativeConstraintCount: remoteZone.relativeConstraintCount,
+        areaM2: remoteZone.areaM2,
+        terrainUncertaintyDb: remoteZone.terrainUncertaintyDb,
+        contributingObservationIds: remoteZone.contributingObservationIds,
+        contributingObserverIds: remoteZone.contributingObserverIds,
+        exclusionReasons: remoteZone.exclusionReasons,
+        methodCaveat: 'Relative SNR provides a broad likelihood envelope; terrain, antennas, and fading can dominate the readings.',
+        simulatedData: input.session.demo,
+      },
+    });
+  }
+
+  if (input.communityAssistedZone?.polygon && input.communityAssistedZone.polygon.length >= 3) {
+    features.push({
+      type: 'Feature',
+      id: 'approximate-community-assisted-zone',
+      geometry: {
+        type: 'Polygon',
+        coordinates: [latLonRing(input.communityAssistedZone.polygon)],
+      },
+      properties: {
+        featureType: 'community-assisted-zone',
+        label: 'Approximate community-assisted search zone',
+        approximate: true,
+        ready: input.communityAssistedZone.ready,
+        reason: input.communityAssistedZone.reason,
+        confidence: input.communityAssistedZone.confidence,
+        disagreement: input.communityAssistedZone.disagreement === true,
+        observerCount: input.communityAssistedZone.observerCount,
+        areaM2: input.communityAssistedZone.areaM2 ?? null,
+        contributingObservationIds: input.communityAssistedZone.contributingObservationIds,
+        contributingObserverIds: input.communityAssistedZone.contributingObserverIds,
+        methodCaveat: 'This overlap remains an approximate search zone and requires close-range visual confirmation.',
+        simulatedData: input.session.demo,
+      },
+    });
+  }
+
   for (const event of input.events ?? []) {
     const observation = observationFromBearingEvent(event);
     if (!observation) continue;
@@ -226,6 +355,7 @@ export function buildGeoJson(input: GeoJsonExportInput): MeshCoreGeoJson {
   const exportedAt = input.exportedAt instanceof Date
     ? input.exportedAt.toISOString()
     : input.exportedAt ?? new Date().toISOString();
+  const importedObserverAuditCount = countImportedObserverAudit(input.events ?? []);
   return {
     type: 'FeatureCollection',
     features,
@@ -258,8 +388,136 @@ export function buildGeoJson(input: GeoJsonExportInput): MeshCoreGeoJson {
           areaM2: input.finalApproach.areaM2 ?? null,
         },
       } : {}),
+      ...(input.remoteObserverAnalysis ? {
+        remoteObservers: {
+          approximate: true,
+          ready: input.remoteObserverAnalysis.ready,
+          reason: input.remoteObserverAnalysis.reason,
+          confidence: input.remoteObserverAnalysis.zone?.confidence ?? null,
+          observerCount: input.remoteObserverAnalysis.zone?.observerCount
+            ?? input.remoteObserverAnalysis.eligibleObserverCount,
+          observationCount: input.remoteObserverAnalysis.zone?.observationCount
+            ?? input.remoteObserverAnalysis.eligibleObservationCount,
+          areaM2: input.remoteObserverAnalysis.zone?.areaM2 ?? null,
+        },
+      } : {}),
+      ...(input.communityAssistedZone ? {
+        communityAssistedZone: {
+          approximate: true,
+          ready: input.communityAssistedZone.ready,
+          reason: input.communityAssistedZone.reason,
+          confidence: input.communityAssistedZone.confidence,
+          disagreement: input.communityAssistedZone.disagreement === true,
+          observerCount: input.communityAssistedZone.observerCount,
+          areaM2: input.communityAssistedZone.areaM2 ?? null,
+        },
+      } : {}),
+      ...(importedObserverAuditCount > 0 ? {
+        importedObserverAudit: {
+          reportCount: importedObserverAuditCount,
+          analysisEligibility: 'audit-only',
+          geometryExported: false,
+        },
+      } : {}),
     },
   };
+}
+
+function countImportedObserverAudit(events: readonly SessionEvent[]): number {
+  return events.filter((event) => (
+    event.type === 'note'
+    && event.data.kind === 'imported-observer-evidence-audit'
+    && event.data.eligibility === 'audit-only'
+    && event.data.originalEventType === 'observer-evidence'
+  )).length;
+}
+
+function observerEvidenceFromEvents(
+  events: readonly SessionEvent[],
+  targetPubkeyHex: string | undefined,
+): RemoteObserverEvidence[] {
+  const reports: RemoteObserverEvidence[] = [];
+  for (const event of events) {
+    if (event.type !== 'observer-evidence') continue;
+    const data = event.data;
+    const observedAt = finiteNumber(data.observedAt);
+    const receivedAt = finiteNumber(data.receivedAt);
+    const heardSecondsAgo = finiteNumber(data.heardSecondsAgo);
+    const snr = finiteNumber(data.snr);
+    const anchorLat = finiteNumber(data.anchorLat);
+    const anchorLon = finiteNumber(data.anchorLon);
+    const anchorAccuracyM = finiteNumber(data.anchorAccuracyM);
+    const anchorVerifiedAt = finiteNumber(data.anchorVerifiedAt);
+    if (
+      typeof data.observerId !== 'string'
+      || typeof data.observerPubkeyHex !== 'string'
+      || typeof data.targetPubkeyHex !== 'string'
+      || observedAt === undefined
+      || receivedAt === undefined
+      || heardSecondsAgo === undefined
+      || snr === undefined
+      || anchorLat === undefined
+      || anchorLon === undefined
+      || anchorAccuracyM === undefined
+      || anchorVerifiedAt === undefined
+      || (data.anchorVerification !== 'user-surveyed'
+        && data.anchorVerification !== 'operator-confirmed')
+      || data.source !== 'guest-neighbour'
+      || data.trust !== 'verified-observer'
+      || targetPubkeyHex === undefined
+      || data.targetPubkeyHex.toLowerCase() !== targetPubkeyHex
+      || observedAt < 0
+      || receivedAt < 0
+      || observedAt > receivedAt
+      || heardSecondsAgo < 0
+      || Math.abs((receivedAt - observedAt) - heardSecondsAgo * 1_000) > 2_000
+      || Math.abs(event.t - receivedAt) > 30_000
+    ) continue;
+    reports.push({
+      ...(typeof data.id === 'string' ? { id: data.id } : {}),
+      observerId: data.observerId,
+      observerPubkeyHex: data.observerPubkeyHex,
+      targetPubkeyHex: data.targetPubkeyHex,
+      observedAt,
+      receivedAt,
+      heardSecondsAgo,
+      snr,
+      anchorLat,
+      anchorLon,
+      anchorAccuracyM,
+      anchorVerifiedAt,
+      anchorVerification: data.anchorVerification,
+      source: 'guest-neighbour',
+      trust: 'verified-observer',
+    });
+  }
+  return reports;
+}
+
+function validObserverReport(
+  report: RemoteObserverEvidence,
+  targetPubkeyHex: string | undefined,
+): boolean {
+  return report.trust === 'verified-observer'
+    && report.source === 'guest-neighbour'
+    && /^(?:[0-9a-f]{2}){32}$/i.test(report.observerPubkeyHex)
+    && /^(?:[0-9a-f]{2}){32}$/i.test(report.targetPubkeyHex)
+    && targetPubkeyHex !== undefined
+    && report.targetPubkeyHex.toLowerCase() === targetPubkeyHex
+    && validCoordinates(report.anchorLat, report.anchorLon)
+    && Number.isFinite(report.anchorAccuracyM)
+    && report.anchorAccuracyM >= 1
+    && Number.isFinite(report.observedAt)
+    && Number.isFinite(report.receivedAt)
+    && report.observedAt >= 0
+    && report.receivedAt >= report.observedAt
+    && Number.isFinite(report.anchorVerifiedAt)
+    && Number.isFinite(report.heardSecondsAgo)
+    && report.heardSecondsAgo >= 0
+    && Math.abs((report.receivedAt - report.observedAt) - report.heardSecondsAgo * 1_000) <= 2_000
+    && Number.isFinite(report.snr)
+    && report.snr >= -32
+    && report.snr <= 31.75;
 }
 
 function latLonRing(polygon: readonly (readonly [number, number])[]): GeoJsonPosition[] {

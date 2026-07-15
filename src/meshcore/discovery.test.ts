@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { classifyDiscovery } from './classify';
 import {
+  DISCOVERY_COOLDOWN_MS,
   DiscoveryCoordinator,
   DiscoveryCooldownError,
   buildDiscoveryCommand,
@@ -79,10 +80,69 @@ describe('discovery correlation', () => {
     expect(() => coordinator.start()).toThrow(DiscoveryCooldownError);
 
     now = 30;
+    expect(() => coordinator.start()).toThrow(DiscoveryCooldownError);
+
+    now = 10 + DISCOVERY_COOLDOWN_MS;
     const second = coordinator.start();
     const rejection = expect(second.done).rejects.toThrow('field test ended');
     coordinator.cancel('field test ended');
+    expect(second.signal.aborted).toBe(true);
     await rejection;
+  });
+
+  it('propagates cancellation to a queued transport write', async () => {
+    let releaseQueue!: () => void;
+    let transportWrites = 0;
+    let transportSignal: AbortSignal | undefined;
+    const coordinator = new DiscoveryCoordinator((_command, signal) => {
+      transportSignal = signal;
+      return new Promise<void>((resolve, reject) => {
+        releaseQueue = () => {
+          if (signal.aborted) {
+            reject(signal.reason);
+            return;
+          }
+          transportWrites += 1;
+          resolve();
+        };
+      });
+    });
+
+    const run = coordinator.start();
+    expect(transportSignal).toBe(run.signal);
+    const rejection = expect(run.done).rejects.toThrow('page hidden');
+    coordinator.cancel('page hidden');
+    releaseQueue();
+
+    expect(run.signal.aborted).toBe(true);
+    expect(transportWrites).toBe(0);
+    await rejection;
+  });
+
+  it('uses a caller signal to cancel an active run', async () => {
+    const caller = new AbortController();
+    let transportSignal: AbortSignal | undefined;
+    const coordinator = new DiscoveryCoordinator(async (_command, signal) => {
+      transportSignal = signal;
+    });
+    const run = coordinator.start(0x0f, { signal: caller.signal });
+    const rejection = expect(run.done).rejects.toThrow('visibility lost');
+
+    caller.abort(new Error('visibility lost'));
+
+    expect(transportSignal).toBe(run.signal);
+    expect(run.signal.aborted).toBe(true);
+    await rejection;
+  });
+
+  it('does not enqueue discovery when the caller signal is already aborted', () => {
+    const caller = new AbortController();
+    caller.abort(new Error('already hidden'));
+    const send = vi.fn(async () => undefined);
+    const coordinator = new DiscoveryCoordinator(send);
+
+    expect(() => coordinator.start(0x0f, { signal: caller.signal })).toThrow('already hidden');
+    expect(send).not.toHaveBeenCalled();
   });
 
   it('provides a queue matcher that leaves other frames untouched', () => {
