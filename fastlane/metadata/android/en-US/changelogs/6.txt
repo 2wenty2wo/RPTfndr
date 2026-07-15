@@ -1,9 +1,0 @@
-Version 1.2.3
-
-- 2D charts follow live data while zoomed in; tap a chart point to open that packet.
-- Chart tooltip shows millisecond time and packet type.
-- Smoother, steadier 3D-map clustering; more points shown in sparse areas.
-- Received Packets columns are ordered by recent activity.
-- CSV export shows the saved file's size.
-
-Fixed: show/hide button for collision repeaters, duplicate repeater rows on long runs, the resume prompt reliably appearing on reopen.

@@ -1,161 +1,119 @@
-# MeshCore Signal Tester
+# MeshCore Finder
 
-Web application for real-time monitoring of mesh traffic from a MeshCore **companion radio** (Bluetooth, USB, or — in the Android app — WiFi) or a MeshCore **repeater** (USB serial CLI). The connected device type is auto-detected.
+MeshCore Finder is a mobile-first, web-hosted field tool for the lawful owner of a missing MeshCore repeater. It connects to a MeshCore companion over Web Bluetooth, records received packets with RSSI/SNR and phone GPS, and highlights the strongest **confirmed search area** observed during repeated passes.
 
-### Live app: [meshcore.kyblsoft.cz/signal-tester](https://meshcore.kyblsoft.cz/signal-tester)
-#### Android app available in [repo releases](https://github.com/kybl/meshcore-signal-tester/releases).
+“Local-first” means **web-hosted, device-local data**: an HTTPS server delivers the static application, while each browser stores its own sessions in IndexedDB. It does not mean that the app is limited to `localhost` or must run from the development computer.
 
-## Features
+MeshCore Finder does **not** determine a transmitter’s exact coordinates. A single receiver’s RSSI/SNR cannot uniquely identify a location, and radio signal strength is affected by terrain, buildings, foliage, antenna orientation, transmit power, receiver behaviour, and multipath. Treat every result as a way to prioritise where to search next—not as proof, a surveyed position, or permission to enter property.
 
-- **Connection** — connects to a MeshCore companion device over **Bluetooth** (Web Bluetooth) or **USB serial** (Web Serial); previously used devices appear as one-click reconnect buttons (USB ports are labelled by vendor/product id, since serial ports expose no name). The **Android app** adds a **WiFi** option — a raw TCP link to a companion running the WiFi firmware (same frame protocol as USB serial) — which browsers can't provide; you enter the device's IP and port, and the connection is saved for one-click reconnect too
-- **Repeater support (USB)** — also connects to a MeshCore repeater, which exposes a plain-text CLI instead of the binary protocol; the device type (companion vs repeater) is auto-detected on connect. On stock firmware the app polls the packet log and neighbour table; on a `MESH_PACKET_LOGGING` build it decodes the live raw packet stream for full per-packet detail. See [Device detection](#device-detection)
-- **Packet grouping** — groups every reception by message, so you can see at a glance which repeaters forwarded the same packet and compare their signal side by side. Packets are decoded with `@michaelhart/meshcore-decoder` (type, path, last-hop repeater IDs, RSSI, SNR, payload fields) to drive the grouping and labelling
-- **Seen repeaters table** — per-repeater statistics (RX count, max/last RSSI, max/last SNR, last seen); sortable columns
-- **SNR & RSSI history charts** — scrolling time-series per repeater with noise floor estimate; click a chart dot to highlight one repeater across all views and open that packet's row in the table; hover or tap a point for a tooltip with its exact SNR/RSSI, millisecond time and packet type (and the reception count for a clustered point); **zoom and pan the time axis** (mouse wheel, drag across a region, or pinch — both charts share one time window; double-click or **Reset zoom** to restore), and while measuring a zoomed view kept at the right edge keeps following new packets
-- **Signal 3D map** — places each received packet as a dot at your GPS position; height encodes SNR (taller = higher SNR); nearby points are aggregated into clusters when zoomed out and shown individually as you zoom in; click a dot to select a repeater, turn the camera toward a repeater whose position is known, keep repeaters pinned on the map, or follow your own location as you move (**Center on me** toggles follow mode — any manual pan/rotate leaves it); while capturing live, the map keeps tiles loaded around your current position so you don't move off the map even when no packets are arriving (an imported dataset from elsewhere is left in place); map tile sources: Mapy.com (basic/outdoor/aerial/winter), OpenStreetMap and variants (OpenTopoMap, CyclOSM, Humanitarian, German, French), CARTO (Dark Matter / Positron / Voyager, each also without labels), Esri (Dark/Light Gray Canvas and World Imagery satellite), or **None** for a plain floor
-- **Discover nodes** — sends an active discovery request; nearby nodes (firmware ≥ v1.10) reply with their public key, name, GPS position, and the SNR they measured for your uplink
-- **Location capture** — every packet is geotagged with your GPS position for the 3D map. In the Android app this starts automatically once you grant the location permission while connecting (and keeps running in the background); one-off GPS outliers are filtered out so your position marker doesn't jump
-- **Received packets table** — one row per unique packet hash, one column pair (RSSI/SNR) per repeater, with columns ordered by recent activity (the most active repeaters first); click a cell to expand full packet detail with ms-precision reception time and raw hex; filterable
-- **CSV import / export** — export the captured packets to a CSV file and re-import them later to review offline (several files can be selected and imported at once, merged into one session); contact metadata is embedded so repeater names and positions survive the round-trip; export covers the full on-disk history, not just what is in memory
-- **Persistent capture** — the session is written to on-disk storage (IndexedDB) as it is captured, so it survives a page reload or app restart (you're asked whether to resume the previous session on launch), and *Auto-remove: Never* keeps the whole history without growing memory without bound. Storage is isolated per browser tab
-- **Repeater ID prefix resolution** — path IDs can arrive as 1–3-byte prefixes of full 4-byte node IDs; the app progressively promotes shorter labels to longer ones, and splits columns into collision labels (e.g. `1234/1289`) when an ID turns out to be ambiguous
-- **Pause / Resume** — suspend data collection without disconnecting; collection pauses automatically on disconnect and resumes on reconnect
-- **Sound** — optional two-note bell/chime on each new packet (off / **disconnect only** / short / medium / long); first note is a fixed 700 Hz tone, second note pitch scales with SNR (0 dB = base, ±10 dB = ±1 octave); *disconnect only* stays silent per-packet but still sounds the disconnect alarm, and any non-off setting sounds it too; when a repeater filter is active, only the filtered repeater(s) trigger sound
-- **Auto-remove** — permanently deletes captured data older than a chosen window (30 s … 12 h, or **Never** — the default); packets, signal history, Seen Repeaters and 3D-map points all expire together, and collision labels are recalculated as their evidence ages out
-- **Display window** — separate from Auto-remove: controls how far back each view (table, charts, 3D map) shows, *without* deleting anything (30 s … 12 h, or **All**); defaults to 15 min and can be set no longer than Auto-remove
-- **Repeater filter** — comma-separated prefix filter that applies to all sections simultaneously (table, charts, map)
-- **Keep screen on** — optional toggle (default on) that prevents the screen from sleeping while collecting data
-- **Device battery** — displays the connected device's battery level, derived from the voltage it reports (MeshCore battery event) — more reliable than the BLE Battery Service, which some devices misreport as a flat 100%
-- **Disconnect alarm** — a full-screen warning (and an audible alarm when Sound is enabled) when an established connection drops unexpectedly (cable unplugged, device reset, out of range); a deliberate disconnect doesn't trigger it
-- **Auto-reconnect** — optional toggle (next to the connect buttons) that, after an unexpected drop, silently retries the last device a few times before the disconnect alarm fires; shown only where a silent reconnect is possible — the Android app, or desktop Chrome/Edge, but **not** Bluetooth in a mobile browser, where every connection needs a manual device-picker confirmation
-- **Light / dark theme** — toggle in the header
-- **Text size** — UI scale selector (Small → Larger) for small or high-DPI screens
-- **Adjustable dot size** — independent controls for the 2D chart dots (header slider) and the 3D map dots (⚙ menu)
-- **Device location on the 3D map** — optionally shows the connected device's own position as a blue antenna marker (3D map ⚙ menu, off by default). A companion reports its current position — a live onboard-GPS fix if it has one, otherwise its configured advert position; a repeater reports its static configured position. Hidden when the device has no position set
+## The important safety rule
 
-## Screenshots
+Only packets whose immediate RF transmitter can be proved to be the selected target feed the finder gauge, cell aggregates, and area estimate. Target-origin packets that arrived through a forwarder, weak prefix matches, direct-route packets with an unprovable final transmitter, malformed packets, and unrelated traffic remain visible in the technical log but are excluded.
 
-<img src="docs/charts.webp" width="100%" alt="Seen Repeaters table and SNR/RSSI history charts">
+See [packet classification](docs/packet-classification.md) for the exact precedence and the deliberate difference between growing flood paths and remaining direct-route instructions.
 
-*Seen Repeaters table with per-repeater statistics, SNR history chart (incoming + outgoing ★), and RSSI history with noise floor estimate.*
+## Privacy model
 
-<img src="docs/3dmap.webp" width="100%" alt="Signal 3D map">
+- No backend, account, analytics, application telemetry, or automatic synchronisation.
+- The HTTPS server delivers static files only. Targets, sessions, raw frames, fixes, notes, classifications, and settings are stored in IndexedDB for that browser profile and web origin.
+- Opening the same hosted URL on another phone or computer does not copy the first device’s records. Use a JSON archive export/import for a deliberate manual transfer.
+- Search logs and other locally stored records leave the browser only through an export the user initiates (subject to browser/OS backup policy).
+- Opening the map requests raster tiles from OpenStreetMap; up to 300 viewed tiles may be cached for seven days. Capture and exports remain usable without a basemap.
+- JSON archives include a displayed SHA-256 digest. CSV, GeoJSON, and a human-readable technical summary are also available.
+- Coordinates advertised by a repeater or copied from a contact are treated as untrusted admin metadata. They are hidden by default and, if enabled, appear only as **Admin-configured position — unverified**; they never feed map bounds or location calculations.
+- Verified community-observer definitions, query audit events, and target-matched reports are also device-local. Observer assist is opt-in and sends radio traffic only while an authorised foreground Drive session is running.
 
-*Signal 3D map — each dot is positioned at the GPS location where the packet was received; height encodes SNR.*
+Read [privacy and safety](docs/privacy-and-safety.md) before field use.
 
-<img src="docs/packets.webp" width="100%" alt="Received Packets table with expanded packet detail">
+## Supported browsers
 
-*Received Packets table grouped by message hash; expanded row shows full decoded packet including path, payload, and GPS position.*
+| Platform | Capture support | Notes |
+| --- | --- | --- |
+| iPhone / iPad | Bluefy | Open the deployed HTTPS URL inside Bluefy. Keep the app visible. |
+| Android | Chromium-based browser with Web Bluetooth | Chrome is the primary tested route. |
+| Desktop | Chrome / Edge with Web Bluetooth | Useful for development and companion testing. |
+| Safari / Firefox | Review only | Import, inspect, demo, and export work; Bluetooth capture does not. |
 
-## Requirements
+Web Bluetooth requires HTTPS (localhost is allowed for development), a user gesture for the device picker, Bluetooth permission, and location permission for GPS association. See [iOS and Bluefy field testing](docs/ios-bluefy-testing.md) and [the BLE protocol notes](docs/meshcore-ble.md).
 
-- **Bluetooth** needs a Chromium browser (Chrome, Edge, or Opera) — Web Bluetooth isn't available in Firefox or Safari
-- **USB serial** works in those Chromium browsers and, since **Firefox 151** (desktop, 2026), in Firefox too — both ship the Web Serial API
-- Page must be served over **HTTPS or localhost**
+## Typical field workflow
 
-## How to use
+1. Open the app and acknowledge the lawful-use, privacy, and estimation limitations.
+2. Connect a MeshCore/Meshtastic companion radio.
+3. Choose a repeater contact or enter its full 32-byte public key / 4-byte node ID. Shorter prefixes can never create confirmed samples.
+4. Start in **drive mode** for broad, passenger-operated coverage. Never handle the app while driving.
+5. Optionally configure **Smart Wardrive**. Automatic repeater discovery and community observer polling are separate opt-ins with conservative minimum intervals. Both stop when the page is hidden, Bluetooth disconnects, or the Drive session ends.
+6. Make separated passes. Look for a repeatable cluster of confirmed direct receptions, not one peak.
+7. Change to **walk mode** near the strongest confirmed search area and approach from several directions.
+8. Near the search area, record manual directional-antenna bearings from separated locations. Two eligible bearings are the minimum; three or more are recommended.
+9. Treat every shaded overlap as approximate. Poor geometry, GPS error, angular uncertainty, propagation, and multipath can move or enlarge it, and disagreement is reported rather than concealed.
+10. Search the final area at close range and visually confirm the physical equipment.
+11. Export the technical search log before deleting local data or copying an ended log to another device for review. Imported sessions remain ended; start a new local session for further capture.
 
-1. Serve the directory over HTTPS or open `index.html` via `localhost`
-2. Click **Connect Bluetooth** (wireless) or **Connect USB** (wired serial) — or, in the Android app, **Connect WiFi** (raw TCP to a WiFi companion) — and select your MeshCore device — a companion radio, or (over USB) a repeater; the type is auto-detected (see [Device detection](#device-detection))
-3. Packet data appears automatically as the device receives mesh traffic
+The gauge shows relative, session-calibrated signal—not distance. “100%” means strong relative to the configured/session range, not “at the repeater.” Details are in [location estimation](docs/location-estimation.md).
 
-## Android app
+## Smart Wardrive and community observers
 
-A native Android wrapper is available for field use — see [`android/`](android/README.md).
+Smart Wardrive automates the parts a browser and companion can do safely: passive reception capture continues as before, repeater-only discovery pulses share a hard 60-second minimum interval with manual discovery, and enabled community observers can be polled no more often than every 5–60 minutes. It requires a real Drive session, a visible page, a fully restored companion protocol, and a connected companion; observer polling additionally requires the target's full 32-byte public key. Queued automation writes are cancelled before transmission when those prerequisites are lost. It is not background tracking; phone locking and browser suspension stop it.
 
-The key benefit over a browser tab: the radio link (Bluetooth, USB, or WiFi) and GPS run in a **native foreground service**, so data collection keeps going with the screen off or the app in the background. A browser tab suspends and drops the connection when the screen turns off; the Android app doesn't.
+Community observer assist is deliberately manual to configure and automatic only after configuration. For each stationary repeater you must enter an independently surveyed or operator-confirmed position and confirm permission to query it. Do not copy its advert/contact coordinates: those remain untrusted and can never become an observer anchor automatically. The app sends only MeshCore's documented blank-password guest login; there is no password field, storage, retry guessing, or administrative command path. A rejected or failed login is not retried until the Bluetooth connection is re-established.
 
-The Android app also adds a **WiFi** connection option — a raw TCP link to a companion running the WiFi firmware — which a browser can't provide, since browsers have no raw-socket API.
+After a successful guest login, the app requests a bounded, newest-first neighbour list with full 32-byte keys and retains only a record matching the selected target's full key. Each cycle visits at most three observers in round-robin order and eight neighbour pages overall; anchors worse than 250 m are audit-only and are not polled. Two fresh, separated observers are the minimum and three or more are recommended. Their relative SNR ordering produces a broad likelihood envelope—it is never converted into range. The app can shade its overlap with the local confirmed-signal or directional-bearing zone, but displays a disagreement warning when the inputs do not overlap.
 
-APK releases are published on [GitHub](https://github.com/kybl/meshcore-signal-tester/releases).
+## Demo and replay
 
-**iOS:** There is no iOS version. This is a hobby project and the author doesn't own an iOS device to build or test on.
+Choose **Open demo scenario** on the connection screen to use the app without hardware. Demo sessions are structurally separate from real capture, persistently marked **SIMULATED DATA**, and stamped in every export. Replay supports normal, 2×, 10×, and maximum speed for deterministic testing. See [testing with replay](docs/testing-with-replay.md).
 
-## File structure
+## Development
 
-| File | Description |
-|------|-------------|
-| `index.html` | Main page |
-| `style.css` | Styles |
-| `app.js` | Application logic (Bluetooth, decoding, rendering) |
-| `signal3d.js` | Three.js-based 3D signal map |
-| `native-bridge.js` | No-op on the web; bridges Bluetooth, USB serial, WiFi (TCP) and Geolocation to native code inside the Android app |
-| `vendor/` | Locally bundled JS deps (three.js, MapControls, meshcore-decoder) so the app runs fully offline |
-| `android/` | Native Android wrapper for background (screen-off) capture |
+Requirements: Node.js 22.12+ and npm 10+.
 
-## Transport protocols
+```sh
+npm ci
+npm run dev
+```
 
-All three transports carry the same MeshCore companion command/response frames; only how each frame is delimited differs.
+Quality gates:
 
-### Bluetooth — Nordic UART Service (NUS)
+```sh
+npm run typecheck
+npm run lint
+npm test
+npm run build
+npm run test:hosting
+npm run test:e2e
+```
 
-| Role | UUID |
-|------|------|
-| Service | `6e400001-b5a3-f393-e0a9-e50e24dcca9e` |
-| Write (app → device) | `6e400002-b5a3-f393-e0a9-e50e24dcca9e` |
-| Notify (device → app) | `6e400003-b5a3-f393-e0a9-e50e24dcca9e` |
+The production output is `dist/`. `test:hosting` builds and inspects both root and configured-subpath PWA variants. Playwright starts `vite preview` on port 4173 and runs both desktop Chromium and Pixel 7 emulation. Unit tests use Vitest, jsdom, and fake-indexeddb.
 
-Each BLE notification (and each write) carries exactly one complete frame — no extra framing.
+## Static deployment
 
-### USB — Web Serial
+The app is a static PWA and may be hosted on any ordinary HTTPS web server. `BASE_PATH` may be set for a subdirectory; it keeps built assets, the manifest, and the service worker under the intended deployment path. The hash router avoids server-side SPA rewrite requirements.
 
-Opened at **115200 baud**. The byte stream is split into frames with a 3-byte header:
+```sh
+BASE_PATH=/RPTfndr/ npm run build
+```
 
-| Byte | Meaning |
-|------|---------|
-| 0 | Frame type — `0x3c` (`<`) app → radio, `0x3e` (`>`) radio → app |
-| 1–2 | Payload length, unsigned 16-bit little-endian |
-| 3… | Payload (the same frame body sent over BLE) |
+On PowerShell:
 
-The app accumulates incoming bytes and extracts complete frames as they arrive, resynchronising past any unexpected bytes. This matches the framing used by [`meshcore.js`](https://github.com/meshcore-dev/meshcore.js) and the official MeshCore web app.
+```powershell
+$env:BASE_PATH='/RPTfndr/'; npm run build
+```
 
-### WiFi — raw TCP (Android app only)
+Serve `dist/` over HTTPS. The service worker caches the application for resilient field use, but it does not upload or synchronise IndexedDB records. See [deployment](docs/deployment.md) for root/subdirectory builds, service-worker scope, origin-scoped storage, update behaviour, and the field checklist.
 
-A companion running the WiFi firmware listens on a TCP port and speaks the **exact same `0x3c`/`0x3e` + 16-bit-length framing as USB serial**, so the app reuses its serial frame parser unchanged. Browsers can't open raw TCP sockets, so this transport exists only in the native Android wrapper: native code opens the socket and bridges the byte stream to the web layer. You enter the device's IP and port (the port is whatever the WiFi firmware build is configured for). This mirrors how the official cross-platform MeshCore app reaches a WiFi companion.
+## Design and protocol documentation
 
-### Common command flow
+- [MeshCore BLE companion protocol](docs/meshcore-ble.md)
+- [Packet classification](docs/packet-classification.md)
+- [Location estimation](docs/location-estimation.md)
+- [iOS / Bluefy testing](docs/ios-bluefy-testing.md)
+- [Privacy and safety](docs/privacy-and-safety.md)
+- [Replay testing](docs/testing-with-replay.md)
+- [Deployment](docs/deployment.md)
 
-On connect the app sends `CMD_APP_START` (opcode `0x01`) to enable push notifications. The device then sends LoRa RX events (opcodes `0x84`, `0x88`, `0x8e`) carrying SNR, RSSI, and a raw LoRa payload, plus battery voltage events (opcode `0x0c`).
+## Upstream and licence
 
-## Device detection
+MeshCore Finder replaces the application in a fork of [kybl/meshcore-signal-tester](https://github.com/kybl/meshcore-signal-tester). The companion protocol handling, GPS filtering, spatial indexing patterns, CSV rules, audio cues, and other proven behaviours were ported and substantially reworked in strict TypeScript. Upstream attribution is preserved in [NOTICE](NOTICE) and git history.
 
-The app supports two kinds of MeshCore device and figures out which one is attached without the user choosing.
-
-### Companion vs. repeater
-
-| | Companion radio | Repeater |
-|---|---|---|
-| Protocol | Binary companion frames | Plain-text CLI |
-| Bluetooth | ✅ (always assumed) | ❌ |
-| WiFi (TCP) | ✅ (always assumed, Android app only) | ❌ |
-| USB serial | ✅ *if* the firmware has USB support (many companion builds are Bluetooth-only) | ✅ |
-| Data model | Device pushes every RX packet, fully decoded (path, last hop, SNR, RSSI) | App pulls data over the CLI; detail depends on firmware (see below) |
-
-Over **Bluetooth** — and over **WiFi** in the Android app — the device is always treated as a companion (a repeater offers neither transport). Over **USB** the app probes the freshly opened port (115200 baud) in three phases:
-
-1. **Companion probe** — sends `CMD_APP_START` (`0x01`) and a contacts request (`CMD_GET_CONTACTS`, `0x04`). A companion answers with a `0x3e` (radio→app) frame → connect as companion.
-2. **Repeater probe** — if no frame arrives, switch the read loop to text mode and send `ver`. A repeater replies over its CLI → connect as repeater.
-3. **Neither** — report an unsupported device. The common cause is a companion plugged in by USB whose firmware speaks the protocol over Bluetooth only.
-
-### Repeater firmware: stock vs. logging build
-
-A repeater is polled over its CLI, and how much it can report depends on how the firmware was compiled:
-
-- **Stock firmware** — the app polls the packet-log file (`log start`, then `log` every 2.5 s, `log erase` on the `EOF` marker) and the neighbour table (`neighbors` every 5 s). Log summary lines carry SNR, RSSI and the route (direct/flood) but **not the last hop's identity** — a flood line names the packet origin, not the node actually heard. Those packets are bucketed into two pseudo-columns rather than a real repeater ID:
-  - **direct** — heard at the first hop (no intermediate repeater)
-  - **unknown** — forwarded, but the last hop can't be identified
-
-  The neighbour table is the only source of per-node signal here, and only yields SNR (no RSSI), only for direct neighbours, at a slow cadence. **Discover nodes** sends `discover.neighbors` to refresh it on demand.
-- **Logging build (`MESH_PACKET_LOGGING`)** — the repeater streams every received packet live as a raw hex dump (`U RAW: …`) plus a summary line. The app decodes the raw dump for the full path — recovering the **real last-hop repeater ID** — and pairs it with the summary line for SNR/RSSI, giving companion-grade detail. The first raw dump switches the app into this mode, after which it stops polling the now-redundant log file (which would otherwise duplicate every packet). This is the recommended firmware for a repeater used as a measurement node.
-
-## References
-
-- [MeshCore Decoder](https://github.com/michaelhart/meshcore-decoder) — TypeScript library for packet decoding
-- [Web Bluetooth API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Bluetooth_API) — MDN documentation
-- [Web Serial API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API) — MDN documentation
-- [Nordic UART Service](https://nrfconnectdocs.nordicsemi.com/ncs/latest/nrf/libraries/bluetooth/services/nus.html) — NUS specification
-- [meshcore.js](https://github.com/meshcore-dev/meshcore.js) — reference JS client (BLE / serial / TCP transports)
-
-## Author
-
-Created by **[Aleš Janda](https://alesjanda.cz)** with the help of [Claude Code](https://claude.ai/code). Feedback, bug reports, and questions are welcome at [ales.janda@kyblsoft.cz](mailto:ales.janda@kyblsoft.cz) or via [GitHub Issues](https://github.com/kybl/meshcore-signal-tester/issues).
+The project is licensed under the MIT licence. See [LICENSE](LICENSE).
