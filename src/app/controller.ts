@@ -30,6 +30,7 @@ import {
   targetBytes,
   type CompanionFrame,
   type DeviceSnapshot,
+  type DiscoveryResponseFrame,
 } from '../meshcore';
 import { SessionRecorder, type RecorderSnapshot } from '../session';
 import {
@@ -69,6 +70,13 @@ import type {
 } from '../types';
 import { DEFAULT_SESSION_SETTINGS } from '../types';
 import { SmartWardriveScheduler } from './smartWardrive';
+import {
+  candidateFromDiscoveryResponse,
+  normalizeObserverCandidates,
+  upsertObserverCandidates,
+  type ObserverCandidate,
+  type ObserverCandidateInput,
+} from './observerCandidates';
 
 export type ExportKind = 'json' | 'csv' | 'geojson' | 'summary';
 
@@ -300,6 +308,7 @@ const ACTIVE_TARGET_SETTING = 'active-target';
 const SESSION_SETTINGS_SETTING = 'session-settings';
 const SHOW_UNTRUSTED_ADMIN_POSITION_SETTING = 'show-untrusted-admin-position';
 const VERIFIED_OBSERVERS_SETTING = 'verified-observers-v1';
+const OBSERVER_CANDIDATES_SETTING = 'observer-candidates-v1';
 const MIN_OBSERVER_POLL_INTERVAL_MS = 5 * 60_000;
 const REMOTE_OBSERVER_MAX_AGE_MS = 5 * 60_000;
 const MAX_OBSERVER_ANCHOR_ACCURACY_M = 250;
@@ -538,7 +547,7 @@ export class AppController {
     });
     this.repository = new FinderRepository(this.#database);
     this.#lease = await acquireWriterLock();
-    const [acknowledged, targets, sessions, resumeCandidates, activeTargetId, savedSettings, showUntrustedAdminPosition, savedObservers] = await Promise.all([
+    const [acknowledged, targets, sessions, resumeCandidates, activeTargetId, savedSettings, showUntrustedAdminPosition, savedObservers, savedObserverCandidates] = await Promise.all([
       this.repository.getSetting<boolean>(ACK_SETTING),
       this.repository.listTargets(),
       this.repository.listSessions(),
@@ -547,6 +556,7 @@ export class AppController {
       this.repository.getSetting<Partial<SessionSettings>>(SESSION_SETTINGS_SETTING),
       this.repository.getSetting<boolean>(SHOW_UNTRUSTED_ADMIN_POSITION_SETTING),
       this.repository.getSetting<unknown>(VERIFIED_OBSERVERS_SETTING),
+      this.repository.getSetting<unknown>(OBSERVER_CANDIDATES_SETTING),
     ]);
     const preferences = resolvePreferences(savedSettings);
     this.configureAudio(preferences);
@@ -577,6 +587,7 @@ export class AppController {
       preferences,
       showUntrustedAdminPosition: showUntrustedAdminPosition === true,
       observers: normalizeObservers(savedObservers),
+      observerCandidates: normalizeObserverCandidates(savedObserverCandidates),
     });
     if (!this.#lease.acquired) {
       this.notice('warning', 'Another MeshCore Finder tab holds the writer lock. This tab is read-only.');
@@ -1044,6 +1055,7 @@ export class AppController {
     try {
       await this.appendSessionEvent('discovery-cmd', { tag: run.tag, trigger, filterMask: 0x04 });
       const result = await run.done;
+      if (trigger === 'automatic') await this.recordObserverCandidatesFromDiscovery(result.responses, result.endedAt);
       if (trigger === 'manual') {
         this.notice('info', `Discovery window complete: ${result.responses.length} response${result.responses.length === 1 ? '' : 's'}.`);
       }
@@ -1179,6 +1191,51 @@ export class AppController {
     }
     this.syncSmartWardrive();
     this.notice('success', 'Settings saved. Automation changes apply now; aggregation changes apply to the next session.');
+  }
+
+
+  async reviewObserverCandidate(id: string): Promise<void> {
+    this.requireWriter();
+    this.requireRepository();
+    const now = Date.now();
+    const candidates = this.store.value.observerCandidates.map((candidate) => (
+      candidate.id === id ? { ...candidate, reviewed: true, updatedAt: now } : candidate
+    ));
+    if (!candidates.some((candidate) => candidate.id === id)) throw new Error('Observer candidate not found.');
+    await this.repository.setSetting(OBSERVER_CANDIDATES_SETTING, candidates);
+    this.store.set({ observerCandidates: candidates });
+  }
+
+  async authoriseObserverCandidate(id: string): Promise<void> {
+    this.requireWriter();
+    this.requireRepository();
+    const candidate = this.store.value.observerCandidates.find((item) => item.id === id);
+    if (!candidate) throw new Error('Observer candidate not found.');
+    const confirmed = typeof confirm === 'function'
+      ? confirm(`Mark ${candidate.displayName} as authorised only for setup review? You must still enter independently verified coordinates before observer assist can use it.`)
+      : true;
+    if (!confirmed) return;
+    const now = Date.now();
+    const candidates = this.store.value.observerCandidates.map((item) => (
+      item.id === id ? { ...item, reviewed: true, authorised: true, updatedAt: now } : item
+    ));
+    await this.repository.setSetting(OBSERVER_CANDIDATES_SETTING, candidates);
+    this.store.set({ observerCandidates: candidates });
+  }
+
+  async setObserverCandidateAssist(id: string, enabled: boolean): Promise<void> {
+    this.requireWriter();
+    this.requireRepository();
+    const now = Date.now();
+    const candidates = this.store.value.observerCandidates.map((candidate) => (
+      candidate.id === id ? { ...candidate, observerAssistEnabled: enabled, updatedAt: now } : candidate
+    ));
+    if (!candidates.some((candidate) => candidate.id === id)) throw new Error('Observer candidate not found.');
+    await this.repository.setSetting(OBSERVER_CANDIDATES_SETTING, candidates);
+    this.store.set({ observerCandidates: candidates });
+    this.notice('info', enabled
+      ? 'Candidate flagged for observer-assist setup. It will not be polled until saved as a verified observer with independent coordinates.'
+      : 'Candidate observer-assist setup disabled.');
   }
 
   async saveObserver(input: {
@@ -1767,6 +1824,44 @@ export class AppController {
     }
   }
 
+
+  private async recordObserverCandidatesFromDiscovery(responses: readonly DiscoveryResponseFrame[], heardAt: number): Promise<void> {
+    this.requireRepository();
+    const inputs: ObserverCandidateInput[] = [];
+    for (const response of responses) {
+      const metadata = this.discoveryCandidateMetadata(response.pubkeyHex, heardAt);
+      const candidate = candidateFromDiscoveryResponse(response, heardAt, metadata);
+      if (candidate) inputs.push(candidate);
+    }
+    if (!inputs.length) return;
+    const observerCandidates = upsertObserverCandidates(this.store.value.observerCandidates, inputs);
+    await this.repository.setSetting(OBSERVER_CANDIDATES_SETTING, observerCandidates);
+    this.store.set({ observerCandidates });
+  }
+
+  private discoveryCandidateMetadata(pubkeyHex: string, heardAt: number): { displayName?: string; advertisedCoordinates?: Omit<NonNullable<ObserverCandidate['advertisedCoordinates']>, 'status'> } {
+    const pubkey = normalizeFullPubkey(pubkeyHex);
+    const contact = this.store.value.targets.find((target) => normalizeFullPubkey(target.identity.pubkeyHex) === pubkey && target.source === 'contacts');
+    const advertReception = [...this.store.value.receptions].reverse().find((reception) => {
+      const advert = reception.decoded?.advert;
+      return advert !== undefined && normalizeFullPubkey(advert.pubkeyHex) === pubkey && advert.hasLocation && validAdvertisedPosition(advert.lat, advert.lon);
+    });
+    const advert = advertReception?.decoded?.advert;
+    if (advert?.lat !== undefined && advert.lon !== undefined) {
+      return {
+        displayName: advert.name ?? contact?.label,
+        advertisedCoordinates: { lat: advert.lat, lon: advert.lon, source: 'advert', observedAt: advertReception?.t ?? heardAt },
+      };
+    }
+    const reference = contact?.advertisedReference;
+    return {
+      displayName: contact?.label,
+      advertisedCoordinates: reference
+        ? { lat: reference.lat, lon: reference.lon, source: reference.source, observedAt: reference.observedAt }
+        : undefined,
+    };
+  }
+
   private async cleanupTransport(): Promise<void> {
     this.#protocolReady = false;
     this.stopSmartWardrive('Radio disconnected.');
@@ -1902,6 +1997,9 @@ export class AppController {
   ): Promise<void> {
     let remainingPageBudget = MAX_OBSERVER_PAGES_PER_POLL;
     for (const observer of observers) {
+      if (observer.trust !== 'verified-observer') {
+        throw new Error('Observer candidates cannot be used directly for polling; save an independently verified observer first.');
+      }
       if (remainingPageBudget <= 0) break;
       this.assertObserverPollContext(generation, sessionId, targetPubkeyHex, coordinator, observer);
       const attemptedAt = Date.now();

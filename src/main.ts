@@ -233,6 +233,25 @@ async function runAction(button: HTMLElement, action: string): Promise<void> {
     case 'delete-observer':
       await controller.deleteObserver(button.dataset.id ?? '');
       break;
+    case 'review-observer-candidate':
+      await controller.reviewObserverCandidate(button.dataset.id ?? '');
+      break;
+    case 'authorise-observer-candidate':
+      await controller.authoriseObserverCandidate(button.dataset.id ?? '');
+      break;
+    case 'toggle-observer-candidate-assist':
+      await controller.setObserverCandidateAssist(button.dataset.id ?? '', button.dataset.enabled === 'true');
+      break;
+    case 'copy-observer-candidate': {
+      const form = root.querySelector<HTMLFormElement>('[data-form="observer"]');
+      const pubkey = form?.querySelector<HTMLInputElement>('[name="pubkey"]');
+      if (pubkey) pubkey.value = button.dataset.pubkey ?? '';
+      const label = form?.querySelector<HTMLInputElement>('[name="label"]');
+      if (label) label.value = button.dataset.label ?? '';
+      form?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      controller.notice('info', 'Candidate public key copied. Enter independently verified coordinates before saving.');
+      break;
+    }
   }
 }
 
