@@ -243,13 +243,13 @@ async function runAction(button: HTMLElement, action: string): Promise<void> {
       await controller.setObserverCandidateAssist(button.dataset.id ?? '', button.dataset.enabled === 'true');
       break;
     case 'copy-observer-candidate': {
+      controller.notice('info', 'Candidate public key copied. Enter independently verified coordinates before saving.');
       const form = root.querySelector<HTMLFormElement>('[data-form="observer"]');
       const pubkey = form?.querySelector<HTMLInputElement>('[name="pubkey"]');
       if (pubkey) pubkey.value = button.dataset.pubkey ?? '';
       const label = form?.querySelector<HTMLInputElement>('[name="label"]');
       if (label) label.value = button.dataset.label ?? '';
       form?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      controller.notice('info', 'Candidate public key copied. Enter independently verified coordinates before saving.');
       break;
     }
   }
