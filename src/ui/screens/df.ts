@@ -1,5 +1,5 @@
 import type { AppState } from '../../app/store';
-import { observationFromBearingEvent } from '../../location';
+import { observationFromBearingEvent, recommendNextObservations } from '../../location';
 import { escapeHtml } from '../components';
 
 function formatArea(areaM2: number | undefined): string {
@@ -18,6 +18,16 @@ export function dfScreen(state: Readonly<AppState>): string {
   const finalApproach = state.finalApproach;
   const assisted = state.communityAssistedZone;
   const remote = state.remoteObserverAnalysis;
+  const nextActions = recommendNextObservations({
+    estimate: state.estimate,
+    finalApproach,
+    bearingAnalysis: analysis,
+    remoteObserverAnalysis: remote,
+    observers: state.observers,
+    observerStatuses: state.observerStatuses,
+    recentGpsTrack: state.fixes.slice(-80),
+    maxActions: 4,
+  });
   const exclusions = analysis?.exclusions ?? [];
   const statusClass = finalApproach?.ready
     ? 'good'
@@ -48,6 +58,10 @@ export function dfScreen(state: Readonly<AppState>): string {
         ${!consensus && state.estimate?.ready ? '<p class="muted">Directional bearings are not ready. Continue using the RSSI-only strongest confirmed search area as lower-precision proximity guidance.</p>' : ''}
         <p class="${assisted?.disagreement ? 'warning-text' : 'fine-print'}"><strong>Community assist:</strong> ${escapeHtml(assisted?.reason ?? remote?.reason ?? 'No eligible remote-observer evidence yet.')}</p>
         <a class="button" href="#/map">View shaded zones</a>
+      </article>
+      <article class="card stack">
+        <div class="row"><div><h2>Next observation guidance</h2><p class="muted">Rule-based and explainable; no AI service is used for recommendations.</p></div><span class="status-pill">${nextActions.length} ranked</span></div>
+        ${nextActions.length ? `<ol class="muted next-actions">${nextActions.map((action) => `<li><strong>${escapeHtml(action.title)}</strong><p>${escapeHtml(action.detail)}</p><p class="fine-print">Why: ${action.evidence.map(escapeHtml).join(' · ')}${action.observerId ? ` · observer ${escapeHtml(action.observerId)}` : ''}${action.target ? ` · target ${action.target.lat.toFixed(5)}, ${action.target.lon.toFixed(5)}` : ''}</p></li>`).join('')}</ol>` : '<p class="muted">No next-step guidance is available yet.</p>'}
       </article>
     </div>
     <div class="grid two" style="margin-top:.85rem">
