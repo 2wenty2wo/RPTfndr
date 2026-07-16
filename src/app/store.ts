@@ -9,6 +9,7 @@ import type {
 } from '../location';
 import type { AreaEstimate, CellAggregate, ConnState, GpsFix, Reception, RemoteObserverEvidence, SearchSession, SessionEvent, SessionSettings, TargetProfile, VerifiedObserver } from '../types';
 import type { SmartWardriveSnapshot } from './smartWardrive';
+import type { ObserverCandidate } from './observerCandidates';
 
 export interface Notice {
   id: string;
@@ -52,6 +53,7 @@ export interface AppState {
   preferences: SessionSettings;
   showUntrustedAdminPosition: boolean;
   observers: VerifiedObserver[];
+  observerCandidates: ObserverCandidate[];
   observerEvidence: RemoteObserverEvidence[];
   remoteObserverAnalysis?: RemoteObserverAnalysis;
   communityAssistedZone?: RemoteObserverCombinedZone;
@@ -107,6 +109,7 @@ export const initialAppState: AppState = {
   preferences: { ...DEFAULT_SESSION_SETTINGS },
   showUntrustedAdminPosition: false,
   observers: [],
+  observerCandidates: [],
   observerEvidence: [],
   observerStatuses: [],
   smartWardrive: {
