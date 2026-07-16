@@ -40,13 +40,13 @@ jobs:
       - name: Test
         run: npm test
 
+      - name: Verify hosted build
+        run: npm run test:hosting
+
       - name: Build
         run: npm run build
         env:
           BASE_PATH: ${{ vars.BASE_PATH }}
-
-      - name: Verify hosted build
-        run: npm run test:hosting
 
       - name: Deploy dist over FTP
         uses: SamKirkland/FTP-Deploy-Action@v4.4.0
