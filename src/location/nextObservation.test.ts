@@ -117,6 +117,61 @@ describe('next observation guidance', () => {
     expect(actions[0]).toMatchObject({ kind: 'poll-verified-observer', observerId: 'ridge' });
   });
 
+
+  it('treats live remote relative-signal conflicts as disagreement even with a retained zone', () => {
+    const remoteObserverAnalysis: RemoteObserverAnalysis = {
+      ready: true,
+      reason: 'Approximate remote-observer likelihood zone; terrain and antenna effects can dominate SNR.',
+      eligibleObserverCount: 3,
+      eligibleObservationCount: 3,
+      exclusions: [{ reason: 'inconsistent-relative-signal', observationIds: ['r1', 'r2'], observerIds: ['ridge'], detail: 'Relative SNR constraints conflicted.' }],
+      zone: {
+        polygon: [[0, 0], [0, 0.002], [0.002, 0.002], [0.002, 0]],
+        areaM2: 40_000,
+        confidence: 'low',
+        geometryQuality: 'fair',
+        observerCount: 3,
+        observationCount: 3,
+        relativeConstraintCount: 0,
+        contributingObservationIds: ['r1', 'r2', 'r3'],
+        contributingObserverIds: ['ridge', 'valley', 'summit'],
+        exclusionReasons: [{ reason: 'inconsistent-relative-signal', observationIds: ['r1', 'r2'], observerIds: ['ridge'], detail: 'Relative SNR constraints conflicted.' }],
+        terrainUncertaintyDb: 12,
+        generatedAt: 1,
+        approximate: true,
+        method: 'relative-snr-envelope',
+      },
+    };
+    const actions = recommendNextObservations({
+      estimate: estimate(),
+      remoteObserverAnalysis,
+      observers: [observer],
+      observerStatuses: [{ observerId: 'ridge', state: 'idle' }],
+    });
+    expect(actions[0]).toMatchObject({ kind: 'poll-verified-observer', score: 90 });
+  });
+
+  it('does not target audit-only observers that are too inaccurate for polling', () => {
+    const remoteObserverAnalysis: RemoteObserverAnalysis = {
+      ready: false,
+      reason: 'Remote observer evidence is incomplete.',
+      eligibleObserverCount: 1,
+      eligibleObservationCount: 1,
+      exclusions: [],
+    };
+    const auditOnlyObserver: VerifiedObserver = { ...observer, accuracyM: 300 };
+    const actions = recommendNextObservations({
+      estimate: estimate(),
+      remoteObserverAnalysis,
+      observers: [auditOnlyObserver],
+      observerStatuses: [{ observerId: 'ridge', state: 'idle' }],
+    });
+    const pollAction = actions.find((action) => action.kind === 'poll-verified-observer');
+    expect(pollAction).toBeDefined();
+    expect(pollAction?.observerId).toBeUndefined();
+    expect(pollAction?.target).toBeUndefined();
+  });
+
   it('suggests close-range visual search when the final zone is small and consistent', () => {
     const finalApproach: FinalApproachEstimate = {
       ready: true,

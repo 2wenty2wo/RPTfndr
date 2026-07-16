@@ -4,6 +4,8 @@ import type { BearingConsensusAnalysis, BearingExclusion, FinalApproachEstimate 
 import { distanceMeters, type LatLon } from './geo';
 import type { RemoteObserverAnalysis, RemoteObserverExclusion } from './remoteObservers';
 
+const MAX_OBSERVER_ANCHOR_ACCURACY_M = 250;
+
 export type NextObservationActionKind =
   | 'collect-confirmed-samples'
   | 'take-separated-bearing'
@@ -130,11 +132,11 @@ export function recommendNextObservations(input: NextObservationInput): NextObse
     });
   }
 
-  const disagreement = finalApproach?.disagreement || remote?.zone === undefined && hasReason(remoteExclusions, 'inconsistent-relative-signal');
+  const disagreement = Boolean(finalApproach?.disagreement || hasReason(remoteExclusions, 'inconsistent-relative-signal'));
   if (remote && (!remote.ready || disagreement || remote.eligibleObserverCount > 0)) {
     const byId = new Map(input.observerStatuses?.map((status) => [status.observerId, status]));
     const observer = (input.observers ?? [])
-      .filter((candidate) => candidate.enabled && candidate.permissionConfirmed)
+      .filter((candidate) => candidate.enabled && candidate.permissionConfirmed && candidate.accuracyM <= MAX_OBSERVER_ANCHOR_ACCURACY_M)
       .map((candidate) => ({ candidate, priority: statusPriority(byId.get(candidate.id)) }))
       .sort((a, b) => b.priority - a.priority)[0]?.candidate;
     actions.push({
