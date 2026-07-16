@@ -15,16 +15,29 @@ npm run build
 npm run test:hosting
 ```
 
-`dist/` is the deployable directory. Preview exactly that output with `npm run preview`.
+`dist/` is the only deployable directory. Preview exactly that output with `npm run preview`.
 
-For a root deployment, the default relative base is suitable. For a subdirectory, set the public base before building, including both leading and trailing slashes:
+For a root-domain deployment such as `https://rptfndr.2wenty2wo.com/`, build with the default base:
 
-```powershell
-$env:BASE_PATH='/RPTfndr/'
+```sh
 npm run build
 ```
 
-The example produces URLs and service-worker scope beneath `/RPTfndr/`. Rebuild with the real public path whenever that path changes. The app uses a hash router, so a static host does not need SPA rewrite rules. Do not add a Mapy or other private API key; the included tile endpoints require none.
+For a subdirectory deployment, set the public base before building, including both leading and trailing slashes:
+
+```sh
+BASE_PATH=/RPTfndr/ npm run build
+```
+
+On PowerShell:
+
+```powershell
+$env:BASE_PATH='/RPTfndr/'; npm run build
+```
+
+Upload the contents of `dist/` to the web server document root or configured publish directory. Do not upload `src/`, `node_modules/`, the repo-root `index.html`, or other source-tree files as the live site. After publishing, view the hosted page source and confirm it references built files under `assets/`, not `/src/main.ts`.
+
+The subdirectory example produces URLs and service-worker scope beneath `/RPTfndr/`. Rebuild with the real public path whenever that path changes. The app uses a hash router, so a static host does not need SPA rewrite rules. Do not add a Mapy or other private API key; the included tile endpoints require none.
 
 
 ## GitHub Actions FTP deployment

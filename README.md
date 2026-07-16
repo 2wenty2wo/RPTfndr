@@ -88,7 +88,7 @@ The production output is `dist/`. `test:hosting` builds and inspects both root a
 
 ## Static deployment
 
-The app is a static PWA and may be hosted on any ordinary HTTPS web server. `BASE_PATH` may be set for a subdirectory; it keeps built assets, the manifest, and the service worker under the intended deployment path. The hash router avoids server-side SPA rewrite requirements.
+The app is a static PWA and may be hosted on any ordinary HTTPS web server. Run `npm run build` for a root-domain deployment such as `https://rptfndr.2wenty2wo.com/`. `BASE_PATH` may be set for a subdirectory; it keeps built assets, the manifest, and the service worker under the intended deployment path. The hash router avoids server-side SPA rewrite requirements.
 
 ```sh
 BASE_PATH=/RPTfndr/ npm run build
@@ -100,7 +100,7 @@ On PowerShell:
 $env:BASE_PATH='/RPTfndr/'; npm run build
 ```
 
-Serve `dist/` over HTTPS. The service worker caches the application for resilient field use, but it does not upload or synchronise IndexedDB records. See [deployment](docs/deployment.md) for root/subdirectory builds, service-worker scope, origin-scoped storage, update behaviour, and the field checklist.
+Serve only the contents of `dist/` over HTTPS. Do not publish `src/`, `node_modules/`, the repo-root `index.html`, or other source-tree files as the live site; the hosted page source should reference built files under `assets/`, not `/src/main.ts`. The service worker caches the application for resilient field use, but it does not upload or synchronise IndexedDB records. See [deployment](docs/deployment.md) for root/subdirectory builds, service-worker scope, origin-scoped storage, update behaviour, and the field checklist.
 
 ## Design and protocol documentation
 
