@@ -5,3 +5,4 @@ export * from './cells';
 export * from './estimate';
 export * from './bearings';
 export * from './remoteObservers';
+export * from './nextObservation';
